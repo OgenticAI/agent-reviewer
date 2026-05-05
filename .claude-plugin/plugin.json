@@ -1,0 +1,19 @@
+{
+  "$schema": "https://claude.com/plugins/schema/plugin.json",
+  "name": "ogenticai-reviewer",
+  "version": "0.1.0",
+  "description": "Review a PR against its linked Linear ticket's UAT checklist. Per-item verdicts, sticky comment, optional Linear writeback.",
+  "homepage": "https://github.com/OgenticAI/agent-reviewer",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "OgenticAI",
+    "url": "https://ogenticai.com"
+  },
+  "commands": [
+    {
+      "name": "review-pr",
+      "file": "commands/review-pr.md",
+      "description": "Review a GitHub PR against its Linear ticket's UAT checklist."
+    }
+  ]
+}

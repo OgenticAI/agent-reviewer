@@ -1,0 +1,32 @@
+# Self-review: the OgenticAI Reviewer reviews its own PRs (dogfooding).
+#
+# This workflow is the canonical example consumers should crib from when
+# adding the reviewer to their own repo. See docs/INSTALL.md for the
+# minimal copy-pasteable version.
+
+name: OgenticAI Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/review
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
+          github_app_private_key: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
+          linear_api_token: ${{ secrets.LINEAR_API_TOKEN }}
+          auto_patch: "false"

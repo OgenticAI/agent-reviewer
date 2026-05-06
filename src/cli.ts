@@ -4,16 +4,16 @@
  *
  * Used by:
  *   - The Claude Code plugin's `/review-pr <github-url>` slash command.
- *   - The GitHub Action — same code path as local; the Action just calls
- *     the same CLI under a GitHub App token with --post and --output-json,
- *     then publishes the Check based on the JSON output. One LLM call per
- *     run, deterministic, easy to debug.
+ *   - The GitHub Action — same code path as local; the Action calls the
+ *     CLI under a GitHub App token with --post and --output-json, then
+ *     publishes the Check based on the JSON output.
  *   - Devs iterating on prompts without a CI round-trip.
  *
  * Usage:
- *   tsx src/cli.ts review-pr <pr-url>                 # dry-run; prints the comment
- *   tsx src/cli.ts review-pr <pr-url> --post           # upsert the sticky comment
+ *   tsx src/cli.ts review-pr <pr-url>                         # dry-run; prints the comment
+ *   tsx src/cli.ts review-pr <pr-url> --post                  # upsert PR comment + Linear writeback
  *   tsx src/cli.ts review-pr <pr-url> --output-json verdict.json
+ *   tsx src/cli.ts review-pr <pr-url> --no-linear-writeback   # skip Linear side effects
  *
  * Exit codes:
  *   0  success
@@ -28,10 +28,10 @@ import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
 import { runReview, ReviewSkippedError } from "./review.js";
-import type { GithubReader, LinearClient, VerdictModel } from "./review.js";
+import type { GithubReader, VerdictModel } from "./review.js";
+import { LinearGraphqlClient } from "./linear/client.js";
+import { runWriteback } from "./linear/writeback.js";
 import { upsertStickyComment } from "./github/sticky.js";
-import { renderStickyComment } from "./render/comment.js";
-import { overallStatus } from "./schema/verdict.js";
 import { REVIEWER_VERSION } from "./version.js";
 
 const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
@@ -41,6 +41,7 @@ interface CliArgs {
   prUrl: string;
   post: boolean;
   outputJson: string | undefined;
+  linearWriteback: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -51,22 +52,24 @@ function parseArgs(argv: string[]): CliArgs {
   const post = args.includes("--post");
   const outIdx = args.indexOf("--output-json");
   const outputJson = outIdx >= 0 ? args[outIdx + 1] : undefined;
-  return { command: "review-pr", prUrl, post, outputJson };
+  const linearWriteback = !args.includes("--no-linear-writeback");
+  return { command: "review-pr", prUrl, post, outputJson, linearWriteback };
 }
 
 function printUsageAndExit(): never {
   console.error(
     [
-      "Usage: ogenticai-reviewer review-pr <pr-url> [--post] [--output-json PATH]",
+      "Usage: ogenticai-reviewer review-pr <pr-url> [--post] [--output-json PATH] [--no-linear-writeback]",
       "",
-      "  <pr-url>              e.g. https://github.com/OgenticAI/ogentic-shield/pull/1",
-      "  --post                upsert the sticky comment on the PR (default: print only)",
-      "  --output-json PATH    write the raw verdict JSON to PATH",
+      "  <pr-url>                  e.g. https://github.com/OgenticAI/ogentic-shield/pull/1",
+      "  --post                    upsert sticky PR comment + run Linear writeback",
+      "  --output-json PATH        write the raw verdict JSON to PATH",
+      "  --no-linear-writeback     skip Linear comment / status / child-issue writes",
       "",
       "Required env vars:",
-      "  ANTHROPIC_API_KEY     Claude API key",
-      "  GITHUB_TOKEN          GitHub token (PAT locally, App token in CI)",
-      "  LINEAR_API_TOKEN      Linear personal API key",
+      "  ANTHROPIC_API_KEY         Claude API key",
+      "  GITHUB_TOKEN              GitHub token (PAT locally, App token in CI)",
+      "  LINEAR_API_TOKEN          Linear personal API key",
     ].join("\n"),
   );
   process.exit(2);
@@ -90,12 +93,13 @@ async function main(): Promise<void> {
 
   const octokit = new Octokit({ auth: githubToken });
   const anthropic = new Anthropic({ apiKey: anthropicKey });
+  const linear = new LinearGraphqlClient({ token: linearToken });
 
   try {
     const result = await runReview({
       pr: { owner, repo, number },
       github: makeGithubReader(octokit),
-      linear: makeLinearClient(linearToken),
+      linear,
       model: makeAnthropicModel(anthropic),
     });
 
@@ -110,6 +114,7 @@ async function main(): Promise<void> {
     }
 
     if (args.post) {
+      // 1) Upsert the PR sticky comment via the GitHub App token.
       const upsert = await upsertStickyComment({
         octokit,
         owner,
@@ -117,9 +122,45 @@ async function main(): Promise<void> {
         issueNumber: number,
         body: result.body,
       });
-      console.error(`[${upsert.action}] ${upsert.url}`);
+      console.error(`[github:${upsert.action}] ${upsert.url}`);
+
+      // 2) Run Linear writeback unless explicitly skipped.
+      if (args.linearWriteback) {
+        const meta = await linear.getIssueMeta(result.verdict.ticketId);
+        const ciGreen = await isCiGreen(octokit, {
+          owner,
+          repo,
+          ref: result.prContext.headSha,
+        });
+        const plan = await runWriteback({
+          writer: linear,
+          verdict: result.verdict,
+          ticket: {
+            id: meta.id,
+            identifier: result.ticket.identifier,
+            teamId: meta.teamId,
+            url: meta.url,
+            currentStatusType: meta.currentStatusType,
+          },
+          pr: {
+            url: `https://github.com/${owner}/${repo}/pull/${number}`,
+            ref: `${owner}/${repo}#${number}`,
+          },
+          ciGreen,
+        });
+        console.error(
+          `[linear:comment:${plan.comment.action}] [linear:status:${plan.status.action}${
+            plan.status.to ? `→${plan.status.to}` : ""
+          }] children=${plan.children.length} errors=${plan.errors.length}`,
+        );
+        for (const err of plan.errors) {
+          console.error(`  [linear:error] ${err.step}: ${err.message}`);
+        }
+      } else {
+        console.error("(skipping Linear writeback per --no-linear-writeback)");
+      }
     } else {
-      console.error("(dry run — pass --post to upsert)");
+      console.error("(dry run — pass --post to upsert PR comment + run Linear writeback)");
     }
   } catch (err) {
     if (err instanceof ReviewSkippedError) {
@@ -171,60 +212,6 @@ function makeGithubReader(octokit: Octokit): GithubReader {
   };
 }
 
-function makeLinearClient(token: string): LinearClient {
-  return {
-    async getIssue(identifier: string) {
-      const query = `
-        query($id: String!) {
-          issue(id: $id) {
-            id
-            identifier
-            title
-            description
-            url
-            state { name }
-          }
-        }
-      `;
-      const resp = await fetch("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: token,
-        },
-        body: JSON.stringify({ query, variables: { id: identifier } }),
-      });
-      if (!resp.ok) {
-        throw new Error(`Linear API error: ${resp.status} ${await resp.text()}`);
-      }
-      const json = (await resp.json()) as {
-        data?: {
-          issue?: {
-            id: string;
-            identifier: string;
-            title: string;
-            description: string | null;
-            url: string;
-            state: { name: string };
-          };
-        };
-      };
-      if (!json.data?.issue) {
-        throw new Error(`Linear ticket ${identifier} not found (or token lacks access)`);
-      }
-      const issue = json.data.issue;
-      return {
-        identifier: issue.identifier,
-        id: issue.id,
-        title: issue.title,
-        description: issue.description ?? "",
-        status: issue.state.name,
-        url: issue.url,
-      };
-    },
-  };
-}
-
 function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
   return {
     async produce({ systemPrompt, userPrompt }) {
@@ -242,8 +229,29 @@ function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
   };
 }
 
-// Suppress unused-import lint for renderStickyComment — runReview already
-// uses it internally. We re-export here for future tooling integration.
-void renderStickyComment;
+/**
+ * Best-effort: check whether the head commit's CI status is green.
+ *
+ * The "Ready to Merge" transition only fires when CI reports green for the
+ * head SHA. We use the combined-status API which folds both the legacy
+ * "status" API and modern Checks. If anything errors here we return false
+ * (safe default — never auto-promote on uncertainty).
+ */
+async function isCiGreen(
+  octokit: Octokit,
+  args: { owner: string; repo: string; ref: string },
+): Promise<boolean> {
+  try {
+    const status = await octokit.repos.getCombinedStatusForRef(args);
+    if (status.data.state !== "success") return false;
+    const checks = await octokit.checks.listForRef(args);
+    const conclusions = checks.data.check_runs.map((c) => c.conclusion);
+    return conclusions.every(
+      (c) => c === "success" || c === "neutral" || c === "skipped" || c === null,
+    );
+  } catch {
+    return false;
+  }
+}
 
 void main();

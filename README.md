@@ -92,8 +92,8 @@ agent-reviewer/
 | Feature | Linear ticket | Status |
 |---------|--------------|--------|
 | Spec, scaffold, GitHub App, UAT parser | [OGE-337](https://linear.app/ogenticai/issue/OGE-337) | In review |
-| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | In progress |
-| Linear writeback (comments, status, follow-ups) | [OGE-339](https://linear.app/ogenticai/issue/OGE-339) | Backlog |
+| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | In review |
+| Linear writeback (comments, status, follow-ups) | [OGE-339](https://linear.app/ogenticai/issue/OGE-339) | In progress |
 | Merge gate via required Check + `/uat-override` | [OGE-340](https://linear.app/ogenticai/issue/OGE-340) | Backlog |
 | Auto-patch drafts + plugin + multi-repo rollout | [OGE-341](https://linear.app/ogenticai/issue/OGE-341) | Backlog |
 

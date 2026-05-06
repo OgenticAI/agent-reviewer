@@ -110,8 +110,12 @@ async function createState(
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: token },
     body: JSON.stringify({
+      // Linear's WorkflowStatePayload exposes the created state under
+      // `workflowState`, not `state`. Using the wrong field name fails the
+      // entire mutation with `Cannot query field "state" on type
+      // "WorkflowStatePayload"`.
       query: `mutation($input: WorkflowStateCreateInput!) {
-        workflowStateCreate(input: $input) { success state { id name } }
+        workflowStateCreate(input: $input) { success workflowState { id name } }
       }`,
       variables: {
         input: {

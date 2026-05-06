@@ -3,6 +3,12 @@
 # This workflow is the canonical example consumers should crib from when
 # adding the reviewer to their own repo. See docs/INSTALL.md for the
 # minimal copy-pasteable version.
+#
+# Until the OgenticAI Reviewer GitHub App is registered + the four org
+# secrets are set, this workflow detects the missing config in a precheck
+# step and skips the review cleanly. That's why the Check passes (with a
+# notice) on every PR landing here BEFORE the App goes live, and starts
+# producing real verdicts AFTER the App + secrets land.
 
 name: OgenticAI Reviewer
 
@@ -22,8 +28,36 @@ jobs:
     timeout-minutes: 15
     if: github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/review
+      # Detect whether the App + secrets are configured. We can't reference
+      # `secrets.X` directly in `if:` expressions on jobs/steps in older
+      # runner versions, so we read into env in this precheck and gate the
+      # subsequent steps on its output.
+      - name: Check reviewer config
+        id: cfg
+        env:
+          APP_ID: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
+          APP_KEY: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
+          ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY }}
+          LINEAR: ${{ secrets.LINEAR_API_TOKEN }}
+        run: |
+          missing=()
+          [ -z "$APP_ID" ]   && missing+=("OGENTICAI_REVIEWER_APP_ID")
+          [ -z "$APP_KEY" ]  && missing+=("OGENTICAI_REVIEWER_APP_KEY")
+          [ -z "$ANTHROPIC" ] && missing+=("ANTHROPIC_API_KEY")
+          [ -z "$LINEAR" ]   && missing+=("LINEAR_API_TOKEN")
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::OgenticAI Reviewer config detected — running self-review."
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OgenticAI Reviewer not yet configured — skipping. Missing org secrets: ${missing[*]}. See docs/GITHUB_APP_SETUP.md."
+          fi
+
+      - if: steps.cfg.outputs.configured == 'true'
+        uses: actions/checkout@v5
+
+      - if: steps.cfg.outputs.configured == 'true'
+        uses: ./.github/actions/review
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}

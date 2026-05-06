@@ -108,6 +108,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
     headSha: pr.headSha,
     generatedAt: now(),
+    checklist,
   });
 
   const body = renderStickyComment(verdict);
@@ -135,11 +136,21 @@ export class ReviewSkippedError extends Error {
 
 /**
  * Parse + validate the model's JSON output, injecting the agent-side metadata
- * fields (schema version, reviewer version, ticket id, PR ref, SHA, timestamp).
+ * fields (schema version, reviewer version, ticket id, PR ref, SHA, timestamp)
+ * and patching common drift patterns before zod validation.
  *
- * The model can return JSON wrapped in code fences despite instructions —
- * strip them defensively. zod parsing then fails closed if the model output
- * is structurally wrong.
+ * Drift patterns we tolerate (observed live in production):
+ *   - Items missing `id`: filled in from 1-based array position.
+ *   - Items missing `itemText`: looked up from the parser's checklist by id.
+ *   - `evidenceRefs` as bare strings: coerced to `{ kind, path, ... }` objects
+ *     using these heuristics:
+ *       "src/foo.py:42-58"  →  { kind: "lines", path: "src/foo.py", start: 42, end: 58 }
+ *       "src/foo.py:42"     →  { kind: "lines", path: "src/foo.py", start: 42, end: 42 }
+ *       "src/foo.py"        →  { kind: "file",  path: "src/foo.py" }
+ *       "https://..."       →  { kind: "external", url: "..." }
+ *
+ * Anything we can't repair fails closed via zod — the caller's failure-safe
+ * Check publishing turns that into a `neutral` Check, never `failure`.
  */
 function parseVerdict(
   modelOutput: string,
@@ -148,6 +159,7 @@ function parseVerdict(
     prRef: string;
     headSha: string;
     generatedAt: string;
+    checklist: { items: Array<{ id: number; text: string }> };
   },
 ): ReviewVerdict {
   const stripped = modelOutput
@@ -168,8 +180,29 @@ function parseVerdict(
   if (parsed === null || typeof parsed !== "object") {
     throw new Error("Model output parsed but isn't a JSON object");
   }
+
+  const root = parsed as Record<string, unknown>;
+  const rawItems = Array.isArray(root.items) ? (root.items as unknown[]) : [];
+  const checklistById = new Map(
+    injected.checklist.items.map((it) => [it.id, it.text]),
+  );
+
+  const repairedItems = rawItems.map((raw, idx) => {
+    const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const id = typeof item.id === "number" ? item.id : idx + 1;
+    const itemText =
+      typeof item.itemText === "string" && item.itemText.length > 0
+        ? item.itemText
+        : (checklistById.get(id) ?? `Item ${id}`);
+    const evidenceRefs = Array.isArray(item.evidenceRefs)
+      ? (item.evidenceRefs as unknown[]).map(coerceEvidenceRef).filter((r) => r !== null)
+      : [];
+    return { ...item, id, itemText, evidenceRefs };
+  });
+
   const candidate = {
-    ...(parsed as Record<string, unknown>),
+    ...root,
+    items: repairedItems,
     schemaVersion: 1,
     reviewerVersion: REVIEWER_VERSION,
     ticketId: injected.ticketId,
@@ -178,4 +211,37 @@ function parseVerdict(
     generatedAt: injected.generatedAt,
   };
   return ReviewVerdict.parse(candidate);
+}
+
+/**
+ * Coerce a model-emitted evidence reference into the `EvidenceRef` shape.
+ *
+ * Pass through objects that are already in the right shape; convert strings
+ * via heuristics on file-path / line-range / URL. Returns null for inputs
+ * we can't sensibly map (caller filters them out).
+ */
+function coerceEvidenceRef(raw: unknown): unknown {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "object") return raw; // trust zod to validate further
+
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+
+  // External URL → { kind: "external", url }
+  if (/^https?:\/\//i.test(s)) {
+    return { kind: "external", url: s };
+  }
+
+  // path:start-end  or  path:start
+  const lineMatch = s.match(/^([^:]+):(\d+)(?:-(\d+))?$/);
+  if (lineMatch) {
+    const path = lineMatch[1]!;
+    const start = Number(lineMatch[2]!);
+    const end = lineMatch[3] !== undefined ? Number(lineMatch[3]) : start;
+    return { kind: "lines", path, start, end };
+  }
+
+  // Bare path → file
+  return { kind: "file", path: s };
 }

@@ -264,4 +264,140 @@ describe("runReview (end-to-end)", () => {
     // consumers (Linear writeback in OGE-339, Check output in OGE-340).
     expect(result.verdict.generatedAt).toBe(FROZEN_TIME);
   });
+
+  // ─── Lenient parsing — patch over common model-output drift ─────────────────
+  //
+  // Caught live the first time the reviewer ran on real model output: the
+  // model omitted `id` + `itemText` (assuming they're redundant from the
+  // checklist position) and emitted bare-string evidenceRefs instead of the
+  // {kind, path} object form. We patch over those drift patterns rather than
+  // failing closed, since the agent already knows id + itemText from the
+  // parsed checklist and bare strings have an obvious file/line/url shape.
+
+  describe("lenient parsing of model-output drift", () => {
+    it("fills in missing id from 1-based array position", async () => {
+      const json = JSON.stringify({
+        items: [
+          // No `id` field — agent should inject 1, 2, 3, 4 from position
+          { itemText: "a", status: "PASS", rationale: "ok", evidenceRefs: [] },
+          { itemText: "b", status: "PASS", rationale: "ok", evidenceRefs: [] },
+          { itemText: "c", status: "PASS", rationale: "ok", evidenceRefs: [] },
+          { itemText: "d", status: "PASS", rationale: "ok", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(buildArgs({ model: makeModel(json) }));
+      expect(result.verdict.items.map((it) => it.id)).toEqual([1, 2, 3, 4]);
+    });
+
+    it("fills in missing itemText from the parsed checklist by id", async () => {
+      const json = JSON.stringify({
+        items: [
+          // No itemText — agent should look it up from checklist[0].text
+          { id: 1, status: "PASS", rationale: "ok", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(buildArgs({ model: makeModel(json) }));
+      // PR fixture's first UAT item is the s.redact() one:
+      expect(result.verdict.items[0]?.itemText).toContain("s.redact");
+    });
+
+    it("coerces bare-string evidenceRefs into {kind, path} objects", async () => {
+      const json = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText: "x",
+            status: "PASS",
+            rationale: "ok",
+            evidenceRefs: [
+              "src/redaction.py", // bare path → file
+              "src/redaction.py:42-58", // path:start-end → lines
+              "src/redaction.py:42", // path:start → lines start==end
+              "https://github.com/OgenticAI/ogentic-shield/blob/main/README.md", // url → external
+            ],
+          },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(buildArgs({ model: makeModel(json) }));
+      const refs = result.verdict.items[0]!.evidenceRefs;
+      expect(refs).toEqual([
+        { kind: "file", path: "src/redaction.py" },
+        { kind: "lines", path: "src/redaction.py", start: 42, end: 58 },
+        { kind: "lines", path: "src/redaction.py", start: 42, end: 42 },
+        {
+          kind: "external",
+          url: "https://github.com/OgenticAI/ogentic-shield/blob/main/README.md",
+        },
+      ]);
+    });
+
+    it("passes through evidenceRefs already in object form unchanged", async () => {
+      const json = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText: "x",
+            status: "PASS",
+            rationale: "ok",
+            evidenceRefs: [
+              { kind: "file", path: "src/foo.py" },
+              { kind: "test", path: "tests/test_foo.py", name: "test_round_trip" },
+            ],
+          },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(buildArgs({ model: makeModel(json) }));
+      expect(result.verdict.items[0]!.evidenceRefs).toEqual([
+        { kind: "file", path: "src/foo.py" },
+        { kind: "test", path: "tests/test_foo.py", name: "test_round_trip" },
+      ]);
+    });
+
+    it("survives the live-observed drift pattern (the original bug)", async () => {
+      // Reproduces what the model actually returned on ogentic-shield PR #2's
+      // first run: missing id/itemText AND bare-string evidenceRefs.
+      const json = JSON.stringify({
+        items: [
+          {
+            status: "PASS",
+            rationale:
+              "Audit emission wired into Shield.analyze() and Shield.redact() in src/ogentic_shield/audit.py.",
+            evidenceRefs: ["src/ogentic_shield/audit.py", "tests/test_audit.py"],
+          },
+          {
+            status: "PASS",
+            rationale: "AuditBackend Protocol defined; Null/Stderr/File backends shipped.",
+            evidenceRefs: ["src/ogentic_shield/audit.py:1-50"],
+          },
+        ],
+        summary: "Audit emission looks solid.",
+      });
+      const result = await runReview(buildArgs({ model: makeModel(json) }));
+      expect(result.verdict.items).toHaveLength(2);
+      expect(result.verdict.items[0]?.id).toBe(1);
+      expect(result.verdict.items[1]?.id).toBe(2);
+      expect(result.verdict.items[0]?.evidenceRefs[0]).toEqual({
+        kind: "file",
+        path: "src/ogentic_shield/audit.py",
+      });
+      expect(result.verdict.items[1]?.evidenceRefs[0]).toEqual({
+        kind: "lines",
+        path: "src/ogentic_shield/audit.py",
+        start: 1,
+        end: 50,
+      });
+    });
+
+    it("still fails closed on truly malformed output (e.g. invalid status)", async () => {
+      const bogus = JSON.stringify({
+        items: [{ id: 1, itemText: "x", status: "MAYBE", rationale: "y" }],
+        summary: "x",
+      });
+      await expect(runReview(buildArgs({ model: makeModel(bogus) }))).rejects.toThrow();
+    });
+  });
 });

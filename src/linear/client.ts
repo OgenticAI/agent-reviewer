@@ -195,6 +195,81 @@ export class LinearGraphqlClient implements LinearReader, LinearWriter {
     return data.issue?.children.nodes ?? [];
   }
 
+  /**
+   * Find or create a label on `teamId` and add it to `issueId`. Used by the
+   * override flow (OGE-340) to mark tickets that have had their UAT verdict
+   * overridden — `uat-override` is the well-known label.
+   *
+   * Idempotent: if the label already exists on the issue, returns
+   * `{ created: false }` without writing.
+   */
+  async upsertLabelOnIssue(args: {
+    issueId: string;
+    teamId: string;
+    labelName: string;
+  }): Promise<{ created: boolean }> {
+    // 1) Find the label on the team's label list (or create it).
+    const labelId = await this.findOrCreateTeamLabel({
+      teamId: args.teamId,
+      name: args.labelName,
+    });
+
+    // 2) Read existing labels on the issue; skip if already present.
+    const existing = await this.gql<{
+      issue: { labels: { nodes: Array<{ id: string }> } } | null;
+    }>(
+      `query($id: String!) {
+        issue(id: $id) { labels { nodes { id } } }
+      }`,
+      { id: args.issueId },
+    );
+    const present = (existing.issue?.labels.nodes ?? []).some((l) => l.id === labelId);
+    if (present) return { created: false };
+
+    // 3) Add the label by appending to the issue's labelIds. Linear's
+    //    issueUpdate replaces the list, so we send the full union.
+    const allIds = (existing.issue?.labels.nodes ?? []).map((l) => l.id).concat(labelId);
+    await this.gql<{ issueUpdate: { success: boolean } }>(
+      `mutation($id: String!, $labelIds: [String!]!) {
+        issueUpdate(id: $id, input: { labelIds: $labelIds }) { success }
+      }`,
+      { id: args.issueId, labelIds: allIds },
+    );
+    return { created: true };
+  }
+
+  private async findOrCreateTeamLabel(args: {
+    teamId: string;
+    name: string;
+  }): Promise<string> {
+    const data = await this.gql<{
+      team: { labels: { nodes: Array<{ id: string; name: string }> } } | null;
+    }>(
+      `query($id: String!) {
+        team(id: $id) { labels(first: 100) { nodes { id name } } }
+      }`,
+      { id: args.teamId },
+    );
+    const existing = (data.team?.labels.nodes ?? []).find(
+      (l) => l.name.toLowerCase() === args.name.toLowerCase(),
+    );
+    if (existing) return existing.id;
+    const created = await this.gql<{
+      issueLabelCreate: { success: boolean; issueLabel: { id: string } };
+    }>(
+      `mutation($input: IssueLabelCreateInput!) {
+        issueLabelCreate(input: $input) { success issueLabel { id } }
+      }`,
+      {
+        input: { teamId: args.teamId, name: args.name, color: "#F59E0B" },
+      },
+    );
+    if (!created.issueLabelCreate.success) {
+      throw new Error(`Could not create Linear label "${args.name}"`);
+    }
+    return created.issueLabelCreate.issueLabel.id;
+  }
+
   async createChildIssue(args: {
     parentId: string;
     teamId: string;

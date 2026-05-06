@@ -10,7 +10,11 @@ branding:
 
 inputs:
   anthropic_api_key:
-    description: "Anthropic API key. Use ${{ secrets.ANTHROPIC_API_KEY }}."
+    # Pass via `secrets.ANTHROPIC_API_KEY` from the calling workflow. We don't
+    # write the literal `${{ secrets.ANTHROPIC_API_KEY }}` here because GitHub
+    # parses expression syntax inside `description` fields and `secrets` isn't
+    # available in the composite-action context — that fails the action load.
+    description: "Anthropic API key. Pass from the caller's secrets context."
     required: true
   github_app_id:
     description: "OgenticAI Reviewer GitHub App ID."

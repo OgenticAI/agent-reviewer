@@ -186,27 +186,32 @@ async function putProtection(
   args: { owner: string; repo: string; branch: string },
   next: BranchProtectionPut,
 ): Promise<void> {
-  await octokit.repos.updateBranchProtection({
-    owner: args.owner,
-    repo: args.repo,
-    branch: args.branch,
-    required_status_checks: next.required_status_checks
-      ? {
+  // GitHub's PUT branch-protection schema validates `required_status_checks`
+  // as `oneOf({strict, contexts}, {strict, checks})` — they are mutually
+  // exclusive. Sending both fails with `More than one subschema in "oneOf"
+  // matched`. We always prefer the modern `checks` form (which carries the
+  // App-id pinning that prevents check-name spoofing) and omit `contexts`
+  // entirely. Octokit's auto-generated TS types still mark `contexts` as
+  // required; we go through the lower-level `request()` to bypass that.
+  const requiredStatusChecks =
+    next.required_status_checks === null
+      ? null
+      : {
           strict: next.required_status_checks.strict,
-          contexts: next.required_status_checks.contexts,
-          checks: next.required_status_checks.checks?.map((c) => ({
+          checks: (next.required_status_checks.checks ?? []).map((c) => ({
             context: c.context,
             app_id: c.app_id ?? undefined,
           })),
-        }
-      : null,
+        };
+
+  await octokit.request("PUT /repos/{owner}/{repo}/branches/{branch}/protection", {
+    owner: args.owner,
+    repo: args.repo,
+    branch: args.branch,
+    required_status_checks: requiredStatusChecks,
     enforce_admins: next.enforce_admins,
-    required_pull_request_reviews: next.required_pull_request_reviews as
-      | Parameters<typeof octokit.repos.updateBranchProtection>[0]["required_pull_request_reviews"]
-      | null,
-    restrictions: next.restrictions as
-      | Parameters<typeof octokit.repos.updateBranchProtection>[0]["restrictions"]
-      | null,
+    required_pull_request_reviews: next.required_pull_request_reviews,
+    restrictions: next.restrictions,
     required_linear_history: next.required_linear_history,
     allow_force_pushes: next.allow_force_pushes,
     allow_deletions: next.allow_deletions,
@@ -214,7 +219,7 @@ async function putProtection(
     required_conversation_resolution: next.required_conversation_resolution,
     lock_branch: next.lock_branch,
     allow_fork_syncing: next.allow_fork_syncing,
-  });
+  } as Record<string, unknown>);
 }
 
 function normalizeProtectionGet(

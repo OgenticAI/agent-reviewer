@@ -28,17 +28,22 @@ A `/uat-override <reason>` slash command in a PR comment from a maintainer flips
 any OgenticAI repo
    └── .github/workflows/ogenticai-reviewer.yml
          └── uses: OgenticAI/agent-reviewer/.github/actions/review@v1
-                ├── runs: anthropics/claude-code-action with the prompt in
-                │            .github/actions/review/prompts/review.md
-                ├── MCPs: Linear MCP (read ticket + UAT, write comments + status)
-                ├── posts: sticky PR comment with per-item verdict table
-                ├── writes: comment + status transitions on Linear ticket
-                ├── sets: required check "OgenticAI Reviewer / UAT"
-                └── opens: follow-up child Linear tickets for FAIL items;
-                           draft PR with patch when mechanically fixable
+                ├── mints a GitHub App token (actions/create-github-app-token)
+                ├── runs the agent CLI exactly once per push:
+                │     tsx src/cli.ts review-pr <url> --post --output-json verdict.json
+                │       ├── fetches PR + diff via Octokit
+                │       ├── resolves Linear ticket from branch / body / title
+                │       ├── fetches the ticket via Linear GraphQL
+                │       ├── parses the ## UAT checklist block
+                │       ├── ONE call to Claude (temperature 0) → verdict JSON
+                │       ├── renders the deterministic sticky comment
+                │       └── upserts the comment via the App token
+                └── publishes a Check "OgenticAI Reviewer / UAT" based on overall
 ```
 
-The same logic also ships as a **Claude Code plugin**: `/review-pr <github-pr-url>` runs the review locally during a cowork session for a faster feedback loop.
+**Why one LLM call (and not the model-driven `claude-code-action` tool loop):** stable verdicts. Letting the model orchestrate every step (parse, render, upsert) means tool-call ordering and intermediate decisions vary between runs. By doing the deterministic plumbing (parser, renderer, upserter) in TypeScript and using the model only for the per-item judgement, the same diff + same checklist produces the same verdicts on every push. That's what the "no comment churn" promise actually requires.
+
+The same logic also ships as a **Claude Code plugin**: `/review-pr <github-pr-url>` runs the review locally during a cowork session for a faster feedback loop. The plugin and the Action are the same code path — `src/review.ts`'s `runReview()` — so a verdict produced locally matches what CI would produce.
 
 ## Substrate (build-not-buy)
 
@@ -86,8 +91,8 @@ agent-reviewer/
 
 | Feature | Linear ticket | Status |
 |---------|--------------|--------|
-| Spec, scaffold, GitHub App, UAT parser | [OGE-337](https://linear.app/ogenticai/issue/OGE-337) | In progress |
-| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | Backlog |
+| Spec, scaffold, GitHub App, UAT parser | [OGE-337](https://linear.app/ogenticai/issue/OGE-337) | In review |
+| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | In progress |
 | Linear writeback (comments, status, follow-ups) | [OGE-339](https://linear.app/ogenticai/issue/OGE-339) | Backlog |
 | Merge gate via required Check + `/uat-override` | [OGE-340](https://linear.app/ogenticai/issue/OGE-340) | Backlog |
 | Auto-patch drafts + plugin + multi-repo rollout | [OGE-341](https://linear.app/ogenticai/issue/OGE-341) | Backlog |

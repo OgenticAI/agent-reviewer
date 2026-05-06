@@ -51,15 +51,17 @@ describe("renderStickyComment", () => {
     expect(renderStickyComment(v)).toBe(renderStickyComment(v));
   });
 
-  it("does NOT include the generatedAt timestamp in the rendered body header", () => {
-    // Timestamp lives only inside the JSON sidecar — it must not perturb the
-    // human-visible Markdown body, otherwise sticky comments would 'churn'
-    // on every push.
+  it("excludes the generatedAt timestamp from BOTH the visible body and the JSON sidecar", () => {
+    // The sticky comment must be byte-identical across runs on the same SHA so
+    // the upserter no-ops. That means generatedAt cannot leak into the JSON
+    // sidecar either — the timestamp lives in the Check output and the Linear
+    // comment metadata, not in the comment body.
     const a = renderStickyComment(makeVerdict({ generatedAt: "2026-04-27T08:30:14.000Z" }));
     const b = renderStickyComment(makeVerdict({ generatedAt: "2099-12-31T23:59:59.000Z" }));
-    // Strip the JSON sidecar block before comparing
-    const stripJson = (s: string) => s.replace(/```json[\s\S]*?```/, "");
-    expect(stripJson(a)).toBe(stripJson(b));
+    expect(a).toBe(b);
+    // And the timestamp string never appears anywhere in the body.
+    expect(a).not.toContain("2026-04-27T08:30:14");
+    expect(a).not.toContain("generatedAt");
   });
 
   it("renders the per-item verdict table", () => {

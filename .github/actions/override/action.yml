@@ -1,0 +1,88 @@
+name: "OgenticAI Reviewer — UAT Override"
+description: >-
+  Apply a /uat-override <reason> request from a maintainer comment.
+  Verifies permission, flips the GitHub Check to success, posts an audit
+  comment on the linked Linear ticket, and labels the ticket `uat-override`.
+author: "OgenticAI"
+branding:
+  icon: "key"
+  color: "purple"
+
+inputs:
+  github_app_id:
+    description: "OgenticAI Reviewer GitHub App ID."
+    required: true
+  github_app_private_key:
+    description: "OgenticAI Reviewer GitHub App private key (PEM)."
+    required: true
+  linear_api_token:
+    description: "Linear API token used to post the audit comment + label."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Mint GitHub App token
+      id: app_token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.github_app_id }}
+        private-key: ${{ inputs.github_app_private_key }}
+        owner: ${{ github.repository_owner }}
+
+    - name: Set up Node
+      uses: actions/setup-node@v5
+      with:
+        node-version: "20"
+
+    - name: Install reviewer
+      shell: bash
+      working-directory: ${{ github.action_path }}/../../..
+      run: npm ci --silent
+
+    - name: Apply override
+      shell: bash
+      working-directory: ${{ github.action_path }}/../../..
+      env:
+        GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+        LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
+        # Anthropic key not needed by override-pr — set empty so requireEnv
+        # doesn't trip if the script ever consults it.
+        ANTHROPIC_API_KEY: "unused"
+        EVENT_PATH: ${{ github.event_path }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        set +e
+        # Extract PR URL + comment body from the issue_comment event payload.
+        PR_URL=$(node -e "const e=require(process.env.EVENT_PATH); console.log(e.issue.pull_request?.html_url ?? '')")
+        COMMENT_BODY=$(node -e "const e=require(process.env.EVENT_PATH); process.stdout.write(e.comment.body ?? '')")
+
+        if [ -z "$PR_URL" ]; then
+          echo "::warning::issue_comment was not on a pull request; nothing to override."
+          exit 0
+        fi
+
+        # Parse `/uat-override <reason>`. We re-implement the regex inline
+        # so we don't have to import TS just for a one-liner.
+        REASON=$(node -e "
+          const body = process.argv[1];
+          const m = /^[ \t]*\/uat-override(?:[ \t]+([^\r\n]+))?[ \t]*$/m.exec(body);
+          if (!m) process.exit(0);
+          const reason = (m[1] ?? '').trim();
+          if (!reason) process.exit(0);
+          process.stdout.write(reason);
+        " "$COMMENT_BODY")
+
+        if [ -z "$REASON" ]; then
+          echo "Comment did not contain a /uat-override <reason> directive (or reason was empty); skipping."
+          exit 0
+        fi
+
+        npx tsx src/cli.ts override-pr "$PR_URL" \
+          --by "$ACTOR" \
+          --reason "$REASON"
+        rc=$?
+        echo "Override exit code: $rc"
+        # Don't fail the workflow on permission denied — the CLI already
+        # logs a structured message and the user gets visible feedback.
+        exit 0

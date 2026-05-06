@@ -65,6 +65,20 @@ export const ItemVerdict = z.object({
    */
   rationale: z.string().min(1).max(800),
   evidenceRefs: z.array(EvidenceRef).default([]),
+  /**
+   * Hint for OGE-341's auto-patch flow: when `true` AND status is `FAIL`,
+   * the Action (with `auto_patch: true`) attempts to open a draft PR with
+   * a candidate fix. Use sparingly — only set it when the fix is mechanical
+   * (missing test for an asserted behavior, missing docstring, a README
+   * claim that doesn't match the code).
+   *
+   * Optional rather than `.default(false)`: the model is instructed to omit
+   * the field entirely when not flagging an item. Runtime code reads it as
+   * `=== true`, so missing / false / undefined all collapse to "no
+   * auto-patch". Keeping it optional avoids forcing every test fixture and
+   * model output to spell out `false` redundantly.
+   */
+  autoPatchable: z.boolean().optional(),
 });
 export type ItemVerdict = z.infer<typeof ItemVerdict>;
 
@@ -110,4 +124,13 @@ export function overallStatus(verdict: ReviewVerdict): OverallStatus {
   if (statuses.includes("UNVERIFIABLE")) return "HUMAN_REVIEW";
   if (statuses.includes("PARTIAL")) return "PASS_WITH_PARTIALS";
   return "PASS";
+}
+
+/**
+ * Items the auto-patch flow (OGE-341) will attempt to fix. Returns `[]` when
+ * there are none — used by the Action to decide whether to spend a second
+ * `claude-code-action` invocation on patch generation.
+ */
+export function autoPatchableFails(verdict: ReviewVerdict): ReviewVerdict["items"] {
+  return verdict.items.filter((it) => it.status === "FAIL" && it.autoPatchable);
 }

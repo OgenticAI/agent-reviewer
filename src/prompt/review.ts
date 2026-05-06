@@ -83,6 +83,14 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     `  reproduction steps, etc). Explain why a human is needed.`,
     ``,
     `Author tick-marks are advisory only — don't trust them. Decide from the diff.`,
+    ``,
+    `**Optional auto-patch hint:** for any item where status === "FAIL" AND the gap is`,
+    `clearly mechanical (missing test for an explicitly-asserted behavior; missing`,
+    `docstring on a public function; a README claim that doesn't match the code; a`,
+    `version-string that wasn't bumped), set \`"autoPatchable": true\`. Default false.`,
+    `Only flag an item autoPatchable when you could write the fix yourself from the`,
+    `diff context alone — design questions, business decisions, and visual claims`,
+    `must always be \`autoPatchable: false\`.`,
   ].join("\n");
 }
 

@@ -77,10 +77,18 @@ export function renderStickyComment(verdict: ReviewVerdict): string {
 
   // JSON sidecar for downstream tooling (Linear writeback in OGE-339, the
   // merge-gate Check in OGE-340) and for the override flow.
+  //
+  // Strip `generatedAt` from the embedded JSON: it changes every run, and we
+  // want the rendered comment body to be byte-identical for the same verdict
+  // (same diff + same checklist) so the upserter no-ops instead of churning.
+  // The timestamp lives in the GitHub Check output and the Linear comment
+  // metadata — those are appropriate places for "when was this run" data.
+  // The comment itself is identity-by-content.
+  const { generatedAt: _generatedAt, ...verdictForBody } = verdict;
   lines.push("<details><summary>Reviewer payload (JSON)</summary>");
   lines.push("");
   lines.push("```json");
-  lines.push(JSON.stringify(verdict, null, 2));
+  lines.push(JSON.stringify(verdictForBody, null, 2));
   lines.push("```");
   lines.push("");
   lines.push("</details>");

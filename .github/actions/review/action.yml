@@ -1,8 +1,8 @@
 name: "OgenticAI Reviewer"
 description: >-
   Review a PR against its linked Linear ticket's UAT checklist.
-  Posts a sticky per-item verdict comment, mirrors to Linear, and (when
-  configured) sets a required Check that gates merge.
+  Posts a sticky per-item verdict comment under a GitHub App identity, and
+  publishes a Check that downstream branch protection (OGE-340) can require.
 author: "OgenticAI"
 branding:
   icon: "shield"
@@ -20,22 +20,28 @@ inputs:
     description: "OgenticAI Reviewer GitHub App ID."
     required: true
   github_app_private_key:
-    description: "OgenticAI Reviewer GitHub App private key (PEM, base64 OK)."
+    description: "OgenticAI Reviewer GitHub App private key (PEM)."
     required: true
   linear_api_token:
-    description: "Linear API token. Used by the Linear MCP for ticket reads + writeback."
+    description: "Linear API token used to fetch the linked ticket."
     required: true
-  auto_patch:
-    description: "If 'true', open a draft patch PR for mechanically-fixable UAT failures."
-    required: false
-    default: "false"
   fail_on:
     description: >-
-      Which OverallStatus values should set the Check to 'failure'.
-      Comma-separated subset of NEEDS_WORK, HUMAN_REVIEW. Default: NEEDS_WORK.
-      The reviewer never sets 'failure' on internal infra errors — those go to 'neutral'.
+      Comma-separated list of OverallStatus values that should set the Check to
+      'failure'. Default: empty — the v1 advisory mode never fails the Check.
+      Bumping this is the lever that flips the reviewer from advisory to
+      enforcing (see OGE-340).
     required: false
-    default: "NEEDS_WORK"
+    default: ""
+
+# Outputs the calling workflow can read off this Action.
+outputs:
+  overall:
+    description: "Overall verdict: PASS | PASS_WITH_PARTIALS | NEEDS_WORK | HUMAN_REVIEW | SKIPPED"
+    value: ${{ steps.review.outputs.overall }}
+  comment_url:
+    description: "URL of the sticky comment that was created or updated."
+    value: ${{ steps.review.outputs.comment_url }}
 
 runs:
   using: composite
@@ -48,42 +54,77 @@ runs:
         private-key: ${{ inputs.github_app_private_key }}
         owner: ${{ github.repository_owner }}
 
-    - name: Run claude-code-action review
-      uses: anthropics/claude-code-action@v1
+    - name: Set up Node
+      uses: actions/setup-node@v5
       with:
-        anthropic_api_key: ${{ inputs.anthropic_api_key }}
-        github_token: ${{ steps.app_token.outputs.token }}
-        # The system + user prompts are baked into the prompts/ directory so
-        # they version with the agent. Bumping REVIEWER_VERSION in source
-        # invalidates the sticky comment marker (see src/version.ts).
-        prompt_file: ${{ github.action_path }}/prompts/review.md
-        # Allow only the tools the reviewer actually needs. Locked-down on purpose.
-        allowed_tools: |
-          Bash(gh pr view:*)
-          Bash(gh pr diff:*)
-          Bash(gh issue list:*)
-          Bash(gh api:*)
-          Read
-          mcp__linear__*
-        # The Linear MCP gives the model read+write on Linear tickets.
-        # Ticket parsing, checklist extraction, sticky-comment upserting,
-        # and follow-up-issue creation all happen via tools, not via custom code.
-        mcp_config: |
-          {
-            "mcpServers": {
-              "linear": {
-                "command": "npx",
-                "args": ["-y", "@linear/mcp@latest"],
-                "env": {
-                  "LINEAR_API_KEY": "${{ inputs.linear_api_token }}"
-                }
-              }
-            }
-          }
-        # Keep verdicts deterministic.
-        model: "claude-sonnet-4-5"
-        # The action reads the PR event payload from $GITHUB_EVENT_PATH; we
-        # forward the auto_patch + fail_on flags so the prompt can branch.
-        env: |
-          OGENTICAI_REVIEWER_AUTO_PATCH=${{ inputs.auto_patch }}
-          OGENTICAI_REVIEWER_FAIL_ON=${{ inputs.fail_on }}
+        node-version: "20"
+
+    - name: Install reviewer
+      shell: bash
+      working-directory: ${{ github.action_path }}/../../..
+      # The Action lives inside the agent-reviewer repo; its package.json is
+      # the runtime. `npm ci` is fine because we ship a committed lockfile.
+      run: npm ci --omit=dev=false --silent
+
+    - name: Run review
+      id: review
+      shell: bash
+      working-directory: ${{ github.action_path }}/../../..
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+        LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        VERDICT_PATH: ${{ runner.temp }}/verdict.json
+      run: |
+        set +e  # the reviewer must never fail the Action; it sets a Check instead
+        npx tsx src/cli.ts review-pr "$PR_URL" --post --output-json "$VERDICT_PATH"
+        rc=$?
+        if [ $rc -eq 0 ]; then
+          overall=$(node -e "console.log(require(process.env.VERDICT_PATH).items.reduce((acc,it)=>{if(it.status==='FAIL')return 'NEEDS_WORK';if(it.status==='UNVERIFIABLE'&&acc!=='NEEDS_WORK')return 'HUMAN_REVIEW';if(it.status==='PARTIAL'&&!['NEEDS_WORK','HUMAN_REVIEW'].includes(acc))return 'PASS_WITH_PARTIALS';return acc;},'PASS'))")
+        elif [ $rc -eq 3 ]; then
+          overall="SKIPPED"
+        else
+          overall="ERROR"
+        fi
+        echo "overall=$overall" >> "$GITHUB_OUTPUT"
+        echo "Reviewer exit code: $rc"
+        echo "Overall verdict: $overall"
+        # Don't fail the step on review issues — the Check carries that signal.
+        exit 0
+
+    - name: Publish GitHub Check
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+        OVERALL: ${{ steps.review.outputs.overall }}
+        FAIL_ON: ${{ inputs.fail_on }}
+        OWNER: ${{ github.repository_owner }}
+        REPO: ${{ github.event.repository.name }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        # Map OverallStatus → GitHub Check conclusion. The reviewer never
+        # blocks merges on its own infra outages: ERROR → neutral, not failure.
+        # `fail_on` is the per-repo lever that promotes specific overalls
+        # to `failure`. Empty fail_on (the default) keeps v1 advisory.
+        case "$OVERALL" in
+          PASS|PASS_WITH_PARTIALS) conclusion="success" ;;
+          HUMAN_REVIEW) conclusion="neutral" ;;
+          SKIPPED) conclusion="skipped" ;;
+          NEEDS_WORK)
+            if echo ",$FAIL_ON," | grep -q ",NEEDS_WORK,"; then
+              conclusion="failure"
+            else
+              conclusion="neutral"
+            fi
+            ;;
+          ERROR|*) conclusion="neutral" ;;
+        esac
+        # Title needs to be reasonably stable for branch-protection contexts to match.
+        gh api -X POST "repos/$OWNER/$REPO/check-runs" \
+          -f name='OgenticAI Reviewer / UAT' \
+          -f head_sha="$HEAD_SHA" \
+          -f status='completed' \
+          -f conclusion="$conclusion" \
+          -f "output[title]=UAT verdict: $OVERALL" \
+          -f "output[summary]=See the sticky comment for the per-item table."

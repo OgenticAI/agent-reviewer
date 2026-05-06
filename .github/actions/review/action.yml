@@ -33,6 +33,14 @@ inputs:
       enforcing (see OGE-340).
     required: false
     default: ""
+  auto_patch:
+    description: >-
+      When 'true' AND the verdict has at least one FAIL item flagged
+      autoPatchable=true, fire a focused claude-code-action invocation to
+      open a draft 'chore(uat): suggest fixes' PR. Off by default for v1
+      (see OGE-341).
+    required: false
+    default: "false"
 
 # Outputs the calling workflow can read off this Action.
 outputs:
@@ -128,3 +136,80 @@ runs:
           -f conclusion="$conclusion" \
           -f "output[title]=UAT verdict: $OVERALL" \
           -f "output[summary]=See the sticky comment for the per-item table."
+
+    # ── Auto-patch (OGE-341) ────────────────────────────────────────────────
+    # When `auto_patch: true` AND the verdict has at least one item with
+    # status=FAIL && autoPatchable=true, fire a focused claude-code-action
+    # invocation that creates a draft PR with a candidate fix. We delegate
+    # branching/committing/PR-opening to claude-code-action because that's
+    # what it's built for; we just hand it a tightly-scoped prompt.
+    #
+    # Disabled by default. Enabling per-repo via the workflow input.
+    - name: Check if auto-patch should run
+      id: should_autopatch
+      if: inputs.auto_patch == 'true'
+      shell: bash
+      env:
+        VERDICT_PATH: ${{ runner.temp }}/verdict.json
+      run: |
+        if [ ! -f "$VERDICT_PATH" ]; then
+          echo "should=false" >> "$GITHUB_OUTPUT"
+          echo "No verdict file — skipping auto-patch."
+          exit 0
+        fi
+        items=$(node -e "
+          const v = require(process.env.VERDICT_PATH);
+          const fails = (v.items || []).filter(it => it.status === 'FAIL' && it.autoPatchable === true);
+          if (fails.length === 0) { console.log(''); process.exit(0); }
+          console.log(fails.map(it => '- (#' + it.id + ') ' + it.itemText + ' — ' + it.rationale).join('\n'));
+        ")
+        if [ -z "$items" ]; then
+          echo "should=false" >> "$GITHUB_OUTPUT"
+          echo "No FAIL items marked autoPatchable=true — skipping auto-patch."
+        else
+          echo "should=true" >> "$GITHUB_OUTPUT"
+          # GH Actions multiline output
+          {
+            echo "items<<__OGENTICAI_EOF__"
+            echo "$items"
+            echo "__OGENTICAI_EOF__"
+          } >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Open auto-patch draft PR
+      if: steps.should_autopatch.outputs.should == 'true'
+      uses: anthropics/claude-code-action@v1
+      with:
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        github_token: ${{ steps.app_token.outputs.token }}
+        model: "claude-sonnet-4-5"
+        prompt: |
+          The OgenticAI Reviewer flagged the following UAT items on PR
+          #${{ github.event.pull_request.number }} as mechanically fixable
+          failures (status=FAIL, autoPatchable=true):
+
+          ${{ steps.should_autopatch.outputs.items }}
+
+          Your job:
+          1. Check out the PR's head branch.
+          2. For each item, write the smallest possible fix — add the missing
+             test, write the missing docstring, update the stale README claim,
+             bump the version. Do NOT redesign anything. Do NOT touch unrelated
+             files. If a fix isn't obvious or safe, skip it and note why in the
+             draft PR body.
+          3. Commit each change with a focused message ("test: add coverage for
+             X", "docs: document Y", etc.).
+          4. Open a *draft* PR titled
+             `chore(uat): suggest fixes for ${{ github.event.pull_request.head.ref }}`
+             targeting the same branch this PR is from. Include in the body:
+               - A link back to the original PR
+               - The list of items above with checkboxes for each
+               - A note that this is suggestive only — close it if the
+                 maintainer wants to fix differently
+        allowed_tools: |
+          Bash(git *:*)
+          Bash(gh pr create:*)
+          Bash(gh pr view:*)
+          Read
+          Edit
+          Write

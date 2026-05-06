@@ -9,6 +9,14 @@
 # step and skips the review cleanly. That's why the Check passes (with a
 # notice) on every PR landing here BEFORE the App goes live, and starts
 # producing real verdicts AFTER the App + secrets land.
+#
+# Pinning: this workflow uses `OgenticAI/agent-reviewer@v1` — the same
+# reference shape consumers use, not `./.github/actions/review`. The
+# tradeoff: changes to the action's code in a PR aren't tested by this
+# workflow. They ARE tested by `ci.yml` (typecheck + 118 vitest cases),
+# so the layered safety is: ci.yml proves the code; self-review.yml
+# proves the deployed shape consumers see. To preview a yet-to-be-tagged
+# change end-to-end, force-move the v1 tag locally and trigger by hand.
 
 name: OgenticAI Reviewer
 
@@ -57,10 +65,16 @@ jobs:
         uses: actions/checkout@v5
 
       - if: steps.cfg.outputs.configured == 'true'
-        uses: ./.github/actions/review
+        uses: OgenticAI/agent-reviewer/.github/actions/review@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
           github_app_private_key: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
           linear_api_token: ${{ secrets.LINEAR_API_TOKEN }}
+          # Auto-patch off for now — flip to "true" once we've watched a few
+          # FAIL verdicts and the autoPatchable signal feels reliable.
           auto_patch: "false"
+          # Merge gate: NEEDS_WORK → Check publishes `failure`, blocking merge
+          # when branch protection requires this Check. We dogfood the gate
+          # here first; consumer repos flip this on their own timeline.
+          fail_on: "NEEDS_WORK"

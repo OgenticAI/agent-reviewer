@@ -92,14 +92,18 @@ agent-reviewer/
 | Feature | Linear ticket | Status |
 |---------|--------------|--------|
 | Spec, scaffold, GitHub App, UAT parser | [OGE-337](https://linear.app/ogenticai/issue/OGE-337) | In review |
-| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | In progress |
-| Linear writeback (comments, status, follow-ups) | [OGE-339](https://linear.app/ogenticai/issue/OGE-339) | Backlog |
-| Merge gate via required Check + `/uat-override` | [OGE-340](https://linear.app/ogenticai/issue/OGE-340) | Backlog |
-| Auto-patch drafts + plugin + multi-repo rollout | [OGE-341](https://linear.app/ogenticai/issue/OGE-341) | Backlog |
+| Per-item PR review + sticky comment (advisory) | [OGE-338](https://linear.app/ogenticai/issue/OGE-338) | In review |
+| Linear writeback (comments, status, follow-ups) | [OGE-339](https://linear.app/ogenticai/issue/OGE-339) | In review |
+| Merge gate via required Check + `/uat-override` | [OGE-340](https://linear.app/ogenticai/issue/OGE-340) | In progress |
+| Auto-patch drafts + plugin + multi-repo rollout | [OGE-341](https://linear.app/ogenticai/issue/OGE-341) | In progress |
 
 ## Install
 
-See [docs/INSTALL.md](docs/INSTALL.md) for the per-repo workflow + branch-protection setup, and [docs/GITHUB_APP_SETUP.md](docs/GITHUB_APP_SETUP.md) for the one-time org-level App registration.
+For a single repo, see [docs/INSTALL.md](docs/INSTALL.md) — workflow file, branch protection, override flow.
+
+For the OgenticAI fleet, see [docs/PILOT.md](docs/PILOT.md) — the four v1 pilot repos and the rollout playbook (`scripts/rollout-reviewer.ts` opens an idempotent PR against each target).
+
+The one-time org-level GitHub App setup is documented in [docs/GITHUB_APP_SETUP.md](docs/GITHUB_APP_SETUP.md).
 
 ## Develop
 

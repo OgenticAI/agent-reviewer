@@ -71,6 +71,7 @@ jobs:
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
           github_app_private_key: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
           linear_api_token: ${{ secrets.LINEAR_API_TOKEN }}
+          auto_patch: "true"
           # Auto-patch off for now — flip to "true" once we've watched a few
           # FAIL verdicts and the autoPatchable signal feels reliable.
           auto_patch: "false"

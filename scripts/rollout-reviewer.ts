@@ -24,9 +24,9 @@
  * -----
  *   GITHUB_TOKEN=ghp_xxx tsx scripts/rollout-reviewer.ts \
  *     --repo OgenticAI/ogentic-shield \
- *     --repo agents-ogenticai/agent-sizer \
- *     --repo agents-ogenticai/agent-covenant \
- *     --repo agents-ogenticai/agent-knowledge \
+ *     --repo OgenticAI/agent-dealsizer \
+ *     --repo OgenticAI/agentcovenant \
+ *     --repo OgenticAI/agent-knowledge \
  *     [--dry-run] \
  *     [--app-install-url https://github.com/apps/ogenticai-reviewer/installations/new]
  *

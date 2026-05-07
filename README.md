@@ -158,8 +158,8 @@ The shortest summary: register the GitHub App, set four org secrets, then for ea
 GITHUB_TOKEN=ghp_xxx tsx scripts/rollout-reviewer.ts \
   --repo OgenticAI/ogentic-shield \
   --repo OgenticAI/agent-dealsizer \
-  --repo agents-ogenticai/agent-covenant \
-  --repo agents-ogenticai/agent-knowledge
+  --repo OgenticAI/agentcovenant \
+  --repo OgenticAI/agent-knowledge
 ```
 
 The script opens an idempotent install PR against each target. The maintainer reviews + merges per house style. Subsequent re-runs pick up template drift without spamming.
@@ -202,3 +202,4 @@ npx tsx src/cli.ts override-pr https://github.com/OgenticAI/ogentic-shield/pull/
 ## License
 
 Apache 2.0 &mdash; see [LICENSE](LICENSE).
+

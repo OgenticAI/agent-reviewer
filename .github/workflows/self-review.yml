@@ -71,10 +71,10 @@ jobs:
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
           github_app_private_key: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
           linear_api_token: ${{ secrets.LINEAR_API_TOKEN }}
+          # OGE-391 chaos test F: temporarily flipped to "true" to exercise the
+          # auto-patch path for a mechanical FAIL. This branch is throwaway —
+          # main keeps `auto_patch: "false"`.
           auto_patch: "true"
-          # Auto-patch off for now — flip to "true" once we've watched a few
-          # FAIL verdicts and the autoPatchable signal feels reliable.
-          auto_patch: "false"
           # Merge gate: NEEDS_WORK → Check publishes `failure`, blocking merge
           # when branch protection requires this Check. We dogfood the gate
           # here first; consumer repos flip this on their own timeline.

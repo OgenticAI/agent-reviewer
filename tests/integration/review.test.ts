@@ -149,8 +149,8 @@ describe("runReview (end-to-end)", () => {
     expect(result.verdict.ticketId).toBe("OGE-308");
     expect(result.verdict.prRef).toBe("OgenticAI/ogentic-shield#1");
     expect(result.verdict.headSha).toBe("f6299112233aabbccdd");
-    expect(result.verdict.reviewerVersion).toBe("v1");
-    expect(result.body.startsWith("<!-- ogenticai-reviewer-v1 -->")).toBe(true);
+    expect(result.verdict.reviewerVersion).toBe("v2");
+    expect(result.body.startsWith("<!-- ogenticai-reviewer-v2 -->")).toBe(true);
   });
 
   it("derives the right OverallStatus from the items", async () => {
@@ -398,6 +398,304 @@ describe("runReview (end-to-end)", () => {
         summary: "x",
       });
       await expect(runReview(buildArgs({ model: makeModel(bogus) }))).rejects.toThrow();
+    });
+  });
+
+  // ─── OGE-365 linked verification comments ──────────────────────────────────
+  //
+  // The orchestrator pre-fetches same-PR comments linked from ticked UAT items
+  // and passes them into the prompt. Tests verify the gate (ticked AND linked
+  // AND same-PR), the fail-safe behaviour (404 / undefined fetcher → drop
+  // silently), and that the determinism contract still holds with the new
+  // input vector.
+
+  describe("linked verification comments (OGE-365)", () => {
+    const PR_BODY_WITH_LINKED_COMMENT = [
+      "## Summary",
+      "OGE-308 / OGE-309 — redaction API",
+      "",
+      "## UAT checklist",
+      "- [x] redaction works — verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+      "- [ ] no link",
+      "",
+    ].join("\n");
+
+    function makeGithubWithComments(
+      pr: PrContext,
+      diff: string,
+      issueComments: Map<number, { author: string; createdAt: string; body: string }>,
+    ): GithubReader & {
+      issueCalls: Array<{ owner: string; repo: string; commentId: number }>;
+      reviewCalls: Array<{ owner: string; repo: string; commentId: number }>;
+    } {
+      const issueCalls: Array<{ owner: string; repo: string; commentId: number }> = [];
+      const reviewCalls: Array<{ owner: string; repo: string; commentId: number }> = [];
+      return {
+        getPr: async () => pr,
+        getDiff: async () => diff,
+        async getIssueComment({ owner, repo, commentId }) {
+          issueCalls.push({ owner, repo, commentId });
+          const c = issueComments.get(commentId);
+          if (!c) return null;
+          return {
+            url: `https://github.com/${owner}/${repo}/pull/${pr.number}#issuecomment-${commentId}`,
+            ...c,
+          };
+        },
+        async getReviewComment({ owner, repo, commentId }) {
+          reviewCalls.push({ owner, repo, commentId });
+          return null;
+        },
+        issueCalls,
+        reviewCalls,
+      };
+    }
+
+    const PARTIAL_VERDICT = JSON.stringify({
+      items: [
+        {
+          id: 1,
+          itemText:
+            "redaction works — verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+          status: "PARTIAL",
+          rationale:
+            "Diff alone is insufficient; author attested via linked comment with verification output.",
+          evidenceRefs: [
+            {
+              kind: "external",
+              url: "https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99",
+              note: "author verification comment",
+            },
+          ],
+        },
+        {
+          id: 2,
+          itemText: "no link",
+          status: "UNVERIFIABLE",
+          rationale: "No link, no diff evidence.",
+          evidenceRefs: [],
+        },
+      ],
+      summary: "One PARTIAL via linked-comment promotion, one UNVERIFIABLE.",
+    });
+
+    it("fetches a same-PR issue comment for a ticked, linked item", async () => {
+      const pr = makePr({ body: PR_BODY_WITH_LINKED_COMMENT });
+      const github = makeGithubWithComments(
+        pr,
+        SHARED_DIFF,
+        new Map([
+          [
+            99,
+            {
+              author: "davidoladeji-ogenticai",
+              createdAt: "2026-04-27T09:00:00.000Z",
+              body: "Verified: command output PASSED",
+            },
+          ],
+        ]),
+      );
+      const result = await runReview(
+        buildArgs({ github, model: makeModel(PARTIAL_VERDICT) }),
+      );
+      expect(github.issueCalls).toEqual([
+        { owner: "OgenticAI", repo: "ogentic-shield", commentId: 99 },
+      ]);
+      expect(github.reviewCalls).toEqual([]);
+      expect(result.verdict.items[0]?.status).toBe("PARTIAL");
+      expect(result.verdict.items[0]?.evidenceRefs[0]).toMatchObject({
+        kind: "external",
+        url: "https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99",
+      });
+    });
+
+    it("does NOT fetch when the linked comment is on a different PR (same-PR boundary)", async () => {
+      const body = [
+        "## Summary",
+        "OGE-308",
+        "",
+        "## UAT checklist",
+        // pull/777 is a different PR than the one being reviewed (pull/1)
+        "- [x] see [other PR](https://github.com/OgenticAI/ogentic-shield/pull/777#issuecomment-99)",
+        "",
+      ].join("\n");
+      const pr = makePr({ body });
+      const github = makeGithubWithComments(pr, SHARED_DIFF, new Map());
+      const stubVerdict = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText:
+              "see [other PR](https://github.com/OgenticAI/ogentic-shield/pull/777#issuecomment-99)",
+            status: "UNVERIFIABLE",
+            rationale: "Cross-PR link, no on-PR evidence.",
+            evidenceRefs: [],
+          },
+        ],
+        summary: "Cross-PR comment ignored.",
+      });
+      await runReview(buildArgs({ github, model: makeModel(stubVerdict) }));
+      expect(github.issueCalls).toEqual([]);
+      expect(github.reviewCalls).toEqual([]);
+    });
+
+    it("does NOT fetch when the item is unticked (gate is ticked AND linked)", async () => {
+      const body = [
+        "## Summary",
+        "OGE-308",
+        "",
+        "## UAT checklist",
+        // Same-PR link but checkbox unchecked → no fetch.
+        "- [ ] see [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+        "",
+      ].join("\n");
+      const pr = makePr({ body });
+      const github = makeGithubWithComments(pr, SHARED_DIFF, new Map());
+      const stubVerdict = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText:
+              "see [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+            status: "UNVERIFIABLE",
+            rationale: "Unticked.",
+            evidenceRefs: [],
+          },
+        ],
+        summary: "x",
+      });
+      await runReview(buildArgs({ github, model: makeModel(stubVerdict) }));
+      expect(github.issueCalls).toEqual([]);
+    });
+
+    it("treats fetcher returning null (e.g. 404) as if no link existed", async () => {
+      const pr = makePr({ body: PR_BODY_WITH_LINKED_COMMENT });
+      // Empty comment map → fetcher returns null for commentId 99
+      const github = makeGithubWithComments(pr, SHARED_DIFF, new Map());
+      const stubVerdict = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText:
+              "redaction works — verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+            status: "UNVERIFIABLE",
+            rationale: "Linked comment had no verification block.",
+            evidenceRefs: [],
+          },
+          { id: 2, itemText: "no link", status: "UNVERIFIABLE", rationale: "x", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(
+        buildArgs({ github, model: makeModel(stubVerdict) }),
+      );
+      // Fetcher WAS called (we don't know it'd 404 until we ask) — but the null
+      // result means no comment ends up in the prompt.
+      expect(github.issueCalls).toHaveLength(1);
+      expect(result.verdict.items[0]?.status).toBe("UNVERIFIABLE");
+    });
+
+    it("works when the GithubReader has no comment fetchers (back-compat for old mocks)", async () => {
+      // Test mocks that don't implement getIssueComment/getReviewComment must
+      // still pass — the orchestrator skips silently.
+      const pr = makePr({ body: PR_BODY_WITH_LINKED_COMMENT });
+      const minimalReader: GithubReader = {
+        getPr: async () => pr,
+        getDiff: async () => SHARED_DIFF,
+      };
+      const stubVerdict = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText:
+              "redaction works — verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+            status: "UNVERIFIABLE",
+            rationale: "x",
+            evidenceRefs: [],
+          },
+          { id: 2, itemText: "no link", status: "UNVERIFIABLE", rationale: "x", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(
+        buildArgs({ github: minimalReader, model: makeModel(stubVerdict) }),
+      );
+      expect(result.verdict.items).toHaveLength(2);
+    });
+
+    it("preserves byte-identical sticky across runs when comment body is unchanged (determinism)", async () => {
+      const pr = makePr({ body: PR_BODY_WITH_LINKED_COMMENT });
+      const fixedComment = new Map([
+        [
+          99,
+          {
+            author: "davidoladeji-ogenticai",
+            createdAt: "2026-04-27T09:00:00.000Z",
+            body: "Verified: command output PASSED",
+          },
+        ],
+      ]);
+      const a = await runReview(
+        buildArgs({
+          github: makeGithubWithComments(pr, SHARED_DIFF, fixedComment),
+          model: makeModel(PARTIAL_VERDICT),
+          now: () => "2026-04-27T08:30:00.000Z",
+        }),
+      );
+      const b = await runReview(
+        buildArgs({
+          github: makeGithubWithComments(pr, SHARED_DIFF, fixedComment),
+          model: makeModel(PARTIAL_VERDICT),
+          now: () => "2099-12-31T23:59:59.000Z",
+        }),
+      );
+      expect(a.body).toBe(b.body);
+    });
+
+    it("does NOT prevent diff-derived PASS — the ceiling only applies via the prompt's exception clause", async () => {
+      // The orchestrator's job is to expose the linked comment to the prompt;
+      // the prompt tells the model "diff-supported PASS is unaffected by the
+      // PARTIAL ceiling." The orchestrator must accept whatever verdict the
+      // model returns (PASS in this case) — it does NOT coerce verdicts.
+      const pr = makePr({ body: PR_BODY_WITH_LINKED_COMMENT });
+      const github = makeGithubWithComments(
+        pr,
+        SHARED_DIFF,
+        new Map([
+          [
+            99,
+            {
+              author: "davidoladeji-ogenticai",
+              createdAt: "2026-04-27T09:00:00.000Z",
+              body: "Verified: command output PASSED",
+            },
+          ],
+        ]),
+      );
+      const passVerdict = JSON.stringify({
+        items: [
+          {
+            id: 1,
+            itemText:
+              "redaction works — verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/1#issuecomment-99)",
+            status: "PASS",
+            rationale: "Diff itself adds redact() and the test asserting it.",
+            evidenceRefs: [
+              {
+                kind: "test",
+                path: "tests/test_redaction.py",
+                name: "test_round_trip",
+              },
+            ],
+          },
+          { id: 2, itemText: "no link", status: "UNVERIFIABLE", rationale: "x", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      const result = await runReview(
+        buildArgs({ github, model: makeModel(passVerdict) }),
+      );
+      expect(result.verdict.items[0]?.status).toBe("PASS");
     });
   });
 });

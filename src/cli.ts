@@ -335,6 +335,42 @@ function makeGithubReader(octokit: Octokit): GithubReader {
       });
       return resp.data as unknown as string;
     },
+    async getIssueComment({ owner, repo, commentId }) {
+      try {
+        const resp = await octokit.issues.getComment({
+          owner,
+          repo,
+          comment_id: commentId,
+        });
+        const c = resp.data;
+        return {
+          url: c.html_url,
+          author: c.user?.login ?? "unknown",
+          createdAt: c.created_at,
+          body: c.body ?? "",
+        };
+      } catch {
+        return null;
+      }
+    },
+    async getReviewComment({ owner, repo, commentId }) {
+      try {
+        const resp = await octokit.pulls.getReviewComment({
+          owner,
+          repo,
+          comment_id: commentId,
+        });
+        const c = resp.data;
+        return {
+          url: c.html_url,
+          author: c.user?.login ?? "unknown",
+          createdAt: c.created_at,
+          body: c.body ?? "",
+        };
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

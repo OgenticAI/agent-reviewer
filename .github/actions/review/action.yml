@@ -66,6 +66,15 @@ runs:
       uses: actions/setup-node@v5
       with:
         node-version: "20"
+        # The action installs its own deps via `npm ci` from a different
+        # working dir (the agent-reviewer checkout, not the consumer repo).
+        # Without this flag, setup-node@v5 auto-detects any pnpm-lock.yaml /
+        # yarn.lock at consumer-repo root and tries to enable that PM's
+        # cache — which then fails with `Unable to locate executable file:
+        # pnpm` (or yarn) because we never install those tools. Keeping
+        # the cache off makes the action self-contained for any consumer
+        # regardless of their package-manager-of-choice.
+        package-manager-cache: false
 
     - name: Install reviewer
       shell: bash

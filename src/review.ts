@@ -13,12 +13,17 @@
  *   We test it explicitly in tests/integration/review.test.ts.
  */
 
-import { parseUatChecklist } from "./parser/uat.js";
+import { parseUatChecklist, type UatItem, type UatItemLink } from "./parser/uat.js";
 import { resolveTickets } from "./linear/resolve.js";
 import { ReviewVerdict } from "./schema/verdict.js";
 import { overallStatus, type OverallStatus } from "./schema/verdict.js";
 import { renderStickyComment } from "./render/comment.js";
-import { buildReviewPrompt, SYSTEM_PROMPT } from "./prompt/review.js";
+import {
+  buildReviewPrompt,
+  LINKED_COMMENT_BODY_MAX_CHARS,
+  SYSTEM_PROMPT,
+  type LinkedComment,
+} from "./prompt/review.js";
 import { REVIEWER_VERSION } from "./version.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
@@ -38,10 +43,43 @@ export interface LinearClient {
   getIssue(identifier: string): Promise<LinearTicketContext>;
 }
 
-/** GitHub-side I/O: pull the PR + diff. */
+/**
+ * GitHub-side I/O: pull the PR + diff, plus optional comment fetchers used by
+ * the OGE-365 ticked-with-verification-comment promotion path. The two
+ * comment-fetcher methods are optional so existing test mocks (which only
+ * implement `getPr` + `getDiff`) keep compiling — when undefined, the
+ * orchestrator silently skips the linked-comment fetch step.
+ */
 export interface GithubReader {
   getPr(args: { owner: string; repo: string; number: number }): Promise<PrContext>;
   getDiff(args: { owner: string; repo: string; number: number }): Promise<string>;
+  getIssueComment?(args: {
+    owner: string;
+    repo: string;
+    commentId: number;
+  }): Promise<FetchedComment | null>;
+  getReviewComment?(args: {
+    owner: string;
+    repo: string;
+    commentId: number;
+  }): Promise<FetchedComment | null>;
+}
+
+/**
+ * A PR comment body fetched by the orchestrator and fed into the verdict
+ * prompt as evidence for the OGE-365 promotion path. Implementations return
+ * `null` on any error (404, 403, network) — fail-safe means the affected
+ * UAT item stays at whatever the model would have decided without the comment.
+ */
+export interface FetchedComment {
+  /** Canonical permalink to the comment on github.com. */
+  url: string;
+  /** Login of the comment's author (e.g. "davidoladeji-ogenticai"). */
+  author: string;
+  /** ISO-8601 creation timestamp. */
+  createdAt: string;
+  /** Comment body in original markdown. */
+  body: string;
 }
 
 export interface RunReviewArgs {
@@ -96,7 +134,19 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     );
   }
 
-  const userPrompt = buildReviewPrompt({ pr, ticket, checklist, diff });
+  const linkedComments = await fetchLinkedVerificationComments({
+    items: checklist.items,
+    pr,
+    github: args.github,
+  });
+
+  const userPrompt = buildReviewPrompt({
+    pr,
+    ticket,
+    checklist,
+    diff,
+    linkedComments,
+  });
   const rawJson = await args.model.produce({
     systemPrompt: SYSTEM_PROMPT,
     userPrompt,
@@ -244,4 +294,92 @@ function coerceEvidenceRef(raw: unknown): unknown {
 
   // Bare path → file
   return { kind: "file", path: s };
+}
+
+/**
+ * Fetch the bodies of any same-PR comments that were linked from ticked
+ * UAT items, so the verdict prompt can use them as evidence (OGE-365). The
+ * gate is intentionally narrow: an item must be ticked AND link a comment
+ * on the *same* PR (matching owner/repo/PR-number) to trigger a fetch. That
+ * same-PR check is the security boundary — without it an author could link
+ * a comment from a different PR (or a different repo entirely) and have
+ * the model treat unrelated text as verification evidence.
+ *
+ * Errors and edge cases all fail safe to "comment not attached":
+ *   - `getIssueComment` / `getReviewComment` undefined (test mocks) → skip silently.
+ *   - 404 / 403 / network error → skip silently (logged for observability).
+ *   - Cross-PR or non-comment link → ignored at the gate.
+ *
+ * Body is truncated to `LINKED_COMMENT_BODY_MAX_CHARS` so a multi-megabyte
+ * log paste doesn't crowd the diff out of the prompt budget.
+ */
+async function fetchLinkedVerificationComments(args: {
+  items: UatItem[];
+  pr: PrContext;
+  github: GithubReader;
+}): Promise<LinkedComment[]> {
+  const { items, pr, github } = args;
+  const out: LinkedComment[] = [];
+  for (const item of items) {
+    if (!item.checked) continue;
+    for (const link of item.links) {
+      if (!isSamePrCommentLink(link, pr)) continue;
+      const fetcher =
+        link.kind === "pr-comment-issue"
+          ? github.getIssueComment
+          : github.getReviewComment;
+      if (!fetcher) continue; // test mock without comment fetchers
+      let comment;
+      try {
+        comment = await fetcher.call(github, {
+          owner: link.owner,
+          repo: link.repo,
+          commentId: link.commentId,
+        });
+      } catch (err) {
+        console.error(
+          `[review] failed to fetch ${link.kind} ${link.url}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        continue;
+      }
+      if (!comment) continue;
+      const truncated = comment.body.length > LINKED_COMMENT_BODY_MAX_CHARS;
+      out.push({
+        itemId: item.id,
+        sourceUrl: link.url,
+        author: comment.author,
+        createdAt: comment.createdAt,
+        body: truncated
+          ? comment.body.slice(0, LINKED_COMMENT_BODY_MAX_CHARS)
+          : comment.body,
+        truncated,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The same-PR security gate: the link must point at a comment on the PR
+ * currently being reviewed, not a sibling PR or another repo. The parser
+ * captures `owner/repo/prNumber` from the URL itself; this function compares
+ * against the actual PR context.
+ */
+function isSamePrCommentLink(
+  link: UatItemLink,
+  pr: PrContext,
+): link is Extract<
+  UatItemLink,
+  { kind: "pr-comment-issue" | "pr-comment-review" }
+> {
+  if (link.kind !== "pr-comment-issue" && link.kind !== "pr-comment-review") {
+    return false;
+  }
+  return (
+    link.owner === pr.owner &&
+    link.repo === pr.repo &&
+    link.prNumber === pr.number
+  );
 }

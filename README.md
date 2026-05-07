@@ -5,7 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://github.com/OgenticAI/agent-reviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/OgenticAI/agent-reviewer/actions/workflows/ci.yml)
 ![v1: code complete](https://img.shields.io/badge/v1-code%20complete-success)
-![tests: 112](https://img.shields.io/badge/tests-112%20passing-success)
+![tests: 143](https://img.shields.io/badge/tests-143%20passing-success)
 
 ## What it does
 
@@ -24,6 +24,15 @@ On every `pull_request: [opened, synchronize, ready_for_review]` event:
 9. (Opt-in via `auto_patch: true`) drafts a patch PR titled `chore(uat): suggest fixes for <branch>` for mechanically-fixable failures.
 
 A maintainer can post `/uat-override <reason>` on any PR to flip the Check to success, post an audit comment on the Linear ticket, and label the ticket `uat-override`. The original verdict stays in the sticky comment &mdash; overrides unblock merge but never erase the audit trail.
+
+### Author attestation: ticked box + verification comment
+
+Some UAT items can't be checked from the diff alone &mdash; manual install steps, visual claims, "this command produces this output." For those, authors can:
+
+1. Run the verification themselves and paste the command + output (or screenshot) as a **comment on the same PR**.
+2. Tick the box in the PR description and link that comment from the item: `- [x] pip install works &mdash; verified in [comment](https://github.com/OWNER/REPO/pull/N#issuecomment-12345)`.
+
+The reviewer fetches the linked comment, looks for verification evidence (code-fenced output, "Verified:" / "PASS" markers, screenshots, logs), and may promote the item from **UNVERIFIABLE** to **PARTIAL** with the comment URL cited as evidence. The ceiling is intentional: full PASS would let any author flip an item just by ticking and linking. PARTIAL still surfaces in the merge gate as "needs human eyes" while honoring genuine self-verification. A bare ticked box with no linked comment, or a linked comment with no on-topic evidence, stays UNVERIFIABLE. (See [OGE-365](https://linear.app/ogenticai/issue/OGE-365).)
 
 ## Architecture
 
@@ -181,7 +190,7 @@ npx tsx src/cli.ts override-pr https://github.com/OgenticAI/ogentic-shield/pull/
 
 ## Determinism contract
 
-- Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`.
+- Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)
 - The Action and the plugin reduce to the same `runReview()` function. If you see a verdict on the PR that doesn't match what `npx tsx src/cli.ts review-pr <url>` produces locally, that's a bug &mdash; please file it.
 
 ## Failure-safety

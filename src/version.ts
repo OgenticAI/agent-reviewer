@@ -6,5 +6,5 @@
  * here invalidates existing sticky comments and starts a new sticky thread.
  * Don't bump idly.
  */
-export const REVIEWER_VERSION = "v1";
+export const REVIEWER_VERSION = "v2";
 export const COMMENT_MARKER = `<!-- ogenticai-reviewer-${REVIEWER_VERSION} -->`;

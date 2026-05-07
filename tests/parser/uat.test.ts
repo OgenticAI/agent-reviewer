@@ -172,6 +172,125 @@ describe("parseUatChecklist", () => {
     });
   });
 
+  describe("link extraction (OGE-365)", () => {
+    it("classifies an inline-markdown PR issue-comment link", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] verified in [comment](https://github.com/OgenticAI/ogentic-shield/pull/4#issuecomment-4392720381)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links).toEqual([
+        {
+          kind: "pr-comment-issue",
+          url: "https://github.com/OgenticAI/ogentic-shield/pull/4#issuecomment-4392720381",
+          owner: "OgenticAI",
+          repo: "ogentic-shield",
+          prNumber: 4,
+          commentId: 4392720381,
+        },
+      ]);
+    });
+
+    it("classifies a bare PR issue-comment link", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] see https://github.com/OgenticAI/agent-reviewer/pull/13#issuecomment-12345.",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links).toHaveLength(1);
+      expect(result.items[0]?.links[0]).toMatchObject({
+        kind: "pr-comment-issue",
+        owner: "OgenticAI",
+        repo: "agent-reviewer",
+        prNumber: 13,
+        commentId: 12345,
+      });
+      // Trailing punctuation stripped
+      expect(result.items[0]?.links[0]?.url.endsWith("12345")).toBe(true);
+    });
+
+    it("classifies a review-comment link (#discussion_rNNN, no hyphen)", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] verified in [review](https://github.com/o/r/pull/9#discussion_r987654)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links[0]).toEqual({
+        kind: "pr-comment-review",
+        url: "https://github.com/o/r/pull/9#discussion_r987654",
+        owner: "o",
+        repo: "r",
+        prNumber: 9,
+        commentId: 987654,
+      });
+    });
+
+    it("captures cross-PR same-owner URLs with their OWN prNumber (orchestrator filters, not parser)", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] see [other PR](https://github.com/OgenticAI/ogentic-shield/pull/99#issuecomment-1)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links[0]).toMatchObject({
+        kind: "pr-comment-issue",
+        prNumber: 99,
+        commentId: 1,
+      });
+    });
+
+    it("classifies non-comment github URLs as 'other'", () => {
+      const md = [
+        "## UAT checklist",
+        "- [ ] see [README](https://github.com/OgenticAI/agent-reviewer/blob/main/README.md)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links[0]).toEqual({
+        kind: "other",
+        url: "https://github.com/OgenticAI/agent-reviewer/blob/main/README.md",
+      });
+    });
+
+    it("classifies external (non-github) URLs as 'other'", () => {
+      const md = [
+        "## UAT checklist",
+        "- [ ] see [blog post](https://example.com/post)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links[0]).toEqual({
+        kind: "other",
+        url: "https://example.com/post",
+      });
+    });
+
+    it("collapses duplicate URLs (inline + bare) to a single link", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] see [comment](https://github.com/o/r/pull/1#issuecomment-99) — also https://github.com/o/r/pull/1#issuecomment-99",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links).toHaveLength(1);
+    });
+
+    it("captures multiple distinct links in source order", () => {
+      const md = [
+        "## UAT checklist",
+        "- [x] [a](https://github.com/o/r/pull/1#issuecomment-1) and [b](https://github.com/o/r/pull/1#discussion_r2) and [c](https://example.com)",
+      ].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links.map((l) => l.kind)).toEqual([
+        "pr-comment-issue",
+        "pr-comment-review",
+        "other",
+      ]);
+    });
+
+    it("returns links: [] when there is no URL in the item text", () => {
+      const md = ["## UAT checklist", "- [ ] no link here"].join("\n");
+      const result = parseUatChecklist(md);
+      expect(result.items[0]?.links).toEqual([]);
+    });
+  });
+
   describe("summarizeChecklist", () => {
     it("counts checked vs unchecked correctly", () => {
       const md = ["## UAT checklist", "- [x] done", "- [x] also done", "- [ ] pending"].join("\n");

@@ -186,7 +186,12 @@ runs:
         fi
 
     - name: Open auto-patch draft PR
+      id: autopatch_run
       if: steps.should_autopatch.outputs.should == 'true'
+      # Don't fail the outer reviewer workflow if the inner Claude action
+      # has a hiccup — we want the diagnostic step below to always run so
+      # OGE-395 has the data to triage.
+      continue-on-error: true
       uses: anthropics/claude-code-action@v1
       with:
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
@@ -222,3 +227,87 @@ runs:
           Read
           Edit
           Write
+
+    # ─── OGE-395 diagnostic ─────────────────────────────────────────────────
+    # The auto-patch action (above) has been observed to exit `success` and
+    # produce no draft PR. This step captures everything we need to triage
+    # *why*: the inner step's outcome, working-directory state, branches the
+    # inner action created locally + pushed, and any chore(uat) PRs that
+    # exist on the repo (so we can tell whether a PR was created but missed
+    # in some other way).
+    #
+    # Always runs when the gate said `should=true`, regardless of whether
+    # the inner action succeeded — `continue-on-error: true` above lets this
+    # step observe failures too.
+    - name: Diagnose auto-patch outcome (OGE-395)
+      if: steps.should_autopatch.outputs.should == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app_token.outputs.token }}
+      run: |
+        set +e   # diagnostics must never break the workflow
+        echo "::group::auto-patch action outcome"
+        echo "outcome=${{ steps.autopatch_run.outcome }}"
+        echo "conclusion=${{ steps.autopatch_run.conclusion }}"
+        echo "::endgroup::"
+
+        echo "::group::working directory state"
+        echo "pwd=$(pwd)"
+        echo "HEAD=$(git rev-parse HEAD 2>/dev/null || echo 'no HEAD')"
+        echo "current-branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached')"
+        echo "--- git status --porcelain ---"
+        git status --porcelain 2>&1 | head -40
+        echo "--- git log --oneline -5 ---"
+        git log --oneline -5 2>&1
+        echo "::endgroup::"
+
+        echo "::group::local branches (post-action)"
+        git branch -v 2>&1 | head -20
+        echo "::endgroup::"
+
+        echo "::group::remote branches created in the last 10 min"
+        git fetch origin --prune --quiet 2>/dev/null
+        # ISO timestamp 10 min ago (portable across GNU/BSD date)
+        TEN_MIN_AGO=$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)).isoformat())" 2>/dev/null)
+        git for-each-ref --sort=-creatordate --count=15 \
+          --format='%(refname:short) %(creatordate:iso-strict)' refs/remotes/origin/ 2>&1 \
+          | awk -v cutoff="$TEN_MIN_AGO" '$2 >= cutoff || cutoff == "" { print "  " $0 }'
+        echo "::endgroup::"
+
+        echo "::group::draft PRs by ogenticai-reviewer[bot] currently open"
+        gh pr list \
+          --repo "$GITHUB_REPOSITORY" \
+          --state open \
+          --draft \
+          --json number,title,headRefName,author,createdAt \
+          --jq '.[] | select(.author.login | startswith("ogenticai-reviewer")) | "  #\(.number) head=\(.headRefName) created=\(.createdAt) — \(.title)"' \
+          2>&1 | head -20
+        echo "::endgroup::"
+
+        echo "::group::chore(uat) titled PRs (any state, ever)"
+        gh pr list \
+          --repo "$GITHUB_REPOSITORY" \
+          --state all \
+          --search 'chore(uat) in:title' \
+          --json number,title,headRefName,state,createdAt \
+          --jq '.[] | "  #\(.number) [\(.state)] head=\(.headRefName) created=\(.createdAt) — \(.title)"' \
+          2>&1 | head -20
+        echo "::endgroup::"
+
+        # Emit a concise summary line that aggregates the verdict for OGE-395
+        # downstream consumers (humans grepping the log; future automation).
+        if [ "${{ steps.autopatch_run.conclusion }}" = "success" ]; then
+          # Was a PR actually opened? Cross-check by searching for any chore(uat)
+          # PR younger than the workflow start.
+          NEW_DRAFT=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open --draft \
+            --search 'chore(uat) in:title' \
+            --json number --jq 'length' 2>/dev/null)
+          echo "[autopatch:OGE-395] inner-success=true new-draft-pr-count=${NEW_DRAFT:-?}"
+          if [ "${NEW_DRAFT:-0}" = "0" ]; then
+            echo "[autopatch:OGE-395] ⚠️  inner action exited success but no chore(uat) draft PR exists — this is the failure mode."
+          fi
+        else
+          echo "[autopatch:OGE-395] inner-conclusion=${{ steps.autopatch_run.conclusion }} outcome=${{ steps.autopatch_run.outcome }}"
+        fi

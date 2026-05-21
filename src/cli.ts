@@ -28,6 +28,7 @@ import { runReview, ReviewSkippedError } from "./review.js";
 import type { GithubReader, VerdictModel } from "./review.js";
 import { LinearGraphqlClient } from "./linear/client.js";
 import { runWriteback } from "./linear/writeback.js";
+import { isCiGreen } from "./ci-green.js";
 import { upsertStickyComment } from "./github/sticky.js";
 import { REVIEWER_VERSION } from "./version.js";
 import {
@@ -446,23 +447,6 @@ function makePrReplyWriter(octokit: Octokit): PrReplyWriter {
       });
     },
   };
-}
-
-async function isCiGreen(
-  octokit: Octokit,
-  args: { owner: string; repo: string; ref: string },
-): Promise<boolean> {
-  try {
-    const status = await octokit.repos.getCombinedStatusForRef(args);
-    if (status.data.state !== "success") return false;
-    const checks = await octokit.checks.listForRef(args);
-    const conclusions = checks.data.check_runs.map((c) => c.conclusion);
-    return conclusions.every(
-      (c) => c === "success" || c === "neutral" || c === "skipped" || c === null,
-    );
-  } catch {
-    return false;
-  }
 }
 
 // keep CHECK_NAME importable from cli.ts re-export site if anyone needs it

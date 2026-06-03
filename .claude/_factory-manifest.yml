@@ -4,17 +4,17 @@
 manifest_version: 1
 factory_source: "https://github.com/OgenticAI/agent-factory"
 
-synced_kit_sha: "1b080a23a3df4129f3d1c1a866097de397ac415f"
-synced_kit_hash: "437ae91e45ace6a1206489de53051c97b1e6e59a8c18d27b7eaa2cce569633e9"
-synced_at: "2026-06-03T15:24:13.551778+00:00"
+synced_kit_sha: "138f5731e42448b24bafa9867cd9ceeab40b9b27"
+synced_kit_hash: "8e4a00d29cb0e452fe961a63d369c4fcba663aad065786182d9f520f1fedfc57"
+synced_at: "2026-06-03T17:04:59.069117+00:00"
 
 files:
   - path: .claude/CLAUDE-FACTORY.md
-    content_sha256: a137fb3b1096110ea8e83200ff4cbaccd2c972a9d18016e34a9898683732460b
+    content_sha256: b1531543e8dd1c0757d1b04222eca4be6931bc1f65894684bb19b5d421951a23
   - path: .claude/LINEAR-INTEGRATION.md
     content_sha256: 1063b1c042308718c31aa6ea3d2d8ae3989540fdc4071a07c58ea165e7303dac
   - path: .claude/agents/01-researcher.md
-    content_sha256: 9645a11725a637935605ec6c80356b0ab5323102835a69688c2339903a8c1922
+    content_sha256: b776bec33a393a20277ded6d3c36910f55ab4962b9182092070f0b1f2769be08
   - path: .claude/agents/02-story-writer.md
     content_sha256: 4759cb8cd510d21aa46d10294a0dc7913215dbbb6cfa7e5d051502878fa1486b
   - path: .claude/agents/03-spec-writer.md
@@ -59,8 +59,10 @@ files:
     content_sha256: b5359ed469b8005203d4970c4e973381a0f6bd564d5299d7ef8633524ff42d62
   - path: .claude/skills/multi-repo-coordinator/SKILL.md
     content_sha256: de3eb21edb74810af6c35f326effc5fbc1ba43c63806c2b1252684f82a12e7a9
+  - path: .claude/skills/new-from-knowledge/SKILL.md
+    content_sha256: 0dea4692022b0010beceb46906c5ea3953416aec55bc285be71ab03d52e73f7d
   - path: .claude/skills/project-planner/SKILL.md
-    content_sha256: 3b2e7fb84d9408067dd828b107d30811fa8f32356ce3bb271e7d5aa2a6288382
+    content_sha256: cee6c74fada65213e3746823214341dbb90b22dc23c8d618c81e49049eb32168
   - path: .claude/skills/repo-bootstrap/SKILL.md
     content_sha256: 2c082bf2e2bfbcbb609ab8468fc75d762e6a72211aae67306539a8186d1eabcf
   - path: .claude/skills/repo-create/SKILL.md

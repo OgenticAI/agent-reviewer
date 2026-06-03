@@ -194,4 +194,44 @@ After that, propagation will never overwrite the file in this repo.
 In `agent-factory` → Actions → "Propagate factory kit" → "Run workflow". Choose `non-stale` or pass an explicit comma-separated list of repo names.
 
 
+---
+
+## §F7 — Org-knowledge (the `factory.knowledge_enabled` feature flag)
+
+The factory can consult **org-knowledge** — the org's unified search across Slack, Notion, Drive, Gmail, Calendar, GitHub, OneDrive, and Documents — to ground new work in what the team has already discussed. This is delivered by the `mcp-orgknowledge` plugin (in `OgenticAI/ogenticai-plugins`), which wraps the org-knowledge `/api/v1/search` API (Linear ticket `OGE-590`).
+
+**Default: off.** Until the operator turns it on per-repo, none of the agents call the API. This is deliberate — the API is still in flight (Track C Phase 1), and we want every repo to opt-in once it's live and the operator has generated a token.
+
+**How to turn it on for this repo.**
+
+1. Generate an API key at `orgknowledge.ogenticai.com → Settings → API keys`. Label it `agent-factory · <repo-name>`.
+2. Export the token where Cowork runs (host shell, not sandbox):
+   ```sh
+   export ORGKNOWLEDGE_API_TOKEN="okak_<prefix>_<secret>"
+   ```
+3. Install the `mcp-orgknowledge` Cowork plugin from the `ogenticai-plugins` marketplace.
+4. Add this line to this repo's `CLAUDE.md` (anywhere — convention is §6 / "Open questions for the operator" — or replace this whole sentence with a fresh §7 if you prefer):
+
+   ```
+   factory.knowledge_enabled: true
+   ```
+
+5. Verify: in a Cowork session, ask the `mcp-orgknowledge:orgknowledge_health` tool to run. It should return `{ok: true, …}`.
+
+**Which agents read it.**
+
+| Agent / skill | What it does with org-knowledge |
+|---|---|
+| `researcher` | Calls `orgknowledge_search` as Step 0 of every feature-factory run; posts a `[factory:researcher] knowledge digest` comment on the Linear ticket. |
+| `project-planner` | Calls `orgknowledge_search` in §0 before drafting; halts and asks the operator if the ask fits an existing project. |
+| `new-from-knowledge` | Periodically scans for "decisions without tickets" and proposes Linear issues. |
+
+**Privacy / Shield.** Snippets from `orgknowledge_search` can contain PHI, privilege, or MNPI. Agents must **not** copy snippets verbatim into Linear comments if this repo imports `@ogenticai/shield` or sits in the Therapy / Private Credit verticals. Paraphrase one sentence; rely on `source_url` for inspection.
+
+**Rollback.** Set `factory.knowledge_enabled: false` in this repo's `CLAUDE.md` (or remove the line — false is the default). Agents will skip the org-knowledge step silently and note `factory.knowledge_enabled=false` in their output.
+
+**Failure semantics.** While the API is in flight, every call returns `code: UNREACHABLE`. Agents must treat this as a no-op and continue, not a halt. Once `OGE-590` ships, the same flag flip turns the calls into a hard signal.
+
+
+
 — end of factory partial —

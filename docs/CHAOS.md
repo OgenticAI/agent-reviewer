@@ -53,7 +53,7 @@ $ gh api repos/OgenticAI/agent-reviewer/commits/<sha>/status --jq '{state, conte
 {"contexts":[],"state":"pending"}
 ```
 
-Followup ticket recommended: harden `isCiGreen` to treat "no statuses + all checks green" as `ciGreen=true` (or use `checks.listForRef` exclusively).
+Tracked as follow-up [OGE-394](https://linear.app/ogenticai/issue/OGE-394) — harden `isCiGreen` to treat "no statuses + all checks green" as `ciGreen=true` (or use `checks.listForRef` exclusively).
 
 **Replay.** Same PR shape as above. Watch the run log for `linear:status:noop` (current bug) vs `linear:status:update→Ready to Merge` (post-fix).
 
@@ -153,7 +153,7 @@ prompt: "The OgenticAI Reviewer flagged the following UAT
 
 Likely cause: the inner action's GitHub App token (minted with `actions/create-github-app-token@v1` and passed via `github_token`) has the right scopes for *commenting* but the inner action also needs to create branches and push commits, and either the model declined to commit (the prompt has a "if a fix isn't obvious or safe, skip it" escape) or the runner's checked-out workspace was the action's `github.action_path`-relative dir, not the consumer-PR head branch.
 
-Followup ticket recommended: instrument the auto-patch step with explicit error capture so the next time it doesn't create a PR, we know whether the model declined or the tooling failed.
+Tracked as follow-up [OGE-395](https://linear.app/ogenticai/issue/OGE-395) — instrument the auto-patch step with explicit error capture so the next time it doesn't create a PR, we know whether the model declined or the tooling failed.
 
 **Replay.** Same setup. Watch the inner `claude-code-action@v1` step's logs (currently truncated by GitHub's run-log redaction).
 
@@ -200,7 +200,7 @@ Followup ticket recommended: instrument the auto-patch step with explicit error 
 | G. Pilot dashboard Linear view | ⏸️ Manual | OGE-341 AC: needs Linear UI work |
 | H. Plugin marketplace listing | ⏸️ Manual | OGE-341 AC: needs marketplace decision + publish |
 
-**Followup tickets to file:**
+**Follow-up tickets filed:**
 
-- `isCiGreen` returns false when commit has no statuses — blocks the OGE-339 Ready-to-Merge transition in normal flow.
-- Auto-patch downstream PR creation didn't fire — `claude-code-action@v1` invoked but no branch/PR created. Add error capture; investigate why.
+- [OGE-394](https://linear.app/ogenticai/issue/OGE-394) — `isCiGreen` returns false when commit has no statuses; blocks the OGE-339 Ready-to-Merge transition in normal flow (chaos B).
+- [OGE-395](https://linear.app/ogenticai/issue/OGE-395) — auto-patch downstream PR creation didn't fire; `claude-code-action@v1` invoked but no branch/PR created. Add error capture; investigate why (chaos F).

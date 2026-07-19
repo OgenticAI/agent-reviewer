@@ -52,6 +52,12 @@ import {
   type TriageResult,
 } from "./triage/triage.js";
 import {
+  appendReviewedSha,
+  highestReviewedSha,
+  mergeCarriedForward,
+  selectItems,
+} from "./incremental/select.js";
+import {
   loadRepoConfig,
   matchingLearnedRules,
   matchingPathInstructions,
@@ -230,6 +236,12 @@ export interface RunReviewArgs {
    * diff pack. Omitted / errors → today's uniform behaviour, unchanged.
    */
   triageModel?: TriageModel;
+  /**
+   * Carry untouched verdicts forward across pushes (OGE-1590). Requires a
+   * previous verdict (`cachedVerdict`) and `github.getChangedPaths`. Off by
+   * default; the CLI decides via the `incremental_*` thresholds.
+   */
+  incrementalEnabled?: boolean;
 }
 
 export interface RunReviewResult {
@@ -271,6 +283,8 @@ export interface RunReviewResult {
   suggestedItemIds?: number[];
   /** Per-item routing from the cheap triage pre-pass (OGE-1595), when it ran. */
   triage?: TriageResult;
+  /** Carried vs re-verified counts when incremental review ran (OGE-1590). */
+  incremental?: { carried: number; reverified: number };
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -510,6 +524,46 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Incremental review: carry untouched items forward from the previous
+  // verdict so an unrelated push can't churn a verdict whose code didn't move
+  // (OGE-1590). The previous verdict is the same sidecar the cache reads.
+  let incrementalInfo: { carried: number; reverified: number } | undefined;
+  const previousVerdict = args.cachedVerdict ?? null;
+  const reviewedShas = appendReviewedSha(previousVerdict, pr.headSha);
+  if (args.incrementalEnabled && previousVerdict && args.github.getChangedPaths) {
+    const base = highestReviewedSha(previousVerdict);
+    let changedPaths: string[] = [];
+    if (base && base !== pr.headSha) {
+      try {
+        changedPaths = await args.github.getChangedPaths({
+          owner: pr.owner,
+          repo: pr.repo,
+          base,
+          head: pr.headSha,
+        });
+      } catch (err) {
+        // Fail-open: no delta means re-verify everything, never carry a stale
+        // verdict on a failed diff read.
+        console.error(
+          `[incremental] delta ${base}..${pr.headSha} failed; full review — ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const selection = selectItems({
+      previousItems: previousVerdict.items,
+      currentItemIds: adjudicated.items.map((it) => it.id),
+      changedPaths,
+    });
+    const mergedItems = mergeCarriedForward({ fresh: adjudicated, previous: previousVerdict, selection });
+    adjudicated = { ...adjudicated, items: mergedItems };
+    incrementalInfo = { carried: selection.carryForward.size, reverified: selection.reverify.size };
+    console.error(
+      `[incremental] carried ${incrementalInfo.carried}, re-verified ${incrementalInfo.reverified}`,
+    );
+  }
+  adjudicated = { ...adjudicated, reviewedShas };
+
   // Outcome telemetry: did the last verdict change anything? (OGE-1592)
   // `puntRate` alone cannot tell better verification from bolder guessing.
   const outcomes = await computeOutcomesForRun({
@@ -565,6 +619,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ...(inlineComments ? { inlineComments } : {}),
     ...(suggested ? { suggestedItemIds: suggested } : {}),
     ...(triage ? { triage } : {}),
+    ...(incrementalInfo ? { incremental: incrementalInfo } : {}),
     prContext: pr,
     ticket,
     cached: false,

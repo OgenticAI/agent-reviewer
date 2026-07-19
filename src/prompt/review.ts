@@ -25,6 +25,7 @@ import { COMMENT_MARKER, REVIEWER_VERSION } from "../version.js";
 import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
+import { renderCiSection, type CiSummary } from "../ci/summary.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -76,6 +77,11 @@ export interface BuildPromptArgs {
    * non-research repos byte-identical to v2.
    */
   research?: ResearchPolicy;
+  /**
+   * Check runs and commit statuses for the head SHA (OGE-1554). Omitted keeps
+   * the prompt byte-identical to v2 for callers that don't supply it.
+   */
+  ci?: CiSummary;
 }
 
 const DISABLED_RESEARCH: ResearchPolicy = {
@@ -163,6 +169,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     : "(No `## UAT checklist` block found in the PR description.)";
 
   const linkedCommentsSection = renderLinkedCommentsSection(linkedComments);
+  const ciSection = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
 
   return [
     `# Review request`,
@@ -180,6 +187,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     ``,
     checklistBlock,
     ``,
+    ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,
     ``,

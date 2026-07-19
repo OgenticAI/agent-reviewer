@@ -22,6 +22,32 @@
 import { createHash } from "node:crypto";
 
 import { ReviewVerdict } from "../schema/verdict.js";
+import { normalizeToolOutput } from "./normalize.js";
+import type { ToolCallRecord } from "../tools/loop.js";
+
+/**
+ * Fingerprint of what the client-side tools returned, with volatile substrings
+ * normalised out (OGE-1553).
+ *
+ * Sorted, so a model that happened to call two independent tools in a
+ * different order still fingerprints the same — call order is a trajectory
+ * detail, not evidence.
+ *
+ * Stored in the sidecar for observability. It is deliberately NOT part of the
+ * fast-path cache key — see the note on `isCacheHit` for why that is not
+ * achievable with a model-driven loop.
+ *
+ * Web-search results are absent by construction: those are server-side and
+ * live in the research trace, not the client-side transcript. That is the
+ * right exclusion — invalidating a verdict because a search result drifted
+ * would reintroduce exactly the churn this cache exists to prevent.
+ */
+export function hashToolOutputs(transcript: ToolCallRecord[]): string {
+  const normalized = transcript
+    .map((call) => `${call.name}\u0000${normalizeToolOutput(call.result)}`)
+    .sort();
+  return createHash("sha256").update(normalized.join("\u0001"), "utf8").digest("hex");
+}
 
 /** Stable cache key for a verdict: SHA-256 of the exact user prompt. */
 export function hashPrompt(userPrompt: string): string {
@@ -61,6 +87,26 @@ export function parseVerdictFromStickyBody(body: string): ReviewVerdict | null {
 
 /**
  * Whether a previously-posted verdict can stand in for this run.
+ *
+ * ── On "changed tool output invalidates the cache" ─────────────────────────
+ *
+ * OGE-1553 asked for tool outputs in the cache key. That is not achievable on
+ * the fast path, and it is worth being precise about why rather than shipping
+ * something that looks like it: tool calls are chosen by the model, so you
+ * cannot learn what the tools would have returned without making the model
+ * call the cache exists to avoid. Any scheme that "checks tool outputs first"
+ * has either already paid for the run or is guessing.
+ *
+ * What makes this acceptable in practice is that the evidence which actually
+ * moves a verdict is already in the prompt, and therefore already in
+ * `promptHash`: the diff, the checklist, the ticket, and — since OGE-1554 —
+ * CI check-run status. A tool output that changed while all of those stayed
+ * byte-identical is a narrow case (a CI *log* differing under an unchanged
+ * *conclusion*), and replaying there is a much smaller error than re-reviewing
+ * every push forever.
+ *
+ * `toolOutputHash` is still recorded so a human debugging a suspicious replay
+ * can see whether the tool evidence actually matched.
  *
  * All three must hold:
  *   - same head SHA (the code under review is unchanged)

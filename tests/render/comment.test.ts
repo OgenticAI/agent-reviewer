@@ -192,3 +192,37 @@ describe("renderStickyComment — two-channel fallback (OGE-1586)", () => {
     expect(renderStickyComment(v, undefined)).toBe(renderStickyComment(v));
   });
 });
+
+describe("renderStickyComment — incremental carried-forward marking (OGE-1590)", () => {
+  it("adds a When column marking carried-forward vs re-checked items", () => {
+    const out = renderStickyComment(
+      makeVerdict({
+        items: [
+          {
+            id: 1,
+            itemText: "carried item",
+            status: "PASS",
+            rationale: "unchanged",
+            evidenceRefs: [],
+            verifiedAtSha: "abcdef1234567",
+          },
+          {
+            id: 2,
+            itemText: "fresh item",
+            status: "FAIL",
+            rationale: "just broke",
+            evidenceRefs: [],
+          },
+        ],
+      }),
+    );
+    expect(out).toContain("| When |");
+    expect(out).toContain("carried from `abcdef1`");
+    expect(out).toContain("re-checked");
+  });
+
+  it("keeps the 4-column table byte-identical when nothing carried forward", () => {
+    const out = renderStickyComment(makeVerdict());
+    expect(out).not.toContain("| When |");
+  });
+});

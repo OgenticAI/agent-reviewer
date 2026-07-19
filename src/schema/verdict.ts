@@ -127,6 +127,22 @@ export const ItemVerdict = z.object({
    */
   evidence: z.array(z.string()).optional(),
   /**
+   * Files this verdict cited, denormalized from `evidenceRefs` (OGE-1590).
+   *
+   * Incremental review intersects these with the push-delta to decide whether
+   * the item can carry forward. Stored explicitly rather than re-derived so a
+   * carried-forward verdict keeps the files it was ACTUALLY judged against,
+   * even after later pushes reshape the diff. Optional / derivable: absent it
+   * falls back to the paths in `evidenceRefs`.
+   */
+  evidenceFiles: z.array(z.string()).optional(),
+  /**
+   * The head SHA this item's verdict was last verified against (OGE-1590). Set
+   * when the item carries forward unchanged, so the comment can annotate
+   * "verified at <sha>". Absent means "verified this run".
+   */
+  verifiedAtSha: z.string().min(7).optional(),
+  /**
    * A proposed one-click fix as a contiguous single-hunk replacement on the
    * head file (OGE-1596). Rendered as a GitHub ```suggestion block on the
    * inline comment ONLY when a strict certainty gate passes — FAIL,
@@ -199,6 +215,13 @@ export const ReviewVerdict = z.object({
    * observability — not part of the cache key. See `isCacheHit`.
    */
   toolOutputHash: z.string().optional(),
+  /**
+   * Head SHAs this verdict's items have been verified against, oldest→newest
+   * (OGE-1590). Incremental review reads the highest one to compute the
+   * push-delta and decide which items can carry forward. Optional so older
+   * sidecars parse; absent means "no incremental history", i.e. full review.
+   */
+  reviewedShas: z.array(z.string().min(7)).optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdict>;
 

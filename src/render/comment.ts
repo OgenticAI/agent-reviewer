@@ -60,12 +60,29 @@ export function renderStickyComment(
     lines.push("");
   }
 
-  lines.push("| # | Item | Verdict | Rationale |");
-  lines.push("|---|------|---------|-----------|");
+  // The "When" column appears only once any item carried forward (OGE-1590),
+  // so PRs that never went incremental keep a byte-identical 4-column table.
+  const anyCarried = verdict.items.some((it) => it.verifiedAtSha);
+  if (anyCarried) {
+    lines.push("| # | Item | Verdict | When | Rationale |");
+    lines.push("|---|------|---------|------|-----------|");
+  } else {
+    lines.push("| # | Item | Verdict | Rationale |");
+    lines.push("|---|------|---------|-----------|");
+  }
   for (const item of verdict.items) {
     const text = escapeTableCell(item.itemText);
     const rationale = escapeTableCell(item.rationale);
-    lines.push(`| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${rationale} |`);
+    if (anyCarried) {
+      const when = item.verifiedAtSha
+        ? `carried from \`${item.verifiedAtSha.slice(0, 7)}\``
+        : "re-checked";
+      lines.push(
+        `| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${when} | ${rationale} |`,
+      );
+    } else {
+      lines.push(`| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${rationale} |`);
+    }
   }
   lines.push("");
 

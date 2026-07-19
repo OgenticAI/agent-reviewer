@@ -255,6 +255,15 @@ Mechanical checklist items ("lint passes", "no new type errors", "tests cover th
 - **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
 - **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
 
+## Incremental review &mdash; `incremental_min_commits` / `incremental_min_minutes`
+
+The replay cache keys on `headSha`, so before this every push re-reviewed the whole diff against the whole checklist &mdash; and an item that was PASS yesterday could flip on an unrelated push, which authors read as noise. Incremental review carries untouched verdicts forward.
+
+- **State lives in the PR.** The reviewed-SHA history and each verdict's evidence files are stored in the sticky-comment JSON sidecar &mdash; no backend, the design CodeRabbit independently arrived at.
+- **Selection.** On a new push the reviewer computes the delta from the highest previously-reviewed SHA to head and re-verifies only items whose evidence files intersect it, **plus every FAIL** (an open defect always gets another look) and any item with no evidence to prove it's untouched. The rest carry forward, annotated `verified at <sha>` &mdash; and the *previous* verdict wins for those, so the model can't churn an item whose code didn't change.
+- **Thresholds.** `incremental_min_commits` (default 1) and `incremental_min_minutes` (default 0) gate when the incremental path kicks in, mirroring Qodo's `/review -i`. Below them, or on the first review, a full review runs.
+- **The comment shows both.** When any item carried forward, the verdict table gains a **When** column marking each item `re-checked` or `carried from <sha>`.
+
 ## Cheap-model triage &mdash; `triage`
 
 The expensive pass spends its 12-iteration / 5-minute tool-loop cap uniformly across easy and hard items alike &mdash; a trivially-decidable item burns the same budget as one needing deep investigation, and that's where the loop runs dry and punts. With `triage: true`, a haiku-class pre-pass over the checklist + changed-file list (not the full diff) routes each item as **trivial**, **untouched**, or **needs_tools**, and the files a needs_tools item flags are prioritized in the diff pack so they survive the token budget.

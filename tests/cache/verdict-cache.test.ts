@@ -61,6 +61,27 @@ describe("parseVerdictFromStickyBody", () => {
     expect(recovered!.items).toHaveLength(1);
   });
 
+  it("round-trips reviewedShas and per-item evidenceFiles / verifiedAtSha (OGE-1590)", () => {
+    const verdict = makeVerdict({
+      reviewedShas: ["sha_aaaaaaa", "sha_bbbbbbb"],
+      items: [
+        {
+          id: 1,
+          itemText: "redact() round-trips",
+          status: "PASS",
+          rationale: "carried",
+          evidenceRefs: [],
+          evidenceFiles: ["src/redact.ts"],
+          verifiedAtSha: "sha_aaaaaaa",
+        },
+      ],
+    });
+    const recovered = parseVerdictFromStickyBody(renderStickyComment(verdict));
+    expect(recovered!.reviewedShas).toEqual(["sha_aaaaaaa", "sha_bbbbbbb"]);
+    expect(recovered!.items[0]!.evidenceFiles).toEqual(["src/redact.ts"]);
+    expect(recovered!.items[0]!.verifiedAtSha).toBe("sha_aaaaaaa");
+  });
+
   it("returns null when the body has no JSON sidecar", () => {
     expect(parseVerdictFromStickyBody("just a comment")).toBeNull();
   });

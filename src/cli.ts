@@ -33,6 +33,8 @@ import { fetchCiSummary } from "./ci/summary.js";
 import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
+import { highestReviewedSha } from "./incremental/select.js";
+import { decideIncremental } from "./incremental/thresholds.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
 import type { RefFileReader } from "./config.js";
@@ -283,6 +285,42 @@ async function runReviewCommand(env: {
       headSha: prMeta.data.head.sha,
     });
 
+    // Decide whether to take the incremental path (OGE-1590): carry untouched
+    // verdicts forward instead of re-reviewing the whole checklist.
+    let incrementalEnabled = false;
+    if (cachedVerdict) {
+      const base = highestReviewedSha(cachedVerdict);
+      const head = prMeta.data.head.sha;
+      let newCommits = 0;
+      if (base && base !== head) {
+        try {
+          const cmp = await octokit.repos.compareCommits({
+            owner: env.owner,
+            repo: env.repo,
+            base,
+            head,
+          });
+          newCommits = cmp.data.total_commits ?? 1;
+        } catch {
+          newCommits = 1; // a compare failure shouldn't block the decision
+        }
+      }
+      const minutesSinceLast = cachedVerdict.generatedAt
+        ? (Date.parse(prMeta.data.updated_at) - Date.parse(cachedVerdict.generatedAt)) / 60000
+        : Number.POSITIVE_INFINITY;
+      const decision = decideIncremental({
+        hasPrevious: true,
+        newCommits,
+        minutesSinceLast,
+        thresholds: {
+          minCommits: Number(process.env.REVIEWER_INCREMENTAL_MIN_COMMITS ?? "1"),
+          minMinutes: Number(process.env.REVIEWER_INCREMENTAL_MIN_MINUTES ?? "0"),
+        },
+      });
+      incrementalEnabled = decision.incremental;
+      console.error(`[incremental] ${decision.incremental ? "on" : "off"} — ${decision.reason}`);
+    }
+
     const result = await runReview({
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
@@ -293,6 +331,7 @@ async function runReviewCommand(env: {
       findingsClient: makeCiLogClient(octokit),
       findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
       inlineCommentsEnabled: process.env.REVIEWER_INLINE_COMMENTS === "true",
+      incrementalEnabled,
       ...(process.env.REVIEWER_TRIAGE === "true"
         ? { triageModel: makeTriageModel(anthropic) }
         : {}),

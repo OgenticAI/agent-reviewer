@@ -117,6 +117,28 @@ describe("computeVerdictMetrics", () => {
   });
 });
 
+describe("outcome rates in the metrics block (OGE-1592)", () => {
+  it("includes actedOnRate and overrideRate when outcomes were computed", () => {
+    const m = computeVerdictMetrics({
+      verdict: verdict([{ status: "PASS" }]),
+      toolCalls: 0,
+      researchQueries: 0,
+      cached: false,
+      outcomes: { actedOnRate: 0.75, overrideRate: 0.1 },
+    });
+    expect(m.actedOnRate).toBe(0.75);
+    expect(m.overrideRate).toBe(0.1);
+    // Round-trips through the hidden block like every other metric.
+    expect(parseMetricsBlock(renderMetricsBlock(m))).toEqual(m);
+  });
+
+  it("omits the outcome fields entirely on a first review", () => {
+    const m = metrics([{ status: "PASS" }]);
+    expect(m.actedOnRate).toBeUndefined();
+    expect(m.overrideRate).toBeUndefined();
+  });
+});
+
 describe("metrics block round-trip", () => {
   it("parses back what it renders", () => {
     const m = metrics([{ status: "PASS" }, { status: "UNVERIFIABLE" }]);

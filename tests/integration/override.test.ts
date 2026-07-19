@@ -270,6 +270,51 @@ describe("applyOverride", () => {
     expect(reply.body).toContain(OVERRIDE_LABEL);
   });
 
+  describe("per-item override tagging (OGE-1592)", () => {
+    const verdict = {
+      items: [
+        { id: 1, itemText: "redact works", status: "FAIL" },
+        { id: 2, itemText: "renders on GitHub", status: "UNVERIFIABLE" },
+        { id: 3, itemText: "round-trips", status: "PASS" },
+        { id: 4, itemText: "docs updated", status: "PARTIAL" },
+      ],
+    };
+
+    it("reports only the blocking items as force-passed, not the already-green ones", async () => {
+      const state = freshState();
+      const result = await applyOverride({
+        request: { reason: "known-good, shipping" },
+        context: { ...CONTEXT, verdict },
+        clients: makeClients(state),
+      });
+      // 1 FAIL, 2 UNVERIFIABLE, 4 PARTIAL were blocking; 3 PASS was not.
+      expect(result.overriddenItemIds).toEqual([1, 2, 4]);
+    });
+
+    it("names the force-passed items in the Linear audit comment", async () => {
+      const state = freshState();
+      await applyOverride({
+        request: { reason: "x" },
+        context: { ...CONTEXT, verdict },
+        clients: makeClients(state),
+      });
+      const body = state.linearComments[0]!.body;
+      expect(body).toContain("Force-passed items");
+      expect(body).toContain("redact works");
+      expect(body).not.toContain("round-trips"); // the already-green item
+    });
+
+    it("returns an empty id list when no verdict is supplied", async () => {
+      const state = freshState();
+      const result = await applyOverride({
+        request: { reason: "x" },
+        context: CONTEXT,
+        clients: makeClients(state),
+      });
+      expect(result.overriddenItemIds).toEqual([]);
+    });
+  });
+
   describe("failure-safety (single failed step doesn't abort others)", () => {
     it("Check publish fails → still posts Linear comment + label + PR reply", async () => {
       const state = freshState({ failOn: "check" });

@@ -145,3 +145,7 @@ Open any PR with a `## UAT checklist` block. Within ~60 s of CI starting, you sh
 - For each UAT item that came back FAIL or PARTIAL: a new child issue under the ticket titled `Fix UAT: <item>` linking back to the PR.
 
 If any of those don't appear, check the Action run logs — the reviewer prints structured diagnostic output for failed lookups (missing ticket id, malformed checklist, etc.).
+
+## Writing the checklist
+
+The reviewer can only be as useful as the criteria it is given. See [UAT-CRITERIA.md](UAT-CRITERIA.md) for how to write criteria that a pre-merge verifier can settle, and when to use the `[human]` marker instead.

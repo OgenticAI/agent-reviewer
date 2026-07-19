@@ -112,6 +112,15 @@ export interface OverrideContext {
   /** Linear's internal UUID + team id for the ticket — needed for label upsert. */
   ticketUuid: string;
   ticketTeamId: string;
+  /**
+   * The verdict being overridden (OGE-1592). Supplied so the audit trail names
+   * WHICH items were force-passed, not just that an override happened.
+   *
+   * Without this, "resolved by override" is indistinguishable from "the
+   * reviewer was right and someone fixed it" in the outcome data — and those
+   * two mean opposite things about whether the reviewer is working.
+   */
+  verdict?: { items: Array<{ id: number; itemText: string; status: string }> };
 }
 
 export interface OverrideClients {
@@ -161,7 +170,16 @@ export interface ApplyOverrideArgs {
 export interface ApplyOverrideResult {
   /** Steps the agent took, in order. Used by tests + the CLI's audit log. */
   steps: Array<{ step: string; status: "ok" | "error"; message?: string }>;
+  /**
+   * Item ids the override force-passed — everything not already settled
+   * positively. Feeds `computeOutcomes()` so these are labelled `overridden`
+   * rather than counted as the reviewer being agreed with.
+   */
+  overriddenItemIds: number[];
 }
+
+/** Statuses that were blocking the merge, and so are what an override passes. */
+const BLOCKING_STATUSES = new Set<string>(["FAIL", "PARTIAL", "UNVERIFIABLE"]);
 
 /** The check name we publish — keep in sync with `.github/actions/review/action.yml`. */
 export const CHECK_NAME = "OgenticAI Reviewer / UAT";
@@ -178,7 +196,11 @@ export const OVERRIDE_LABEL = "uat-override";
  */
 export async function applyOverride(args: ApplyOverrideArgs): Promise<ApplyOverrideResult> {
   const { request, context, clients } = args;
-  const result: ApplyOverrideResult = { steps: [] };
+  const overriddenItems = forcePassedItems(context.verdict);
+  const result: ApplyOverrideResult = {
+    steps: [],
+    overriddenItemIds: overriddenItems.map((i) => i.id),
+  };
 
   // 1) Flip the GitHub Check to success with an annotation noting the override.
   await safeStep(result.steps, "check", async () => {
@@ -202,6 +224,7 @@ export async function applyOverride(args: ApplyOverrideArgs): Promise<ApplyOverr
     reason: request.reason,
     pr: context.pr,
     ticketId: context.ticketId,
+    overriddenItems,
   });
   await safeStep(result.steps, "linear:comment", async () => {
     await clients.linear.createComment({ issueId: context.ticketUuid, body: linearBody });
@@ -236,18 +259,41 @@ export async function applyOverride(args: ApplyOverrideArgs): Promise<ApplyOverr
 
 // ─── Audit comment renderer ──────────────────────────────────────────────────
 
+/**
+ * Items an override actually force-passes.
+ *
+ * Items already at PASS or CODE_VERIFIED were not blocking anything, so
+ * labelling them "overridden" would inflate the override rate with items
+ * nobody overrode.
+ */
+export function forcePassedItems(
+  verdict: OverrideContext["verdict"],
+): Array<{ id: number; itemText: string; status: string }> {
+  return (verdict?.items ?? []).filter((i) => BLOCKING_STATUSES.has(i.status));
+}
+
 export function renderOverrideComment(args: {
   commenter: string;
   reason: string;
   pr: { owner: string; repo: string; number: number; htmlUrl: string };
   ticketId: string;
+  overriddenItems?: Array<{ id: number; itemText: string; status: string }>;
 }): string {
+  const itemLines =
+    args.overriddenItems && args.overriddenItems.length > 0
+      ? [
+          ``,
+          `**Force-passed items:**`,
+          ...args.overriddenItems.map((i) => `- ${i.id}. ${i.itemText} — was \`${i.status}\``),
+        ]
+      : [];
   return [
     `${LINEAR_COMMENT_MARKER}`,
     ``,
     `**UAT override** applied by @${args.commenter} on [${args.pr.owner}/${args.pr.repo}#${args.pr.number}](${args.pr.htmlUrl}).`,
     ``,
     `**Reason:** ${args.reason}`,
+    ...itemLines,
     ``,
     `The \`OgenticAI Reviewer / UAT\` Check has been flipped to success on this PR. ` +
       `The original UAT verdict is preserved in the sticky PR comment — overrides unblock merge ` +

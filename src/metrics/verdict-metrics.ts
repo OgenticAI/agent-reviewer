@@ -64,6 +64,15 @@ export interface VerdictMetrics {
    */
   puntRatePre?: number | null;
   puntRatePost?: number | null;
+  /**
+   * Outcome telemetry (OGE-1592). `puntRate` alone cannot tell better
+   * verification from bolder guessing — these can. `actedOnRate` is the share
+   * of flipped findings that came with a change to a file the reviewer cited;
+   * the rest are unexplained flips, which is the number to watch. Omitted when
+   * there is no previous verdict to compare against.
+   */
+  actedOnRate?: number | null;
+  overrideRate?: number | null;
 }
 
 export function computeVerdictMetrics(args: {
@@ -75,6 +84,8 @@ export function computeVerdictMetrics(args: {
   /** Punt counts around adjudication (OGE-1587), when it ran. */
   puntsBefore?: number;
   puntsAfter?: number;
+  /** Outcome rates vs the previous verdict (OGE-1592), when one existed. */
+  outcomes?: { actedOnRate: number | null; overrideRate: number | null };
 }): VerdictMetrics {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
@@ -114,6 +125,9 @@ export function computeVerdictMetrics(args: {
           puntRatePre: args.puntsBefore / verifiableItems,
           puntRatePost: args.puntsAfter / verifiableItems,
         }
+      : {}),
+    ...(args.outcomes
+      ? { actedOnRate: args.outcomes.actedOnRate, overrideRate: args.outcomes.overrideRate }
       : {}),
   };
 }

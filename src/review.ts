@@ -32,6 +32,7 @@ import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.j
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
+import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
 import {
   loadRepoConfig,
   matchingPathInstructions,
@@ -119,6 +120,17 @@ export interface GithubReader {
    * section entirely rather than claiming CI is unknown.
    */
   getCiSummary?(args: { owner: string; repo: string; ref: string }): Promise<CiSummary>;
+  /**
+   * Repo-relative paths changed between two commits (OGE-1592). Used to tell a
+   * finding that was acted on from one that merely flipped. Optional: without
+   * it every flip reads as unexplained, which errs toward flagging.
+   */
+  getChangedPaths?(args: {
+    owner: string;
+    repo: string;
+    base: string;
+    head: string;
+  }): Promise<string[]>;
 }
 
 /**
@@ -173,6 +185,12 @@ export interface RunReviewArgs {
    * Omitted means no per-repo config — prompts stay byte-identical.
    */
   configReader?: RefFileReader;
+  /**
+   * Item ids a human force-passed via `/uat-override` (OGE-1592). Labelled
+   * `overridden` in the outcome data rather than counted as the reviewer
+   * being agreed with — those mean opposite things.
+   */
+  overriddenItemIds?: number[];
 }
 
 export interface RunReviewResult {
@@ -199,6 +217,11 @@ export interface RunReviewResult {
   puntsBefore: number;
   /** Punt count after adjudication. */
   puntsAfter: number;
+  /**
+   * Per-item outcomes vs the previous verdict (OGE-1592). Undefined on the
+   * first review of a PR, when there is nothing to compare against.
+   */
+  outcomes?: OutcomeSummary;
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -393,6 +416,16 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Outcome telemetry: did the last verdict change anything? (OGE-1592)
+  // `puntRate` alone cannot tell better verification from bolder guessing.
+  const outcomes = await computeOutcomesForRun({
+    previous: args.cachedVerdict ?? null,
+    current: adjudicated,
+    pr,
+    github: args.github,
+    overriddenItemIds: args.overriddenItemIds,
+  });
+
   const body = renderStickyComment(adjudicated);
   const retryNote =
     retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
@@ -402,6 +435,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     overall: overallStatus(adjudicated),
     puntsBefore,
     puntsAfter,
+    ...(outcomes ? { outcomes } : {}),
     prContext: pr,
     ticket,
     cached: false,
@@ -800,4 +834,51 @@ function isSamePrCommentLink(
     link.repo === pr.repo &&
     link.prNumber === pr.number
   );
+}
+
+/**
+ * Outcome telemetry for one run (OGE-1592).
+ *
+ * Returns undefined rather than an empty summary when there is nothing to
+ * compare against — a first review has no outcomes, and reporting zeroes would
+ * read as "nothing was acted on", which is a different and much worse claim.
+ *
+ * Every failure path degrades to no telemetry. Measurement must never be able
+ * to take down the thing it measures.
+ */
+async function computeOutcomesForRun(args: {
+  previous: ReviewVerdict | null;
+  current: ReviewVerdict;
+  pr: PrContext;
+  github: GithubReader;
+  overriddenItemIds?: number[];
+}): Promise<OutcomeSummary | undefined> {
+  const { previous, current } = args;
+  if (!previous) return undefined;
+  // Same commit means nothing could have been acted on since.
+  if (previous.headSha === current.headSha) return undefined;
+
+  let changedPaths: string[] = [];
+  if (args.github.getChangedPaths) {
+    try {
+      changedPaths = await args.github.getChangedPaths({
+        owner: args.pr.owner,
+        repo: args.pr.repo,
+        base: previous.headSha,
+        head: current.headSha,
+      });
+    } catch (err) {
+      console.error(
+        `[outcomes] could not diff ${previous.headSha}..${current.headSha}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return computeOutcomes({
+    previous,
+    current,
+    changedPaths,
+    ...(args.overriddenItemIds ? { overriddenItemIds: args.overriddenItemIds } : {}),
+  });
 }

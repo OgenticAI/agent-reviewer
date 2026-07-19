@@ -384,6 +384,44 @@ describe("runWriteback", () => {
       expect(state.calls.createChildIssue[0]?.title).toMatch(/^Fix UAT: /);
     });
 
+    it("promotes still-UNVERIFIABLE items to children only at merge (OGE-1592)", async () => {
+      const items = [
+        { id: 1, itemText: "redact() works", status: "PASS" as const, rationale: "ok", evidenceRefs: [] },
+        {
+          id: 2,
+          itemText: "renders cleanly on GitHub",
+          status: "UNVERIFIABLE" as const,
+          rationale: "visual claim, needs a person",
+          evidenceRefs: [],
+        },
+      ];
+
+      // Pre-merge: a punt is a live question, not a follow-up. No child.
+      const pre = freshState();
+      const prePlan = await runWriteback({
+        writer: makeWriter(pre),
+        verdict: makeVerdict({ items }),
+        ticket: TICKET,
+        pr: PR,
+        ciGreen: false,
+      });
+      expect(prePlan.children).toHaveLength(0);
+      expect(pre.calls.createChildIssue).toHaveLength(0);
+
+      // At merge: the question shipped unanswered — file it so it isn't lost.
+      const post = freshState();
+      const postPlan = await runWriteback({
+        writer: makeWriter(post),
+        verdict: makeVerdict({ items }),
+        ticket: TICKET,
+        pr: PR,
+        ciGreen: true,
+        merged: true,
+      });
+      expect(postPlan.children).toHaveLength(1);
+      expect(post.calls.createChildIssue[0]?.title).toMatch(/renders cleanly/);
+    });
+
     it("does not duplicate a child when one with the same title already exists", async () => {
       const state = freshState({
         children: [

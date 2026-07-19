@@ -53,6 +53,8 @@ export function renderLinearComment(args: {
   metrics?: Partial<Pick<VerdictMetrics, "toolCalls" | "researchQueries" | "cached" | "degraded">> & {
     puntsBefore?: number;
     puntsAfter?: number;
+    /** Outcome rates vs the previous verdict (OGE-1592). */
+    outcomes?: { actedOnRate: number | null; overrideRate: number | null };
   };
 }): string {
   const counts = countByStatus(args.verdict);
@@ -111,6 +113,7 @@ export function renderLinearComment(args: {
         ...(args.metrics?.puntsBefore !== undefined
           ? { puntsBefore: args.metrics.puntsBefore, puntsAfter: args.metrics.puntsAfter }
           : {}),
+        ...(args.metrics?.outcomes ? { outcomes: args.metrics.outcomes } : {}),
       }),
     ),
   );

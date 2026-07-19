@@ -20,7 +20,7 @@
  *   1  any other failure
  */
 
-import { statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -36,7 +36,7 @@ import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
-import { makeRepoTools } from "./tools/repo.js";
+import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseUatChecklist } from "./parser/uat.js";
@@ -285,6 +285,30 @@ async function runReviewCommand(env: {
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
+      diffPack: {
+        ...(process.env.REVIEWER_DIFF_TOKEN_BUDGET
+          ? { tokenBudget: Number(process.env.REVIEWER_DIFF_TOKEN_BUDGET) }
+          : {}),
+        ...(process.env.REVIEWER_EXCLUDE_GLOBS
+          ? {
+              excludeGlobs: process.env.REVIEWER_EXCLUDE_GLOBS.split(",")
+                .map((g) => g.trim())
+                .filter(Boolean),
+            }
+          : {}),
+        // Hunk expansion needs the file on disk (OGE-1591). Reuses the same
+        // containment as the read tools, so a diff naming a path outside the
+        // checkout cannot pull an arbitrary file into the prompt.
+        readFile: (path: string) => {
+          const root = resolveRepoRoot();
+          if (!root) return null;
+          try {
+            return readFileSync(resolveWithinRoot(root, path), "utf8");
+          } catch {
+            return null;
+          }
+        },
+      },
       ...(process.env.REVIEWER_ADJUDICATION === "true"
         ? { adjudicator: makeAdjudicatorModel(anthropic) }
         : {}),

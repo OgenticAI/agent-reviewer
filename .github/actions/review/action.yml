@@ -57,6 +57,23 @@ inputs:
       tools array at all.
     required: false
     default: "false"
+  diff_token_budget:
+    description: >-
+      Approximate token budget for the diff section of the prompt (OGE-1581).
+      Deliberately a fraction of the context window: the checklist, ticket, CI
+      summary, and every tool result have to fit alongside it, and those are
+      what actually settle items. Files that do not fit are listed by path in
+      the prompt so the model reads them or punts with a concrete reason —
+      never silently misses them.
+    required: false
+    default: "24000"
+  exclude_globs:
+    description: >-
+      Comma-separated repo-relative globs to drop from the diff entirely, e.g.
+      "generated/**,vendor/**". Lockfiles, build output, and files marked
+      @generated are already excluded without configuration.
+    required: false
+    default: ""
   adjudication:
     description: >-
       When 'true', every UNVERIFIABLE verdict gets one cheap second-pass call
@@ -137,6 +154,8 @@ runs:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
         REVIEWER_RESEARCH: ${{ inputs.research }}
+        REVIEWER_DIFF_TOKEN_BUDGET: ${{ inputs.diff_token_budget }}
+        REVIEWER_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
         REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}
         REVIEWER_ADJUDICATION_MODEL: ${{ inputs.adjudication_model }}
         PR_URL: ${{ github.event.pull_request.html_url }}

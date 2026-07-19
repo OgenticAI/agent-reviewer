@@ -92,6 +92,14 @@ export interface BuildPromptArgs {
    */
   skippedFiles?: SkippedFile[];
   /**
+   * Overflow fallback (OGE-1581): the diff was too large to include even after
+   * packing, so the prompt carries the changed-file list and a use-your-tools
+   * instruction instead of diff text. Mirrors claude-code-security-review's
+   * PROMPT_TOO_LONG retry — a degraded review beats a failed run on a check
+   * that gates a merge.
+   */
+  diffOmitted?: { changedFiles: string[]; reason: string };
+  /**
    * Per-repo guidance assembled from `.agent-reviewer.yml` and the repo's
    * `AGENTS.md` / `CLAUDE.md`, all read from the DEFAULT BRANCH (OGE-1585).
    * Omitted keeps the prompt byte-identical for repos with no config.
@@ -246,12 +254,15 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,
     ``,
+    ...(args.diffOmitted ? renderDiffOmitted(args.diffOmitted) : []),
     // The diff is written by whoever opened the PR and their merge depends on
     // this verdict — it is the single most attacker-influenced input we have
     // (OGE-1579). Fenced, not sanitized: stripping HTML comments out of a diff
     // would corrupt the code under review. The fence plus the standing rule is
     // the mitigation here.
-    fenceUntrusted(["```diff", diff, "```"].join("\n"), { source: "pr-diff" }),
+    ...(args.diffOmitted
+      ? []
+      : [fenceUntrusted(["```diff", diff, "```"].join("\n"), { source: "pr-diff" })]),
     ...renderSkippedFiles(args.skippedFiles),
     ``,
     `## Your task`,
@@ -476,6 +487,29 @@ function renderRepoMap(map: string | undefined): string[] {
       map,
       "```",
     ].join("\n"),
+    ``,
+  ];
+}
+
+/**
+ * Render the overflow fallback (OGE-1581).
+ *
+ * States plainly that no diff text is present and that the file list is the
+ * only structural evidence, so the model reads its way to a verdict or punts
+ * with a concrete reason — rather than treating an absent diff as an empty one.
+ */
+function renderDiffOmitted(omitted: { changedFiles: string[]; reason: string }): string[] {
+  return [
+    `**The diff is not included in this prompt** — ${omitted.reason}.`,
+    ``,
+    `You have the changed-file list below and your read tools. Read the files an`,
+    `item actually turns on, and cite what you read. Do NOT treat the absent diff`,
+    `as an empty diff: every file below changed.`,
+    ``,
+    fenceUntrusted(
+      omitted.changedFiles.map((f) => `- ${f}`).join("\n"),
+      { source: "changed-files" },
+    ),
     ``,
   ];
 }

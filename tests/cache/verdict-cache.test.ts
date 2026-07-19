@@ -82,6 +82,32 @@ describe("parseVerdictFromStickyBody", () => {
     expect(recovered!.items[0]!.verifiedAtSha).toBe("sha_aaaaaaa");
   });
 
+  it("round-trips confidence, evidence and the adjudicated flag (OGE-1580/1587)", () => {
+    // These three are what make a falling punt rate auditable after the fact:
+    // without them you cannot tell better verification from bolder guessing.
+    const verdict = makeVerdict({
+      items: [
+        {
+          id: 1,
+          itemText: "redact() round-trips",
+          status: "CODE_VERIFIED",
+          rationale: "code delivers it; runtime proof outstanding",
+          evidenceRefs: [],
+          confidence: 0.82,
+          evidence: ["read src/redact.ts:40-58", "CI job `test` reported success"],
+          adjudicated: true,
+        },
+      ],
+    });
+    const recovered = parseVerdictFromStickyBody(renderStickyComment(verdict));
+    expect(recovered!.items[0]!.confidence).toBe(0.82);
+    expect(recovered!.items[0]!.evidence).toEqual([
+      "read src/redact.ts:40-58",
+      "CI job `test` reported success",
+    ]);
+    expect(recovered!.items[0]!.adjudicated).toBe(true);
+  });
+
   it("returns null when the body has no JSON sidecar", () => {
     expect(parseVerdictFromStickyBody("just a comment")).toBeNull();
   });

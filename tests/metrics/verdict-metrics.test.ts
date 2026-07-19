@@ -117,6 +117,31 @@ describe("computeVerdictMetrics", () => {
   });
 });
 
+describe("adjudication punt rates (OGE-1587)", () => {
+  it("reports the punt rate before and after adjudication", () => {
+    // Reported as a pair so the adjudicator's contribution is measurable per
+    // run, rather than inferred from a moving aggregate.
+    const m = computeVerdictMetrics({
+      verdict: verdict([{ status: "PASS" }, { status: "PASS" }, { status: "UNVERIFIABLE" }, { status: "PASS" }]),
+      toolCalls: 0,
+      researchQueries: 0,
+      cached: false,
+      puntsBefore: 3,
+      puntsAfter: 1,
+    });
+    expect(m.puntRatePre).toBe(0.75);
+    expect(m.puntRatePost).toBe(0.25);
+    // Round-trips through the hidden block like every other metric.
+    expect(parseMetricsBlock(renderMetricsBlock(m))).toEqual(m);
+  });
+
+  it("omits the pair entirely when adjudication did not run", () => {
+    const m = metrics([{ status: "UNVERIFIABLE" }]);
+    expect(m.puntRatePre).toBeUndefined();
+    expect(m.puntRatePost).toBeUndefined();
+  });
+});
+
 describe("outcome rates in the metrics block (OGE-1592)", () => {
   it("includes actedOnRate and overrideRate when outcomes were computed", () => {
     const m = computeVerdictMetrics({

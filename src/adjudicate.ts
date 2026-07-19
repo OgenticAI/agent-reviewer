@@ -263,7 +263,14 @@ export async function adjudicateVerdict(args: {
     });
   }
 
-  const items = args.verdict.items.map((it) => revised.get(it.id) ?? it);
+  // Mark every item the pass actually challenged, whether or not it overturned
+  // the punt (OGE-1587). Kept punts are marked too: "we looked again and stood
+  // by it" is a different, and measurable, fact from "we never looked".
+  const challenged = new Set(outcomes.filter((o) => o.spentCall).map((o) => o.itemId));
+  const items = args.verdict.items.map((it) => {
+    const next = revised.get(it.id) ?? it;
+    return challenged.has(it.id) ? { ...next, adjudicated: true } : next;
+  });
   return {
     verdict: { ...args.verdict, items },
     outcomes,

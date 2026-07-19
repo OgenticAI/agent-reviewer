@@ -1,0 +1,39 @@
+{
+  "name": "unverifiable-visual--injected-fail-2",
+  "description": "Injected FAIL against item 2 of unverifiable-visual",
+  "origin": "injected",
+  "pr": {
+    "owner": "OgenticAI",
+    "repo": "agent-reviewer",
+    "number": 1003,
+    "headSha": "sha1004",
+    "headRef": "david/oge-1004-unverifiable-visual",
+    "title": "feat(OGE-1004): A genuinely visual claim — HUMAN_REVIEW.",
+    "body": "## Summary\n\nImplements OGE-1004.\n\n## UAT checklist\n\n- [ ] README renders cleanly on GitHub\n- [ ] README documents the flag",
+    "author": "davidoladeji-ogenticai",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  "ticket": {
+    "identifier": "OGE-1004",
+    "id": "uuid-OGE-1004",
+    "title": "A genuinely visual claim — HUMAN_REVIEW.",
+    "description": "Ticket OGE-1004: A genuinely visual claim — HUMAN_REVIEW.",
+    "status": "In Review",
+    "url": "https://linear.app/ogenticai/issue/OGE-1004"
+  },
+  "diff": "diff --git a/src/unverifiable-visual.ts b/src/unverifiable-visual.ts\n@@ -1,1 +1,2 @@\n+// change for OGE-1004\n\n# [defect-injected] item 2 sabotaged for eval ground truth\n",
+  "modelResponse": "{\"items\":[{\"id\":1,\"itemText\":\"README renders cleanly on GitHub\",\"status\":\"UNVERIFIABLE\",\"rationale\":\"Visual claim; cannot confirm rendered appearance from the diff.\",\"evidenceRefs\":[]},{\"id\":2,\"itemText\":\"README documents the flag\",\"status\":\"FAIL\",\"rationale\":\"Injected defect: the change for this item was removed/corrupted, so it is not delivered.\",\"evidenceRefs\":[]}],\"summary\":\"A genuinely visual claim — HUMAN_REVIEW.\"}",
+  "expected": {
+    "items": [
+      {
+        "id": 1,
+        "status": "UNVERIFIABLE"
+      },
+      {
+        "id": 2,
+        "status": "FAIL"
+      }
+    ],
+    "overall": "NEEDS_WORK"
+  }
+}

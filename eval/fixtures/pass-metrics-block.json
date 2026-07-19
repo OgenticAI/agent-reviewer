@@ -1,0 +1,39 @@
+{
+  "name": "pass-metrics-block",
+  "description": "Metrics rendering delivered — PASS control.",
+  "origin": "snapshot",
+  "pr": {
+    "owner": "OgenticAI",
+    "repo": "agent-reviewer",
+    "number": 1005,
+    "headSha": "sha1006",
+    "headRef": "david/oge-1006-pass-metrics-block",
+    "title": "feat(OGE-1006): Metrics rendering delivered — PASS control.",
+    "body": "## Summary\n\nImplements OGE-1006.\n\n## UAT checklist\n\n- [ ] metrics block round-trips\n- [ ] punt rate excludes [human] items",
+    "author": "davidoladeji-ogenticai",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  "ticket": {
+    "identifier": "OGE-1006",
+    "id": "uuid-OGE-1006",
+    "title": "Metrics rendering delivered — PASS control.",
+    "description": "Ticket OGE-1006: Metrics rendering delivered — PASS control.",
+    "status": "In Review",
+    "url": "https://linear.app/ogenticai/issue/OGE-1006"
+  },
+  "diff": "diff --git a/src/pass-metrics-block.ts b/src/pass-metrics-block.ts\n@@ -1,1 +1,2 @@\n+// change for OGE-1006\n",
+  "modelResponse": "{\"items\":[{\"id\":1,\"itemText\":\"metrics block round-trips\",\"status\":\"PASS\",\"rationale\":\"parseMetricsBlock(render(m)) === m in tests.\",\"evidenceRefs\":[]},{\"id\":2,\"itemText\":\"punt rate excludes [human] items\",\"status\":\"PASS\",\"rationale\":\"verifiableItems excludes humanMarked.\",\"evidenceRefs\":[]}],\"summary\":\"Metrics rendering delivered — PASS control.\"}",
+  "expected": {
+    "items": [
+      {
+        "id": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 2,
+        "status": "PASS"
+      }
+    ],
+    "overall": "PASS"
+  }
+}

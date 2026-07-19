@@ -74,6 +74,35 @@ inputs:
       @generated are already excluded without configuration.
     required: false
     default: ""
+  allow_dynamic_context:
+    description: >-
+      Master switch for hunk expansion (OGE-1591). When 'true' (default), each
+      diff hunk is expanded upward to its enclosing function/class definition
+      before token packing, so the model does not burn capped tool-loop
+      iterations calling read_file just to recover a hunk's surrounding context.
+      Set 'false' to send hunks exactly as git produced them.
+    required: false
+    default: "true"
+  max_extra_lines_before_dynamic_context:
+    description: >-
+      How far up to scan for an enclosing definition before giving up and using
+      the fixed fallback (OGE-1591). Default 8 — deliberately small: the scan is
+      a cheap regex/indentation walk, not a parse.
+    required: false
+    default: "8"
+  patch_extra_lines_before:
+    description: >-
+      Fixed leading context added when no enclosing definition is found within
+      the scan window (OGE-1591). Default 3.
+    required: false
+    default: "3"
+  patch_extra_lines_after:
+    description: >-
+      Trailing context added to each hunk (OGE-1591). Asymmetric with the
+      leading value on purpose — what a hunk means is usually established above
+      it, not below. Default 1.
+    required: false
+    default: "1"
   findings_fail_level:
     description: >-
       Deterministic analyzer/test gate, independent of the LLM verdict
@@ -245,6 +274,10 @@ runs:
         REVIEWER_RESEARCH: ${{ inputs.research }}
         REVIEWER_DIFF_TOKEN_BUDGET: ${{ inputs.diff_token_budget }}
         REVIEWER_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
+        REVIEWER_ALLOW_DYNAMIC_CONTEXT: ${{ inputs.allow_dynamic_context }}
+        REVIEWER_MAX_EXTRA_LINES_BEFORE: ${{ inputs.max_extra_lines_before_dynamic_context }}
+        REVIEWER_PATCH_EXTRA_LINES_BEFORE: ${{ inputs.patch_extra_lines_before }}
+        REVIEWER_PATCH_EXTRA_LINES_AFTER: ${{ inputs.patch_extra_lines_after }}
         REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
         REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
         REVIEWER_TRIAGE: ${{ inputs.triage }}
@@ -270,6 +303,10 @@ runs:
           # Deterministic findings gate (OGE-1588) — independent of the verdict.
           findings_failed=$(node -e "console.log(require(process.env.VERDICT_PATH).findingsGateFailed === true ? 'true' : 'false')")
           echo "findings_failed=$findings_failed" >> "$GITHUB_OUTPUT"
+          # Committed `.agent-reviewer.yml` fail_on overrides this action input
+          # (OGE-1585). Empty means the repo committed none — input stands.
+          config_fail_on=$(node -e "const f=require(process.env.VERDICT_PATH).failOn; console.log(Array.isArray(f)?f.join(','):'')")
+          echo "config_fail_on=$config_fail_on" >> "$GITHUB_OUTPUT"
         elif [ $rc -eq 3 ]; then
           overall="SKIPPED"
         else
@@ -287,11 +324,19 @@ runs:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         OVERALL: ${{ steps.review.outputs.overall }}
         FINDINGS_FAILED: ${{ steps.review.outputs.findings_failed }}
+        CONFIG_FAIL_ON: ${{ steps.review.outputs.config_fail_on }}
         FAIL_ON: ${{ inputs.fail_on }}
         OWNER: ${{ github.repository_owner }}
         REPO: ${{ github.event.repository.name }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
+        # Committed config wins over the action input (OGE-1585): a repo that
+        # commits fail_on to .agent-reviewer.yml has said so in a file on the
+        # default branch, which outranks a value passed in workflow YAML.
+        if [ -n "$CONFIG_FAIL_ON" ]; then
+          echo "fail_on from committed config: $CONFIG_FAIL_ON (overriding input '$FAIL_ON')"
+          FAIL_ON="$CONFIG_FAIL_ON"
+        fi
         # Map OverallStatus → GitHub Check conclusion. The reviewer never
         # blocks merges on its own infra outages: ERROR → neutral, not failure.
         # `fail_on` is the per-repo lever that promotes specific overalls

@@ -360,6 +360,16 @@ async function runReviewCommand(env: {
                 .filter(Boolean),
             }
           : {}),
+        // Hunk-expansion tuning (OGE-1591). Explicit 'false' disables it.
+        ...(process.env.REVIEWER_ALLOW_DYNAMIC_CONTEXT === "false"
+          ? { allowDynamicContext: false }
+          : {}),
+        ...(process.env.REVIEWER_MAX_EXTRA_LINES_BEFORE
+          ? { maxExtraLinesBefore: Number(process.env.REVIEWER_MAX_EXTRA_LINES_BEFORE) }
+          : {}),
+        ...(process.env.REVIEWER_PATCH_EXTRA_LINES_BEFORE
+          ? { patchExtraLinesBefore: Number(process.env.REVIEWER_PATCH_EXTRA_LINES_BEFORE) }
+          : {}),
         // Hunk expansion needs the file on disk (OGE-1591). Reuses the same
         // containment as the read tools, so a diff naming a path outside the
         // checkout cannot pull an arbitrary file into the prompt.
@@ -413,6 +423,9 @@ async function runReviewCommand(env: {
           {
             ...result.verdict,
             overall: result.overall,
+            // Committed config overrides the action input (OGE-1585). The
+            // Action prefers this when present; absent, its own input stands.
+            ...(result.effectiveFailOn ? { failOn: result.effectiveFailOn } : {}),
             // Deterministic findings gate (OGE-1588): the Action reads
             // `findingsGateFailed` to flip the Check to failure independent of
             // the verdict, so an error-level analyzer finding blocks merge on

@@ -783,3 +783,43 @@ describe("runReview — cheap-model triage (OGE-1595)", () => {
     expect(result.triage).toBeUndefined();
   });
 });
+
+describe("runReview — diff overflow fallback (OGE-1581)", () => {
+  /** A diff far past any reasonable window. */
+  const HUGE = [
+    "diff --git a/src/huge.ts b/src/huge.ts",
+    "@@ -1,1 +1,2 @@",
+    ...Array.from({ length: 40_000 }, (_, i) => `+const v${i} = ${i};`),
+  ].join("\n");
+
+  function capturing() {
+    let seen = "";
+    return {
+      model: { produce: async (req: { userPrompt: string }) => { seen = req.userPrompt; return SAMPLE_VERDICT_JSON; } },
+      prompt: () => seen,
+    };
+  }
+
+  it("drops the diff and hands over the changed-file list instead", async () => {
+    const { model, prompt } = capturing();
+    const github = makeGithub(makePr(), HUGE);
+    await runReview(buildArgs({ github, model, maxDiffTokens: 500 }));
+    expect(prompt()).toContain("The diff is not included in this prompt");
+    // The file must still be named — an absent diff is not an empty diff.
+    expect(prompt()).toContain("src/huge.ts");
+    expect(prompt()).not.toContain("const v39999");
+  });
+
+  it("still produces a usable verdict in fallback mode", async () => {
+    const github = makeGithub(makePr(), HUGE);
+    const result = await runReview(buildArgs({ github, maxDiffTokens: 500 }));
+    expect(result.verdict.items).toHaveLength(4);
+  });
+
+  it("leaves a normal-sized diff untouched", async () => {
+    const { model, prompt } = capturing();
+    await runReview(buildArgs({ model }));
+    expect(prompt()).not.toContain("The diff is not included");
+    expect(prompt()).toContain("```diff");
+  });
+});

@@ -197,7 +197,10 @@ function readFileTool(root: string): ReviewTool {
       description:
         "Read a UTF-8 text file from the repository being reviewed. Use this when a UAT item " +
         "depends on code the diff does not show — a caller, an existing implementation, a " +
-        "config file. Paths are relative to the repo root.",
+        "config file. Paths are relative to the repo root. " +
+        `Returns a ${READ_WINDOW_LINES}-line window, not the whole file: pass \`offset\` to ` +
+        "page through a longer file. The reply states how many lines lie above and below the " +
+        "window, so treat a windowed result as a slice — never as the complete file.",
       input_schema: {
         type: "object",
         properties: {
@@ -277,7 +280,10 @@ function searchRepoTool(root: string): ReviewTool {
       description:
         "Search the repository for a JavaScript regular expression and return matching lines " +
         "with their file and line number. Use this to check whether something exists outside " +
-        "the diff — a call site, a test, a config key.",
+        "the diff — a call site, a test, a config key. " +
+        "If a query matches too many lines this REFUSES and reports the total instead of " +
+        "returning a truncated list — write a more specific pattern and try again. A truncated " +
+        "list read as complete is worse than no search at all.",
       input_schema: {
         type: "object",
         properties: {

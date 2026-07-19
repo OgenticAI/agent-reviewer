@@ -31,7 +31,19 @@ import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
-import { packDiff, splitDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
+import {
+  estimateTokens,
+  packDiff,
+  splitDiff,
+  type PackDiffOptions,
+} from "./prompt/diff-pack.js";
+
+/**
+ * Packed-diff token ceiling past which the diff is dropped entirely (OGE-1581).
+ * Well above the default packing budget: this only catches the pathological
+ * case where a single file is itself larger than the window.
+ */
+const DEFAULT_MAX_DIFF_TOKENS = 60_000;
 import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
 import { ingestFindings } from "./findings/ingest.js";
 import type { JobFindings } from "./findings/schema.js";
@@ -251,6 +263,12 @@ export interface RunReviewArgs {
   repoFiles?: RepoFile[];
   /** Base token budget for the repo map; scales inversely with diff size. */
   mapTokens?: number;
+  /**
+   * Hard ceiling on packed-diff tokens before the overflow fallback trips
+   * (OGE-1581). Defaults generously — this is the "would not fit at all" line,
+   * not the packing budget.
+   */
+  maxDiffTokens?: number;
 }
 
 export interface RunReviewResult {
@@ -286,6 +304,17 @@ export interface RunReviewResult {
   findings?: JobFindings[];
   /** The deterministic findings-gate result (OGE-1588). */
   findingsGate?: FindingsGateResult;
+  /**
+   * The effective `fail_on` list after applying config precedence (OGE-1585):
+   * a committed `.agent-reviewer.yml` overrides the action input. Undefined
+   * when the repo committed no `fail_on`, in which case the action input
+   * stands on its own.
+   *
+   * Surfaced here rather than applied internally because the Check conclusion
+   * is decided by the Action, and having two places decide it is exactly the
+   * divergence OGE-1559 already caused once.
+   */
+  effectiveFailOn?: string[];
   /** Inline review comments to post (OGE-1586), when inline mode is on. */
   inlineComments?: InlineComment[];
   /** Item ids that got a committable suggestion block (OGE-1596). */
@@ -464,6 +493,21 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Overflow fallback (OGE-1581): if even the packed diff would blow the
+  // window, drop diff text entirely and hand over the changed-file list plus
+  // the read tools. A degraded review beats a failed run on a merge gate.
+  const packedTokens = estimateTokens(packed.text);
+  const overflow = packedTokens > (args.maxDiffTokens ?? DEFAULT_MAX_DIFF_TOKENS);
+  const diffOmitted = overflow
+    ? {
+        changedFiles,
+        reason: `it is ~${packedTokens} tokens even after packing, beyond the prompt budget`,
+      }
+    : undefined;
+  if (overflow) {
+    console.error(`[diff] OVERFLOW at ~${packedTokens} tokens — falling back to the file list`);
+  }
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
@@ -476,6 +520,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     repoGuidance,
     ...(findings ? { findings } : {}),
     ...(repoMap ? { repoMap } : {}),
+    ...(diffOmitted ? { diffOmitted } : {}),
   });
   const promptHash = hashPrompt(userPrompt);
 
@@ -643,6 +688,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ...(outcomes ? { outcomes } : {}),
     ...(findings ? { findings } : {}),
     ...(findingsGate ? { findingsGate } : {}),
+    ...(repoConfig?.config.fail_on ? { effectiveFailOn: repoConfig.config.fail_on } : {}),
     ...(inlineComments ? { inlineComments } : {}),
     ...(suggested ? { suggestedItemIds: suggested } : {}),
     ...(triage ? { triage } : {}),

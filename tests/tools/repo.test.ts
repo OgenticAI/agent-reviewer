@@ -289,3 +289,23 @@ describe("tool-output reshaping (OGE-1583)", () => {
     expect(r.content).not.toMatch(/many\.ts:1:/);
   });
 });
+
+describe("tool descriptions advertise their affordances (OGE-1583)", () => {
+  // The window and the refusal only help if the model knows about them up
+  // front — otherwise it reads a windowed result as the whole file, which is
+  // the exact failure the windowing was meant to prevent.
+  it("read_file documents the line window and the offset parameter", () => {
+    const def = tools.read_file!.definition;
+    expect(def.description.toLowerCase()).toMatch(/window|lines at a time|100/);
+    // Paging is exposed as start_line/end_line rather than OGE-1583's
+    // suggested `offset` — same affordance, and the explicit range reads
+    // better in a transcript than an opaque cursor.
+    const props = (def.input_schema as { properties: Record<string, unknown> }).properties;
+    expect(Object.keys(props)).toEqual(expect.arrayContaining(["start_line", "end_line"]));
+  });
+
+  it("search_repo documents that an over-cap search refuses rather than truncates", () => {
+    const def = tools.search_repo!.definition;
+    expect(def.description.toLowerCase()).toMatch(/refus|narrow|too many|more specific/);
+  });
+});

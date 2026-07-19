@@ -246,3 +246,28 @@ describe("expandPatchContext", () => {
     expect(packed.includedFiles).toEqual(["src/a.ts"]);
   });
 });
+
+describe("hunk-expansion tuning is configurable (OGE-1591)", () => {
+  const file = [
+    "export function outer() {", // 1
+    "  const a = 1;",            // 2
+    "  const b = 2;",            // 3
+    "  const c = 3;",            // 4
+    "  const d = 4;",            // 5
+    "  return a;",               // 6
+  ];
+
+  it("honours a tightened scan window — no boundary found, uses the fallback", () => {
+    // The definition sits 5 lines up; a 2-line window can't reach it, so the
+    // fixed lead-in applies instead.
+    expect(expandHunkStart(file, 6, 2, 3)).toBe(3); // 6 - 3
+  });
+
+  it("honours a widened scan window — finds the enclosing definition", () => {
+    expect(expandHunkStart(file, 6, 8, 3)).toBe(1);
+  });
+
+  it("honours a custom fixed lead-in when no boundary is in reach", () => {
+    expect(expandHunkStart(file, 6, 1, 1)).toBe(5); // 6 - 1
+  });
+});

@@ -236,3 +236,50 @@ describe("buildAdjudicationPrompt", () => {
     expect(p).toMatch(/gathered no tool observations/);
   });
 });
+
+describe("the adjudicated flag (OGE-1587)", () => {
+  const KEEP = JSON.stringify({ keepPunt: true, reason: "genuinely undecidable" });
+
+  it("marks an overturned item", async () => {
+    const r = await adjudicateVerdict({
+      verdict: verdictWith(["UNVERIFIABLE", "PASS"]),
+      transcript: TRANSCRIPT,
+      prBody: PR_BODY,
+      model: model(OVERTURN),
+    });
+    expect(r.verdict.items[0]!.adjudicated).toBe(true);
+  });
+
+  it("marks a punt it looked at and stood by — distinct from never looking", async () => {
+    const r = await adjudicateVerdict({
+      verdict: verdictWith(["UNVERIFIABLE", "PASS"]),
+      transcript: TRANSCRIPT,
+      prBody: PR_BODY,
+      model: model(KEEP),
+    });
+    expect(r.verdict.items[0]!.status).toBe("UNVERIFIABLE");
+    expect(r.verdict.items[0]!.adjudicated).toBe(true);
+  });
+
+  it("does NOT mark an item it never challenged (no call spent)", async () => {
+    // Index 2 carries the [human] marker, so the hard rules skip it entirely.
+    const r = await adjudicateVerdict({
+      verdict: verdictWith(["PASS", "PASS", "UNVERIFIABLE"]),
+      transcript: TRANSCRIPT,
+      prBody: PR_BODY,
+      model: model(OVERTURN),
+    });
+    expect(r.verdict.items[2]!.human).toBe(true);
+    expect(r.verdict.items[2]!.adjudicated).toBeUndefined();
+  });
+
+  it("leaves unchallenged non-punt items unmarked", async () => {
+    const r = await adjudicateVerdict({
+      verdict: verdictWith(["UNVERIFIABLE", "PASS"]),
+      transcript: TRANSCRIPT,
+      prBody: PR_BODY,
+      model: model(OVERTURN),
+    });
+    expect(r.verdict.items[1]!.adjudicated).toBeUndefined();
+  });
+});

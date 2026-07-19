@@ -277,6 +277,12 @@ Verdicts live in one top-level sticky comment, so an author reading a FAIL has t
 - **Idempotent reconciliation.** Each finding carries a marker id; on re-run the reviewer edits the matching comment in place and deletes stale ones, mirroring the sticky comment's byte-identical idempotency. Only its own marked comments are ever touched.
 - **Never a formal review.** Comments are posted individually via `pulls.createReviewComment`. The reviewer **never** calls `createReview` or approves a PR &mdash; the client surface has no such method, matching claude-code-action's own security boundary. Default `false`.
 
+### Committable suggestion blocks
+
+When `inline_comments` is on, a FAIL that carries a small, certain fix gets a GitHub ```` ```suggestion ```` block on its inline comment &mdash; the author applies it with one click, inside their own PR, no second PR to review. This is the middle rung between a prose rationale (author does everything) and auto-patch (a whole draft PR).
+
+The certainty gate is strict, because a wrong one-click suggestion is worse than none: the item must be `FAIL` + `autoPatchable`, high-confidence (≥0.8), and a contiguous replacement of ≤20 lines whose every replaced line is anchorable in the diff. Anything else falls through to the draft-PR auto-patch path, unchanged. Applied-vs-ignored is a crisp acceptance signal that flows into the outcome telemetry ([docs/OUTCOMES.md](docs/OUTCOMES.md)): an applied suggestion flips the item FAIL→PASS with its file changed, which reads as `acted-on`.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

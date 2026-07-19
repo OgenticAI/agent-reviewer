@@ -126,6 +126,26 @@ export const ItemVerdict = z.object({
    * the verdict, and for UNVERIFIABLE items it must name the missing capability.
    */
   evidence: z.array(z.string()).optional(),
+  /**
+   * A proposed one-click fix as a contiguous single-hunk replacement on the
+   * head file (OGE-1596). Rendered as a GitHub ```suggestion block on the
+   * inline comment ONLY when a strict certainty gate passes — FAIL,
+   * `autoPatchable`, high confidence, and every replaced line anchorable in
+   * the diff. Anything else falls through to the heavier draft-PR auto-patch
+   * path. A wrong one-click suggestion is worse than none, so the model is
+   * told to omit this unless the fix is small and certain.
+   *
+   * `startLine`/`endLine` are 1-based line numbers in the head file; the fix
+   * replaces that inclusive range with `replacement`.
+   */
+  suggestedFix: z
+    .object({
+      path: z.string().min(1),
+      startLine: z.number().int().positive(),
+      endLine: z.number().int().positive(),
+      replacement: z.string(),
+    })
+    .optional(),
 });
 export type ItemVerdict = z.infer<typeof ItemVerdict>;
 

@@ -97,6 +97,11 @@ export function buildPositionMap(diff: string): DiffPositionMap {
 export interface InlineComment {
   path: string;
   line: number;
+  /**
+   * Start of a multi-line anchor (OGE-1596). Set only for a committable
+   * suggestion that replaces a line range; single-line comments omit it.
+   */
+  startLine?: number;
   itemId: number;
   status: ItemVerdict["status"];
   body: string;

@@ -35,6 +35,7 @@ import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
 import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
 import {
   loadRepoConfig,
+  matchingLearnedRules,
   matchingPathInstructions,
   triggeredRecipes,
   type RefFileReader,
@@ -327,6 +328,14 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
         recipes: triggeredRecipes(
           repoConfig.config,
           checklist.items.map((it) => it.text),
+        ),
+        // Learned rules join the prompt on exactly the same terms as
+        // hand-written ones (OGE-1594) — they earned that standing by being
+        // accepted through a human merge.
+        learnedRules: matchingLearnedRules(
+          repoConfig.config,
+          checklist.items.map((it) => it.text),
+          changedFiles,
         ),
       }
     : undefined;

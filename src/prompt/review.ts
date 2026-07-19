@@ -105,6 +105,11 @@ export interface RepoGuidance {
   pathInstructions?: Array<{ glob: string; instructions: string; files: string[] }>;
   /** Recipes whose trigger words appeared in a checklist item. */
   recipes?: Array<{ triggers: string[]; instructions: string }>;
+  /**
+   * Learned rules that fired (OGE-1594) — carry provenance so a wrong rule is
+   * traceable to the decision it came from and deletable.
+   */
+  learnedRules?: Array<{ trigger: string; glob?: string; instructions: string; provenance: string }>;
 }
 
 const DISABLED_RESEARCH: ResearchPolicy = {
@@ -369,8 +374,14 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
  */
 function renderRepoGuidance(guidance: RepoGuidance | undefined): string[] {
   if (!guidance) return [];
-  const { files = [], pathInstructions = [], recipes = [] } = guidance;
-  if (files.length === 0 && pathInstructions.length === 0 && recipes.length === 0) return [];
+  const { files = [], pathInstructions = [], recipes = [], learnedRules = [] } = guidance;
+  if (
+    files.length === 0 &&
+    pathInstructions.length === 0 &&
+    recipes.length === 0 &&
+    learnedRules.length === 0
+  )
+    return [];
 
   const lines = [
     `## Repo conventions (from the default branch)`,
@@ -402,6 +413,21 @@ function renderRepoGuidance(guidance: RepoGuidance | undefined): string[] {
     lines.push(`### Triggered recipes`, ``);
     for (const r of recipes) {
       lines.push(`- triggered by ${r.triggers.map((t) => `\`${t}\``).join(", ")}: ${r.instructions}`);
+    }
+    lines.push(``);
+  }
+
+  if (learnedRules.length > 0) {
+    // Provenance is shown deliberately: a learned rule earns the same standing
+    // as a hand-written one only because a human accepted it (OGE-1594). Naming
+    // the source keeps a bad rule traceable and deletable, and tells the model
+    // this guidance came from a real prior decision, not a guess.
+    lines.push(`### Learned rules (accepted by a maintainer)`, ``);
+    for (const r of learnedRules) {
+      lines.push(
+        `- triggered by \`${r.trigger}\`${r.glob ? ` on \`${r.glob}\`` : ""}: ${r.instructions} ` +
+          `_(learned from ${r.provenance})_`,
+      );
     }
     lines.push(``);
   }

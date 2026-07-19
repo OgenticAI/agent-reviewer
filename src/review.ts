@@ -209,7 +209,7 @@ function parseVerdict(
     prRef: string;
     headSha: string;
     generatedAt: string;
-    checklist: { items: Array<{ id: number; text: string }> };
+    checklist: { items: Array<{ id: number; text: string; human?: boolean }> };
   },
 ): ReviewVerdict {
   const stripped = modelOutput
@@ -234,20 +234,24 @@ function parseVerdict(
   const root = parsed as Record<string, unknown>;
   const rawItems = Array.isArray(root.items) ? (root.items as unknown[]) : [];
   const checklistById = new Map(
-    injected.checklist.items.map((it) => [it.id, it.text]),
+    injected.checklist.items.map((it) => [it.id, it]),
   );
 
   const repairedItems = rawItems.map((raw, idx) => {
     const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
     const id = typeof item.id === "number" ? item.id : idx + 1;
+    const source = checklistById.get(id);
     const itemText =
       typeof item.itemText === "string" && item.itemText.length > 0
         ? item.itemText
-        : (checklistById.get(id) ?? `Item ${id}`);
+        : (source?.text ?? `Item ${id}`);
     const evidenceRefs = Array.isArray(item.evidenceRefs)
       ? (item.evidenceRefs as unknown[]).map(coerceEvidenceRef).filter((r) => r !== null)
       : [];
-    return { ...item, id, itemText, evidenceRefs };
+    // `human` comes from the parsed checklist, never from the model — whether
+    // a criterion needs a person is the author's declaration, not a verdict
+    // the model gets to make. Overwrite anything the model emitted (OGE-1559).
+    return { ...item, id, itemText, evidenceRefs, human: source?.human === true };
   });
 
   const candidate = {

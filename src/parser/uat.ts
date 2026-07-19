@@ -55,10 +55,24 @@ export type UatItemLink =
 export interface UatItem {
   /** Stable position-based ID within the checklist (1-based). */
   id: number;
-  /** Verbatim item text (no leading `- [ ]`, no trailing whitespace). */
+  /**
+   * Item text with the leading `[human]` marker (if any) stripped, and no
+   * trailing whitespace. This is what the model sees and echoes back as
+   * `itemText` — the marker is metadata, not part of the criterion.
+   */
   text: string;
   /** True if the box was ticked in the source markdown (`[x]` or `[X]`). */
   checked: boolean;
+  /**
+   * True when the item opened with a `[human]` marker (OGE-1559 / OGE-1560).
+   *
+   * The convention: criteria that genuinely need a person — clinician
+   * sign-off, "the docs read clearly", visual design judgment — are declared
+   * up front rather than silently punted. Declaring one is good practice, not
+   * a failure, so `overallStatus` excludes human items from the
+   * `HUMAN_REVIEW` calculation. See `src/schema/verdict.ts`.
+   */
+  human: boolean;
   /** 1-based source line number — useful for error messages and round-tripping. */
   line: number;
   /**
@@ -92,6 +106,18 @@ const UAT_HEADING_RE = /^##[ \t]+UAT[ \t]+checklist[ \t]*$/;
 
 /** GitHub task-list item: bullet, brackets, text. */
 const TASK_ITEM_RE = /^[ \t]*-[ \t]+\[([ xX])\][ \t]+(.+?)[ \t]*$/;
+
+/**
+ * The `[human]` marker, at the start of an item's text (OGE-1559 / OGE-1560).
+ *
+ * Case-insensitive, and tolerant of the bold form authors reach for
+ * (`**[human]**`) because GitHub renders a bare `[human]` in dimmed link-ish
+ * styling and people work around it. Both forms mean the same thing.
+ *
+ * Anchored to the start deliberately: a mid-sentence "[human]" is almost
+ * always prose ("escalate to a [human] reviewer"), not a declaration.
+ */
+const HUMAN_MARKER_RE = /^(?:\*\*)?\[human\](?:\*\*)?[ \t]*:?[ \t]*/i;
 
 /**
  * Greedy URL extractor — captures bare URLs and URLs inside markdown link
@@ -203,14 +229,22 @@ export function parseUatChecklist(markdown: string): UatChecklist {
     if (!match) continue;
 
     const checkChar = match[1] ?? " ";
-    const text = (match[2] ?? "").trim();
-    if (!text) continue; // skip empty items defensively
+    const rawText = (match[2] ?? "").trim();
+    if (!rawText) continue; // skip empty items defensively
+
+    // Strip the `[human]` marker before anything else sees the text, so the
+    // model never has to reason about the annotation and `itemText` round-trips
+    // cleanly through the verdict schema.
+    const human = HUMAN_MARKER_RE.test(rawText);
+    const text = human ? rawText.replace(HUMAN_MARKER_RE, "").trim() : rawText;
+    if (!text) continue; // `- [ ] [human]` with no criterion is not an item
 
     position += 1;
     items.push({
       id: position,
       text,
       checked: checkChar !== " ",
+      human,
       line: i + 1, // 1-based for human-readable output
       links: extractLinks(text),
     });

@@ -303,4 +303,64 @@ describe("parseUatChecklist", () => {
       expect(summary).toEqual({ total: 0, checked: 0, unchecked: 0 });
     });
   });
+
+  // OGE-1559: criteria that genuinely need a person are declared up front so
+  // they stop counting against the merge gate.
+  describe("[human] marker", () => {
+    function firstItem(itemLine: string) {
+      return parseUatChecklist(["## UAT checklist", itemLine].join("\n")).items[0];
+    }
+
+    it("sets human=true and strips the marker from the text", () => {
+      const item = firstItem("- [ ] [human] Clinician sign-off on the mapping");
+      expect(item?.human).toBe(true);
+      expect(item?.text).toBe("Clinician sign-off on the mapping");
+    });
+
+    it("accepts the bold form", () => {
+      const item = firstItem("- [ ] **[human]** Design review of the empty state");
+      expect(item?.human).toBe(true);
+      expect(item?.text).toBe("Design review of the empty state");
+    });
+
+    it("is case-insensitive and tolerates a trailing colon", () => {
+      expect(firstItem("- [ ] [HUMAN] Legal review")?.human).toBe(true);
+      expect(firstItem("- [ ] [Human]: Legal review")?.human).toBe(true);
+      expect(firstItem("- [ ] [Human]: Legal review")?.text).toBe("Legal review");
+    });
+
+    it("defaults human=false on a normal item", () => {
+      const item = firstItem("- [ ] `redact()` round-trips across all profiles");
+      expect(item?.human).toBe(false);
+      expect(item?.text).toBe("`redact()` round-trips across all profiles");
+    });
+
+    it("ignores a mid-sentence [human] — that's prose, not a declaration", () => {
+      const item = firstItem("- [ ] Escalates to a [human] reviewer when confidence is low");
+      expect(item?.human).toBe(false);
+      expect(item?.text).toBe("Escalates to a [human] reviewer when confidence is low");
+    });
+
+    it("skips an item that is nothing but a marker", () => {
+      const result = parseUatChecklist(["## UAT checklist", "- [ ] [human]"].join("\n"));
+      expect(result.items).toHaveLength(0);
+    });
+
+    it("composes with checked state and link extraction", () => {
+      const item = firstItem(
+        "- [x] [human] Verified in https://github.com/o/r/pull/1#issuecomment-5",
+      );
+      expect(item?.human).toBe(true);
+      expect(item?.checked).toBe(true);
+      expect(item?.links).toHaveLength(1);
+    });
+
+    it("keeps ids positional when a marker-only item is skipped", () => {
+      const result = parseUatChecklist(
+        ["## UAT checklist", "- [ ] [human]", "- [ ] real criterion here"].join("\n"),
+      );
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0]?.id).toBe(1);
+    });
+  });
 });

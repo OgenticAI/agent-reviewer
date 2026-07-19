@@ -98,7 +98,11 @@ runs:
         npx tsx src/cli.ts review-pr "$PR_URL" --post --output-json "$VERDICT_PATH"
         rc=$?
         if [ $rc -eq 0 ]; then
-          overall=$(node -e "console.log(require(process.env.VERDICT_PATH).items.reduce((acc,it)=>{if(it.status==='FAIL')return 'NEEDS_WORK';if(it.status==='UNVERIFIABLE'&&acc!=='NEEDS_WORK')return 'HUMAN_REVIEW';if(it.status==='PARTIAL'&&!['NEEDS_WORK','HUMAN_REVIEW'].includes(acc))return 'PASS_WITH_PARTIALS';return acc;},'PASS'))")
+          # `overall` is computed by overallStatus() and written into the
+          # sidecar by the CLI. This used to be a reimplementation of that
+          # reduce inline, which diverged as soon as `[human]` items were
+          # excluded from the roll-up (OGE-1559). Read it, don't recompute it.
+          overall=$(node -e "console.log(require(process.env.VERDICT_PATH).overall)")
         elif [ $rc -eq 3 ]; then
           overall="SKIPPED"
         else

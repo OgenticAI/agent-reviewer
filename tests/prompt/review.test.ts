@@ -47,12 +47,15 @@ function makeTicket(): LinearTicketContext {
   };
 }
 
-function makeChecklist(items: Array<{ text: string; checked: boolean }>): UatChecklist {
+function makeChecklist(
+  items: Array<{ text: string; checked: boolean; human?: boolean }>,
+): UatChecklist {
   return {
     items: items.map((it, i) => ({
       id: i + 1,
       text: it.text,
       checked: it.checked,
+      human: it.human ?? false,
       line: i + 1,
       links: [],
     })),

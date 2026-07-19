@@ -22,8 +22,15 @@ export interface UpsertStickyArgs {
   repo: string;
   /** PR number (== issue number for commenting). */
   issueNumber: number;
-  /** The pre-rendered comment body (must start with COMMENT_MARKER). */
+  /** The pre-rendered comment body (must start with `marker`). */
   body: string;
+  /**
+   * Which sticky slot to occupy. Defaults to `COMMENT_MARKER` (the verdict
+   * sticky). The UAT-checklist linter passes `LINT_COMMENT_MARKER` so its
+   * advisory comment gets its own slot instead of overwriting the verdict
+   * table on every run (OGE-1559).
+   */
+  marker?: string;
 }
 
 export interface UpsertStickyResult {
@@ -37,14 +44,15 @@ export interface UpsertStickyResult {
  * "no comment churn on each push" guarantee. Otherwise create or patch.
  */
 export async function upsertStickyComment(args: UpsertStickyArgs): Promise<UpsertStickyResult> {
-  if (!args.body.startsWith(COMMENT_MARKER)) {
+  const marker = args.marker ?? COMMENT_MARKER;
+  if (!args.body.startsWith(marker)) {
     throw new Error(
-      `Sticky body must start with COMMENT_MARKER (got: ${args.body.slice(0, 60)}…). ` +
-        `Use renderStickyComment() to build the body.`,
+      `Sticky body must start with ${marker} (got: ${args.body.slice(0, 60)}…). ` +
+        `Use renderStickyComment() / renderLintComment() to build the body.`,
     );
   }
 
-  const existing = await findStickyComment(args);
+  const existing = await findStickyComment(args, marker);
 
   if (existing && existing.body === args.body) {
     return { action: "noop", commentId: existing.id, url: existing.url };
@@ -75,7 +83,10 @@ interface StickyCommentMatch {
   url: string;
 }
 
-async function findStickyComment(args: UpsertStickyArgs): Promise<StickyCommentMatch | null> {
+async function findStickyComment(
+  args: UpsertStickyArgs,
+  marker: string,
+): Promise<StickyCommentMatch | null> {
   // Paginate. Most PRs have <30 comments, but the API caps at 100/page so
   // walking is cheap and correct.
   const iterator = args.octokit.paginate.iterator(args.octokit.issues.listComments, {
@@ -87,7 +98,7 @@ async function findStickyComment(args: UpsertStickyArgs): Promise<StickyCommentM
 
   for await (const { data } of iterator) {
     for (const comment of data) {
-      if ((comment.body ?? "").startsWith(COMMENT_MARKER)) {
+      if ((comment.body ?? "").startsWith(marker)) {
         return { id: comment.id, body: comment.body ?? "", url: comment.html_url };
       }
     }

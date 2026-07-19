@@ -80,7 +80,17 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
   const { pr, ticket, checklist, diff, linkedComments } = args;
 
   const items = checklist.items
-    .map((it) => `${it.id}. ${it.text}${it.checked ? " (author marked done)" : ""}`)
+    .map((it) => {
+      const annotations = [
+        it.checked ? "author marked done" : null,
+        // OGE-1559: the author declared this one as needing a person. Say so
+        // explicitly rather than letting the model burn reasoning deciding it
+        // can't verify a clinician sign-off from a diff.
+        it.human ? "human sign-off — do not attempt to verify" : null,
+      ].filter((a): a is string => a !== null);
+      const suffix = annotations.length > 0 ? ` (${annotations.join("; ")})` : "";
+      return `${it.id}. ${it.text}${suffix}`;
+    })
     .join("\n");
 
   const checklistBlock = checklist.found
@@ -127,6 +137,12 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     `  reproduction steps, etc). Explain why a human is needed.`,
     ``,
     `Author tick-marks alone are advisory — don't trust them. Decide from the diff.`,
+    ``,
+    `**Items marked "human sign-off"** were explicitly declared by the author as`,
+    `needing a person (clinician approval, design judgment, docs clarity). Return`,
+    `**UNVERIFIABLE** for these with a one-line rationale naming who needs to look.`,
+    `Don't argue with the designation and don't spend effort trying to verify them —`,
+    `they're excluded from the merge gate downstream.`,
     ``,
     `**Exception (ticked-box + verification comment):** if a UAT item is ticked`,
     `(\`(author marked done)\` annotation above) AND the "## Linked verification`,

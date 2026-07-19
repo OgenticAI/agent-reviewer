@@ -44,12 +44,46 @@ export const Recipe = z.object({
 });
 export type Recipe = z.infer<typeof Recipe>;
 
+/**
+ * A machine-appended verification rule, learned from a human decision
+ * (OGE-1594).
+ *
+ * Distinct from `path_instructions` in one way that matters: it carries
+ * **provenance**. The reviewer proposed this rule from a real event — an
+ * override, a resolved sub-issue — and a human accepted it by merging the PR
+ * that added it. When a learned rule turns out to be wrong, `provenance` is
+ * how you find the decision it came from and delete it.
+ *
+ * There is no LLM in the acceptance path. The rule text is recorded human
+ * words (an override reason, a resolution note), the trigger is a literal
+ * string, and acceptance is a git merge — never a model grading itself.
+ * Greptile measured LLM self-scoring as "nearly random"; this is the deliberate
+ * avoidance of it.
+ */
+export const LearnedRule = z.object({
+  /** Substring matched against checklist item text, like a recipe trigger. */
+  trigger: z.string().min(1),
+  /** Optional glob — when set, the rule also requires a matching changed file. */
+  glob: z.string().min(1).optional(),
+  /** The learned verification hint, in the human's own words where possible. */
+  instructions: z.string().min(1),
+  /** Where this rule came from, e.g. "OGE-1200 override on PR #48". */
+  provenance: z.string().min(1),
+});
+export type LearnedRule = z.infer<typeof LearnedRule>;
+
 export const ReviewerConfig = z.object({
   /** Overrides the action input of the same name. */
   fail_on: z.array(z.string()).optional(),
   exclude_globs: z.array(z.string()).optional(),
   path_instructions: z.array(PathInstruction).optional(),
   recipes: z.array(Recipe).optional(),
+  /**
+   * Machine-appended, human-accepted verification rules (OGE-1594). Written by
+   * the reviewer proposing a PR against this file, never by direct commit —
+   * the human merge IS the acceptance signal. Hand-editing is fine too.
+   */
+  learned_rules: z.array(LearnedRule).optional(),
   /**
    * Who may invoke `/uat-override`, beyond GitHub's collaborator check.
    *
@@ -133,6 +167,27 @@ export function triggeredRecipes(config: ReviewerConfig, checklistTexts: string[
   return (config.recipes ?? []).filter((r) =>
     r.triggers.some((t) => haystack.includes(t.toLowerCase())),
   );
+}
+
+/**
+ * Learned rules that apply to this PR (OGE-1594).
+ *
+ * A rule fires when its trigger word appears in a checklist item AND — if it
+ * scopes a glob — a changed file matches. Same matching discipline as recipes
+ * and path instructions, so learned knowledge is injected on exactly the same
+ * terms as hand-written knowledge.
+ */
+export function matchingLearnedRules(
+  config: ReviewerConfig,
+  checklistTexts: string[],
+  changedFiles: string[],
+): LearnedRule[] {
+  const haystack = checklistTexts.join("\n").toLowerCase();
+  return (config.learned_rules ?? []).filter((r) => {
+    if (!haystack.includes(r.trigger.toLowerCase())) return false;
+    if (r.glob && !changedFiles.some((f) => matchesGlob(f, r.glob!))) return false;
+    return true;
+  });
 }
 
 /**

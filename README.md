@@ -216,6 +216,14 @@ recipes:
   - triggers: ["migration", "schema"]
     instructions: "Migrations are verified by the snapshot test, not by running them."
 
+# Machine-appended, human-accepted learnings (see "The feedback loop" below).
+# You rarely hand-write these — the reviewer proposes them via PR.
+learned_rules:
+  - trigger: "migration"
+    glob: "db/**"
+    instructions: "Migrations are verified by the schema-snapshot job."
+    provenance: "OGE-1200 override on PR #48"
+
 # Narrows who may run `/uat-override`. Omit to allow any repo maintainer.
 override_policy:
   allowed_actors: [davidoladeji-ogenticai]
@@ -227,6 +235,16 @@ override_policy:
 A malformed config is a warning, not a failure &mdash; the review runs unconfigured rather than going red.
 
 `AGENTS.md` and `CLAUDE.md`, if present on the default branch, are injected as repo conventions automatically with no config at all (clamped to 4000 chars each so they can't crowd out the diff). `override_policy` can only *narrow* the existing GitHub maintainer check; it is never a second way in.
+
+### The feedback loop &mdash; `learned_rules`
+
+Every human resolution carries repo-specific verification knowledge. When a maintainer overrides an `UNVERIFIABLE` punt with "this is checked by the e2e job", that sentence is exactly what would turn the *next* similar item into a real verdict. The reviewer harvests these.
+
+- **Sources.** `/uat-override` reasons (captured verbatim) and resolved from-reviewer sub-issues, drawn from the outcome export ([docs/OUTCOMES.md](docs/OUTCOMES.md)).
+- **Proposal, not commit.** The reviewer opens a PR against `.agent-reviewer.yml` adding a `learned_rules` entry. **Merging that PR is the acceptance signal** &mdash; it never writes learned rules by direct commit, which keeps the trust model committed-config-only.
+- **Provenance.** Every learned rule records where it came from, so a wrong one is traceable to its source decision and deletable. It shows up in the prompt as `_(learned from OGE-1200 override on PR #48)_`.
+- **Demotion.** A finding class force-passed repeatedly *with no code change* is, by the evidence, noise; it's surfaced as a demotion checklist in the same PR for a maintainer to action.
+- **No model grades a model.** Rule text is the human's own words, triggers are literal strings, acceptance is a git merge, demotion is outcome telemetry. Greptile measured LLM self-scoring as "nearly random", so there is no LLM anywhere in the acceptance path.
 
 ## Determinism contract
 

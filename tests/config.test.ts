@@ -16,6 +16,7 @@ import {
   EMPTY_CONFIG,
   GUIDANCE_MAX_CHARS,
   isOverrideAllowed,
+  matchingLearnedRules,
   matchingPathInstructions,
   parseReviewerConfig,
   triggeredRecipes,
@@ -114,6 +115,42 @@ describe("triggeredRecipes", () => {
 
   it("does not fire when no trigger appears", () => {
     expect(triggeredRecipes(config, ["`redact()` round-trips"])).toEqual([]);
+  });
+});
+
+describe("matchingLearnedRules", () => {
+  const { config } = parseReviewerConfig(
+    [
+      "learned_rules:",
+      '  - trigger: "migration"',
+      '    glob: "db/**"',
+      '    instructions: "Verified by the snapshot job."',
+      '    provenance: "OGE-1200 override on PR #48"',
+      '  - trigger: "webhook"',
+      '    instructions: "Covered by webhook_test.ts."',
+      '    provenance: "OGE-1201 sub-issue resolved"',
+      "",
+    ].join("\n"),
+  );
+
+  it("fires an unscoped rule on a checklist keyword alone", () => {
+    const rules = matchingLearnedRules(config, ["Webhook signature validated"], []);
+    expect(rules.map((r) => r.trigger)).toEqual(["webhook"]);
+  });
+
+  it("requires BOTH the trigger and a matching file for a scoped rule", () => {
+    const noFile = matchingLearnedRules(config, ["Migration applies cleanly"], ["src/app.ts"]);
+    expect(noFile).toEqual([]);
+    const withFile = matchingLearnedRules(
+      config,
+      ["Migration applies cleanly"],
+      ["db/migrations/001.sql"],
+    );
+    expect(withFile.map((r) => r.trigger)).toEqual(["migration"]);
+  });
+
+  it("returns nothing when no rule triggers", () => {
+    expect(matchingLearnedRules(config, ["Unrelated item"], ["src/app.ts"])).toEqual([]);
   });
 });
 

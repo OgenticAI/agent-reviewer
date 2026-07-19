@@ -255,6 +255,16 @@ Mechanical checklist items ("lint passes", "no new type errors", "tests cover th
 - **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
 - **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
 
+## Ranked repo map &mdash; `repo_map` / `map_tokens`
+
+The model starts blind: iteration 1 is typically `list_files` or a speculative search, and with a 12-iteration / 5-minute cap that exploration overhead is the difference between verifying and punting. Punts of the form "cannot confirm this function is called from Y" or "does every path emit an audit event" &mdash; small diff, repo-wide claim &mdash; are exactly what a standing symbol map answers without spending a tool iteration. Aider's lesson: push ranked context up front rather than making the model pay per fact.
+
+- **Ranking** is Aider's recipe with no ML plumbing: a symbol reference graph + personalized PageRank, seeded from diff-touched files **and identifiers lexically pulled from the UAT checklist** (so a claim naming `redactCategory` boosts the file that defines it). Deterministic &mdash; same repo + seeds always produce the same order.
+- **Signature-only** lines give ~10–50× compression; the model still opens a file to see a body, and the map is framed read-only ("use it to target reads, it is not evidence").
+- **Inverse budget scaling** (`map_tokens`, default 1024): the effective budget scales *inversely* with diff size, down to 25% for a large diff. A tiny diff with repo-wide claims gets the biggest map &mdash; precisely when it helps most.
+- **mtime-keyed parse cache** so an unchanged file is never re-parsed across runs (persist it through `actions/cache`).
+- Tag extraction is currently regex-based for TS/JS, isolated behind `extractTags()` so a tree-sitter backend can drop in later without touching ranking or rendering. Off by default.
+
 ## Incremental review &mdash; `incremental_min_commits` / `incremental_min_minutes`
 
 The replay cache keys on `headSha`, so before this every push re-reviewed the whole diff against the whole checklist &mdash; and an item that was PASS yesterday could flip on an unrelated push, which authors read as noise. Incremental review carries untouched verdicts forward.

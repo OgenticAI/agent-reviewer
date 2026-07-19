@@ -20,7 +20,8 @@
  *   1  any other failure
  */
 
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -35,6 +36,7 @@ import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { highestReviewedSha } from "./incremental/select.js";
 import { decideIncremental } from "./incremental/thresholds.js";
+import type { RepoFile } from "./repomap/index.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
 import type { RefFileReader } from "./config.js";
@@ -332,6 +334,14 @@ async function runReviewCommand(env: {
       findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
       inlineCommentsEnabled: process.env.REVIEWER_INLINE_COMMENTS === "true",
       incrementalEnabled,
+      ...(process.env.REVIEWER_REPO_MAP === "true" && resolveRepoRoot()
+        ? {
+            repoFiles: collectRepoFiles(resolveRepoRoot()!),
+            ...(process.env.REVIEWER_MAP_TOKENS
+              ? { mapTokens: Number(process.env.REVIEWER_MAP_TOKENS) }
+              : {}),
+          }
+        : {}),
       ...(process.env.REVIEWER_TRIAGE === "true"
         ? { triageModel: makeTriageModel(anthropic) }
         : {}),
@@ -638,6 +648,59 @@ function resolveRepoRoot(): string | null {
   } catch {
     return null;
   }
+}
+
+/** Directories never worth mapping — build output, deps, VCS. */
+const REPO_MAP_SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", "coverage", ".next", "out", "vendor",
+]);
+const REPO_MAP_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
+/** Bound on files mapped, so a huge monorepo can't blow the map build (OGE-1582). */
+const REPO_MAP_MAX_FILES = 2000;
+
+/**
+ * Collect TS/JS source files under the checkout for the repo map (OGE-1582).
+ *
+ * Bounded and best-effort: skips build/dep dirs, caps the file count, and
+ * carries each file's mtime so the tag cache can skip unchanged files across
+ * runs. Returns [] on any error — the map is an optimization, never a gate.
+ */
+function collectRepoFiles(root: string): RepoFile[] {
+  const out: RepoFile[] = [];
+  const walk = (dir: string): void => {
+    if (out.length >= REPO_MAP_MAX_FILES) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= REPO_MAP_MAX_FILES) return;
+      if (entry.isDirectory()) {
+        if (REPO_MAP_SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+        walk(join(dir, entry.name));
+      } else if (REPO_MAP_EXT.test(entry.name)) {
+        const full = join(dir, entry.name);
+        try {
+          const stat = statSync(full);
+          out.push({
+            path: relative(root, full),
+            content: readFileSync(full, "utf8"),
+            mtimeMs: stat.mtimeMs,
+          });
+        } catch {
+          // skip unreadable file
+        }
+      }
+    }
+  };
+  try {
+    walk(root);
+  } catch {
+    return [];
+  }
+  return out;
 }
 
 /**

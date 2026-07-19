@@ -116,6 +116,23 @@ inputs:
       (OGE-1590). Default 0 (no time gate). Pair with incremental_min_commits.
     required: false
     default: "0"
+  repo_map:
+    description: >-
+      When 'true', a ranked, signature-only repo map is injected read-only into
+      the prompt before the tool loop (OGE-1582), so repo-wide claims ("is this
+      called elsewhere?", "does every path emit an audit event?") are answered
+      from a standing symbol map instead of costing tool iterations. Ranked by
+      personalized PageRank over the symbol graph, seeded from diff-touched files
+      and checklist identifiers. Off by default.
+    required: false
+    default: "false"
+  map_tokens:
+    description: >-
+      Base token budget for the repo map (OGE-1582). The effective budget scales
+      INVERSELY with diff size — a small diff with repo-wide claims gets a big
+      map; a large diff gets a small one (down to 25% of this). Default 1024.
+    required: false
+    default: "1024"
   triage:
     description: >-
       When 'true', a cheap haiku-class pass runs before the expensive review
@@ -211,6 +228,8 @@ runs:
         REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
         REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
         REVIEWER_TRIAGE: ${{ inputs.triage }}
+        REVIEWER_REPO_MAP: ${{ inputs.repo_map }}
+        REVIEWER_MAP_TOKENS: ${{ inputs.map_tokens }}
         REVIEWER_INCREMENTAL_MIN_COMMITS: ${{ inputs.incremental_min_commits }}
         REVIEWER_INCREMENTAL_MIN_MINUTES: ${{ inputs.incremental_min_minutes }}
         REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}

@@ -103,6 +103,12 @@ export interface BuildPromptArgs {
    * prompt byte-identical for repos with no recognized CI output.
    */
   findings?: JobFindings[];
+  /**
+   * A ranked, signature-only repo map (OGE-1582), injected read-only so the
+   * model can answer repo-wide claims and target further reads without spending
+   * tool iterations exploring. Omitted keeps the prompt byte-identical.
+   */
+  repoMap?: string;
 }
 
 /** Per-repo guidance, already filtered to what this PR actually triggers. */
@@ -234,6 +240,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     fenceUntrusted(sanitizeUntrusted(checklistBlock), { source: "uat-checklist" }),
     ``,
     ...renderRepoGuidance(args.repoGuidance),
+    ...renderRepoMap(args.repoMap),
     ...(findingsSection ? [findingsSection, ``] : []),
     ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
@@ -443,6 +450,34 @@ function renderRepoGuidance(guidance: RepoGuidance | undefined): string[] {
   }
 
   return [lines.join("\n"), ``];
+}
+
+/**
+ * Render the ranked repo map (OGE-1582).
+ *
+ * Read-only and framed as Aider frames it: a standing map to answer repo-wide
+ * questions and to target further reads, not a substitute for reading the code
+ * an item actually turns on. It is signature-only, so the model must still open
+ * a file to see a body.
+ */
+function renderRepoMap(map: string | undefined): string[] {
+  if (!map || !map.trim()) return [];
+  return [
+    [
+      `## Repo map (ranked symbols, read-only)`,
+      ``,
+      `Signatures of the most relevant symbols across the repo, ranked by how`,
+      `central they are to this PR. Use it to answer repo-wide questions ("is`,
+      `this called elsewhere?", "does every path emit an audit event?") and to`,
+      `decide which files to read — it is signatures only, so open a file when`,
+      `an item turns on its body. It is not evidence on its own.`,
+      ``,
+      "```",
+      map,
+      "```",
+    ].join("\n"),
+    ``,
+  ];
 }
 
 function renderSkippedFiles(skipped: SkippedFile[] | undefined): string[] {

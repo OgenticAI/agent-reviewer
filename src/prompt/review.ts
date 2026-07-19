@@ -25,6 +25,7 @@ import { COMMENT_MARKER, REVIEWER_VERSION } from "../version.js";
 import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
+import { renderCiSection, type CiSummary } from "../ci/summary.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -76,6 +77,11 @@ export interface BuildPromptArgs {
    * non-research repos byte-identical to v2.
    */
   research?: ResearchPolicy;
+  /**
+   * Check runs and commit statuses for the head SHA (OGE-1554). Omitted keeps
+   * the prompt byte-identical to v2 for callers that don't supply it.
+   */
+  ci?: CiSummary;
 }
 
 const DISABLED_RESEARCH: ResearchPolicy = {
@@ -163,6 +169,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     : "(No `## UAT checklist` block found in the PR description.)";
 
   const linkedCommentsSection = renderLinkedCommentsSection(linkedComments);
+  const ciSection = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
 
   return [
     `# Review request`,
@@ -180,6 +187,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     ``,
     checklistBlock,
     ``,
+    ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,
     ``,
@@ -315,9 +323,19 @@ export const SYSTEM_PROMPT = [
   ``,
   `You speak like a senior teammate doing code review: terse, specific, and`,
   `useful. You never write filler. Every rationale should reference a file path`,
-  `or a concrete claim from the diff. If you cannot verify an item from the diff`,
-  `alone, return UNVERIFIABLE — that is not a failure, it is a request for`,
-  `human eyes.`,
+  `or a concrete claim from the evidence you gathered.`,
+  ``,
+  `**You may investigate before deciding.** When tools are available, use them:`,
+  `read the file the diff didn't show you, check what CI actually reported, look`,
+  `up the standard a criterion names. UNVERIFIABLE means "still unverifiable`,
+  `**after** investigating" — not "not visible in the diff". Reaching for it`,
+  `without having tried the tools in front of you is the failure mode to avoid;`,
+  `it is the answer that was correct when you were blind, and it is what made`,
+  `this reviewer punt on 88% of items. Earn it before you use it.`,
+  ``,
+  `UNVERIFIABLE is still the right answer for things no tool can settle — a`,
+  `visual judgment, a clinician's sign-off, an action that happens after merge.`,
+  `Say which, and say what you tried.`,
   ``,
   `You return ONE JSON object matching the \`ReviewVerdict\` schema. No prose`,
   `outside the JSON. No markdown code fences around the JSON. The same diff +`,

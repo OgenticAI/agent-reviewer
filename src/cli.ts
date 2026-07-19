@@ -20,7 +20,7 @@
  *   1  any other failure
  */
 
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -29,9 +29,15 @@ import type { GithubReader, VerdictModel } from "./review.js";
 import { LinearGraphqlClient } from "./linear/client.js";
 import { runWriteback } from "./linear/writeback.js";
 import { isCiGreen } from "./ci-green.js";
+import { fetchCiSummary } from "./ci/summary.js";
 import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
+import { runToolLoop, type TurnFn } from "./tools/loop.js";
+import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
+import { makeRepoTools } from "./tools/repo.js";
+import { makeHttpTools } from "./tools/http.js";
+import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -257,11 +263,25 @@ async function runReviewCommand(env: {
       );
     }
 
+    // Resolve the head SHA up front: the CI-log tools are scoped to this
+    // commit, and scoping them from PR data rather than from model input is
+    // what stops a PR naming someone else's repository.
+    const prMeta = await octokit.pulls.get({
+      owner: env.owner,
+      repo: env.repo,
+      pull_number: env.number,
+    });
+    const registry = buildToolRegistry(octokit, {
+      owner: env.owner,
+      repo: env.repo,
+      headSha: prMeta.data.head.sha,
+    });
+
     const result = await runReview({
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
-      model: makeAnthropicModel(anthropic),
+      model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
     });
@@ -272,6 +292,14 @@ async function runReviewCommand(env: {
         `reviewer=${REVIEWER_VERSION}${result.cached ? "  ·  (cached)" : ""}`,
     );
     console.error(`[research] ${result.researchReason}`);
+    if (result.degraded) {
+      console.error(`[review:degraded] ${result.degraded}`);
+    }
+    for (const call of result.transcript) {
+      console.error(
+        `[tool] ${call.name} (${call.durationMs}ms)${call.isError ? " ERROR" : ""}: ${call.result}`,
+      );
+    }
     // Audit trail. The model composes these and Anthropic dispatches them
     // server-side, so this after-the-fact log is the only record of what
     // actually left the building — see research/policy.ts.
@@ -326,6 +354,12 @@ async function runReviewCommand(env: {
             ref: `${env.owner}/${env.repo}#${env.number}`,
           },
           ciGreen,
+          metrics: {
+            toolCalls: result.transcript.length,
+            researchQueries: result.researchTrace.queries.length,
+            cached: result.cached,
+            ...(result.degraded ? { degraded: result.degraded } : {}),
+          },
         });
         console.error(
           `[linear:comment:${plan.comment.action}] [linear:status:${plan.status.action}${
@@ -438,6 +472,88 @@ function requireEnv(name: string): string {
   return v;
 }
 
+/**
+ * Where the repo under review is checked out (OGE-1555).
+ *
+ * NOT `process.cwd()`. The Action runs the CLI with `working-directory` set to
+ * the *reviewer's* own checkout (`github.action_path/../../..`), while the repo
+ * being reviewed sits at `GITHUB_WORKSPACE`. Using cwd would point the read
+ * tools at agent-reviewer's source and produce confidently wrong verdicts
+ * about a completely different codebase.
+ *
+ * Returns null when there is no usable checkout, in which case the reviewer
+ * runs with an empty registry exactly as before.
+ */
+function resolveRepoRoot(): string | null {
+  const candidate = process.env.REVIEWER_REPO_ROOT ?? process.env.GITHUB_WORKSPACE;
+  if (!candidate) return null;
+  try {
+    return statSync(candidate).isDirectory() ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Octokit-backed CI log reader (OGE-1557).
+ *
+ * Read-only against the Actions API. Deliberately NOT a `run_tests` tool: the
+ * suite already ran in a job that holds no reviewer secrets, so reading its
+ * output gets the same evidence without handing PR-authored code this
+ * process's Anthropic key, Linear token, and GitHub App private key.
+ */
+function makeCiLogClient(octokit: Octokit): CiLogClient {
+  return {
+    async listWorkflowRuns({ owner, repo, headSha }) {
+      const resp = await octokit.actions.listWorkflowRunsForRepo({
+        owner,
+        repo,
+        head_sha: headSha,
+      });
+      return resp.data.workflow_runs.map((r) => ({ id: r.id, name: r.name ?? "workflow" }));
+    },
+    async listJobs({ owner, repo, runId }) {
+      const resp = await octokit.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: runId,
+      });
+      return resp.data.jobs.map((j) => ({ id: j.id, name: j.name, conclusion: j.conclusion }));
+    },
+    async downloadJobLog({ owner, repo, jobId }) {
+      const resp = await octokit.actions.downloadJobLogsForWorkflowRun({
+        owner,
+        repo,
+        job_id: jobId,
+      });
+      return typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
+    },
+  };
+}
+
+function buildToolRegistry(
+  octokit: Octokit,
+  pr: { owner: string; repo: string; headSha: string },
+): ToolRegistry {
+  // HTTP fetch needs no checkout — it is allowlist-scoped and always safe to
+  // offer (OGE-1556).
+  const tools = [...makeHttpTools()];
+
+  tools.push(...makeCiLogTools(makeCiLogClient(octokit), pr));
+
+  const root = resolveRepoRoot();
+  if (root) {
+    tools.push(...makeRepoTools(root));
+    console.error(`[tools] repo read access rooted at ${root}`);
+  } else {
+    console.error("[tools] no repo checkout found — running without repo read access");
+  }
+
+  if (tools.length === 0) return EMPTY_REGISTRY;
+  console.error(`[tools] registry: ${tools.map((t) => t.definition.name).join(", ")}`);
+  return makeRegistry(tools);
+}
+
 function makeGithubReader(octokit: Octokit): GithubReader {
   return {
     async getPr({ owner, repo, number }) {
@@ -463,6 +579,9 @@ function makeGithubReader(octokit: Octokit): GithubReader {
         mediaType: { format: "diff" },
       });
       return resp.data as unknown as string;
+    },
+    async getCiSummary({ owner, repo, ref }) {
+      return fetchCiSummary(octokit, { owner, repo, ref });
     },
     async getIssueComment({ owner, repo, commentId }) {
       try {
@@ -504,23 +623,24 @@ function makeGithubReader(octokit: Octokit): GithubReader {
 }
 
 /**
- * How many times we'll resume a `pause_turn`.
- *
- * Anthropic's server-side tool loop caps at ~10 internal iterations and then
- * returns `stop_reason: "pause_turn"`, expecting the caller to re-send to
- * continue. Without this the response is silently truncated mid-verdict — no
- * error, just a JSON parse failure or a short answer. The cap keeps a
- * misbehaving loop from billing indefinitely.
+ * Output cap. Raised from 4096 with the tool loop (OGE-1552): tool results
+ * enter the context and the model now narrates its investigation, so the old
+ * ceiling truncated verdicts mid-JSON on anything but a short checklist.
  */
-const MAX_PAUSE_CONTINUATIONS = 3;
+const MAX_OUTPUT_TOKENS = 8192;
 
-function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
+function makeAnthropicModel(
+  anthropic: Anthropic,
+  registry: ToolRegistry = EMPTY_REGISTRY,
+): VerdictModel {
   return {
     async produce({ systemPrompt, userPrompt, research }) {
-      // Only attach `tools` when research is on. An empty array would still
-      // advertise a search capability; omitting the key entirely means there
-      // is no search path at all on the majority of reviews (OGE-1566).
-      const tools: Anthropic.Messages.ToolUnion[] | undefined = research.enabled
+      // Two kinds of tool, deliberately assembled in one array:
+      //   - client-side tools from the registry, which WE execute in the loop
+      //   - Anthropic's server-side web_search, which runs on their side and
+      //     needs no loop iteration at all (OGE-1566)
+      const clientTools = toolDefinitions(registry) ?? [];
+      const serverTools: Anthropic.Messages.ToolUnion[] = research.enabled
         ? [
             {
               type: "web_search_20250305",
@@ -529,37 +649,35 @@ function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
               allowed_domains: [...research.allowedDomains],
             },
           ]
-        : undefined;
+        : [];
+      const tools = [...clientTools, ...serverTools] as Anthropic.Messages.ToolUnion[];
 
-      const messages: Anthropic.MessageParam[] = [{ role: "user", content: userPrompt }];
-      const collected: unknown[] = [];
-
-      for (let attempt = 0; attempt <= MAX_PAUSE_CONTINUATIONS; attempt++) {
+      const turn: TurnFn = async (messages) => {
         const completion = await anthropic.messages.create({
           model: "claude-sonnet-4-5",
-          max_tokens: 4096,
+          max_tokens: MAX_OUTPUT_TOKENS,
           temperature: 0,
           system: systemPrompt,
-          messages,
-          ...(tools ? { tools } : {}),
+          messages: messages as Anthropic.MessageParam[],
+          // Omit the key entirely when there is nothing to offer. An empty
+          // array still advertises a tool-using posture to the model.
+          ...(tools.length > 0 ? { tools } : {}),
         });
-        collected.push(...completion.content);
+        return { content: completion.content, stopReason: completion.stop_reason };
+      };
 
-        if (completion.stop_reason !== "pause_turn") break;
+      const loop = await runToolLoop({ turn, registry, userPrompt });
 
-        // Resume: append the partial assistant turn and re-send as-is. Do NOT
-        // add a "continue" user message — the API detects the trailing
-        // server-tool block and picks up where it left off.
-        messages.push({ role: "assistant", content: completion.content });
-        if (attempt === MAX_PAUSE_CONTINUATIONS) {
-          console.error(
-            `[review] hit the pause_turn continuation cap (${MAX_PAUSE_CONTINUATIONS}); ` +
-              `verdict may be truncated`,
-          );
-        }
+      if (loop.degraded) {
+        console.error(`[review] tool loop degraded: ${loop.degraded}`);
       }
 
-      return { text: extractText(collected), trace: extractResearchTrace(collected) };
+      return {
+        text: extractText(loop.content),
+        trace: extractResearchTrace(loop.content),
+        transcript: loop.transcript,
+        ...(loop.degraded ? { degraded: loop.degraded } : {}),
+      };
     },
   };
 }

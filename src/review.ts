@@ -27,7 +27,9 @@ import {
 import { REVIEWER_VERSION } from "./version.js";
 import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
-import { hashPrompt, isCacheHit } from "./cache/verdict-cache.js";
+import type { ToolCallRecord } from "./tools/loop.js";
+import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
+import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -49,6 +51,16 @@ export interface VerdictModelRequest {
 export interface VerdictModelOutput {
   text: string;
   trace: ResearchTrace;
+  /**
+   * Every client-side tool call the model made, in order (OGE-1552). Surfaced
+   * for operator logs; nothing branches on it yet.
+   */
+  transcript?: ToolCallRecord[];
+  /**
+   * Set when the tool loop stopped on a cap rather than because the model was
+   * finished. The verdict is still usable — degraded, not failed.
+   */
+  degraded?: string;
 }
 
 /**
@@ -65,7 +77,7 @@ export interface VerdictModel {
 }
 
 function normalizeModelOutput(out: string | VerdictModelOutput): VerdictModelOutput {
-  return typeof out === "string" ? { text: out, trace: EMPTY_TRACE } : out;
+  return typeof out === "string" ? { text: out, trace: EMPTY_TRACE, transcript: [] } : out;
 }
 
 /** Linear lookup, swappable between the GraphQL HTTP client and the MCP. */
@@ -93,6 +105,12 @@ export interface GithubReader {
     repo: string;
     commentId: number;
   }): Promise<FetchedComment | null>;
+  /**
+   * Check runs + commit statuses for the head SHA (OGE-1554). Optional so
+   * existing test mocks keep compiling; when absent the prompt omits the CI
+   * section entirely rather than claiming CI is unknown.
+   */
+  getCiSummary?(args: { owner: string; repo: string; ref: string }): Promise<CiSummary>;
 }
 
 /**
@@ -152,6 +170,14 @@ export interface RunReviewResult {
   researchTrace: ResearchTrace;
   /** Why research was on or off, for operator-facing logs. */
   researchReason: string;
+  /** Client-side tool calls made during the run, in order (OGE-1552). */
+  transcript: ToolCallRecord[];
+  /**
+   * Set when the tool loop hit an iteration or wall-clock cap. The verdict is
+   * usable but was cut short — callers surface this rather than pretending the
+   * run completed normally.
+   */
+  degraded?: string;
 }
 
 /**
@@ -198,6 +224,23 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     enabledByConfig: args.researchEnabled === true,
   });
 
+  // CI is real evidence about this exact commit and was already being fetched
+  // for the writeback gate — it just never reached the prompt (OGE-1554).
+  let ci: CiSummary | undefined;
+  if (args.github.getCiSummary) {
+    try {
+      ci = await args.github.getCiSummary({
+        owner: pr.owner,
+        repo: pr.repo,
+        ref: pr.headSha,
+      });
+    } catch {
+      // A CI-read failure must never take down the review. Say "unknown"
+      // rather than silently omitting, so the model can't read absence as green.
+      ci = CI_UNAVAILABLE;
+    }
+  }
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
@@ -205,6 +248,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     diff,
     linkedComments,
     research,
+    ci,
   });
   const promptHash = hashPrompt(userPrompt);
 
@@ -229,6 +273,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       cached: true,
       researchTrace: EMPTY_TRACE,
       researchReason: "cache hit — prompt unchanged since the last run",
+      transcript: [],
     };
   }
 
@@ -247,6 +292,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     headSha: pr.headSha,
     generatedAt: now(),
     promptHash,
+    toolOutputHash: hashToolOutputs(output.transcript ?? []),
     checklist,
     trace: output.trace,
     researchEnabled: research.enabled,
@@ -263,6 +309,8 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     cached: false,
     researchTrace: output.trace,
     researchReason: research.reason,
+    transcript: output.transcript ?? [],
+    ...(output.degraded ? { degraded: output.degraded } : {}),
   };
 }
 
@@ -305,6 +353,7 @@ function parseVerdict(
     headSha: string;
     generatedAt: string;
     promptHash: string;
+    toolOutputHash: string;
     checklist: { items: Array<{ id: number; text: string; human?: boolean }> };
     trace: ResearchTrace;
     researchEnabled: boolean;
@@ -371,6 +420,7 @@ function parseVerdict(
     headSha: injected.headSha,
     generatedAt: injected.generatedAt,
     promptHash: injected.promptHash,
+    toolOutputHash: injected.toolOutputHash,
   };
   return ReviewVerdict.parse(candidate);
 }

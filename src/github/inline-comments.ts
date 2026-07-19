@@ -36,6 +36,8 @@ export interface InlineCommentClient {
     commitId: string;
     path: string;
     line: number;
+    /** Start of a multi-line anchor for a committable suggestion (OGE-1596). */
+    startLine?: number;
     body: string;
   }): Promise<{ id: number }>;
   updateReviewComment(args: {
@@ -108,6 +110,7 @@ export async function reconcileInlineComments(args: ReconcileArgs): Promise<Reco
         commitId: args.commitId,
         path: comment.path,
         line: comment.line,
+        ...(comment.startLine !== undefined ? { startLine: comment.startLine } : {}),
         body: comment.body,
       });
       result.created += 1;

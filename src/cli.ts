@@ -20,7 +20,7 @@
  *   1  any other failure
  */
 
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -34,7 +34,10 @@ import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
-import { EMPTY_REGISTRY, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
+import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
+import { makeRepoTools } from "./tools/repo.js";
+import { makeHttpTools } from "./tools/http.js";
+import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -260,11 +263,25 @@ async function runReviewCommand(env: {
       );
     }
 
+    // Resolve the head SHA up front: the CI-log tools are scoped to this
+    // commit, and scoping them from PR data rather than from model input is
+    // what stops a PR naming someone else's repository.
+    const prMeta = await octokit.pulls.get({
+      owner: env.owner,
+      repo: env.repo,
+      pull_number: env.number,
+    });
+    const registry = buildToolRegistry(octokit, {
+      owner: env.owner,
+      repo: env.repo,
+      headSha: prMeta.data.head.sha,
+    });
+
     const result = await runReview({
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
-      model: makeAnthropicModel(anthropic),
+      model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
     });
@@ -337,6 +354,12 @@ async function runReviewCommand(env: {
             ref: `${env.owner}/${env.repo}#${env.number}`,
           },
           ciGreen,
+          metrics: {
+            toolCalls: result.transcript.length,
+            researchQueries: result.researchTrace.queries.length,
+            cached: result.cached,
+            ...(result.degraded ? { degraded: result.degraded } : {}),
+          },
         });
         console.error(
           `[linear:comment:${plan.comment.action}] [linear:status:${plan.status.action}${
@@ -447,6 +470,88 @@ function requireEnv(name: string): string {
     process.exit(4);
   }
   return v;
+}
+
+/**
+ * Where the repo under review is checked out (OGE-1555).
+ *
+ * NOT `process.cwd()`. The Action runs the CLI with `working-directory` set to
+ * the *reviewer's* own checkout (`github.action_path/../../..`), while the repo
+ * being reviewed sits at `GITHUB_WORKSPACE`. Using cwd would point the read
+ * tools at agent-reviewer's source and produce confidently wrong verdicts
+ * about a completely different codebase.
+ *
+ * Returns null when there is no usable checkout, in which case the reviewer
+ * runs with an empty registry exactly as before.
+ */
+function resolveRepoRoot(): string | null {
+  const candidate = process.env.REVIEWER_REPO_ROOT ?? process.env.GITHUB_WORKSPACE;
+  if (!candidate) return null;
+  try {
+    return statSync(candidate).isDirectory() ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Octokit-backed CI log reader (OGE-1557).
+ *
+ * Read-only against the Actions API. Deliberately NOT a `run_tests` tool: the
+ * suite already ran in a job that holds no reviewer secrets, so reading its
+ * output gets the same evidence without handing PR-authored code this
+ * process's Anthropic key, Linear token, and GitHub App private key.
+ */
+function makeCiLogClient(octokit: Octokit): CiLogClient {
+  return {
+    async listWorkflowRuns({ owner, repo, headSha }) {
+      const resp = await octokit.actions.listWorkflowRunsForRepo({
+        owner,
+        repo,
+        head_sha: headSha,
+      });
+      return resp.data.workflow_runs.map((r) => ({ id: r.id, name: r.name ?? "workflow" }));
+    },
+    async listJobs({ owner, repo, runId }) {
+      const resp = await octokit.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: runId,
+      });
+      return resp.data.jobs.map((j) => ({ id: j.id, name: j.name, conclusion: j.conclusion }));
+    },
+    async downloadJobLog({ owner, repo, jobId }) {
+      const resp = await octokit.actions.downloadJobLogsForWorkflowRun({
+        owner,
+        repo,
+        job_id: jobId,
+      });
+      return typeof resp.data === "string" ? resp.data : String(resp.data ?? "");
+    },
+  };
+}
+
+function buildToolRegistry(
+  octokit: Octokit,
+  pr: { owner: string; repo: string; headSha: string },
+): ToolRegistry {
+  // HTTP fetch needs no checkout — it is allowlist-scoped and always safe to
+  // offer (OGE-1556).
+  const tools = [...makeHttpTools()];
+
+  tools.push(...makeCiLogTools(makeCiLogClient(octokit), pr));
+
+  const root = resolveRepoRoot();
+  if (root) {
+    tools.push(...makeRepoTools(root));
+    console.error(`[tools] repo read access rooted at ${root}`);
+  } else {
+    console.error("[tools] no repo checkout found — running without repo read access");
+  }
+
+  if (tools.length === 0) return EMPTY_REGISTRY;
+  console.error(`[tools] registry: ${tools.map((t) => t.definition.name).join(", ")}`);
+  return makeRegistry(tools);
 }
 
 function makeGithubReader(octokit: Octokit): GithubReader {

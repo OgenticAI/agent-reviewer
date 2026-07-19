@@ -22,6 +22,7 @@ import type {
   VerdictModel,
 } from "../../src/review.js";
 import type { LinearTicketContext, PrContext } from "../../src/schema/event.js";
+import { COMMENT_MARKER, REVIEWER_VERSION } from "../../src/version.js";
 
 const FIXTURES = join(import.meta.dirname, "..", "fixtures");
 const PR1_BODY = readFileSync(join(FIXTURES, "pr-1.md"), "utf8");
@@ -149,8 +150,10 @@ describe("runReview (end-to-end)", () => {
     expect(result.verdict.ticketId).toBe("OGE-308");
     expect(result.verdict.prRef).toBe("OgenticAI/ogentic-shield#1");
     expect(result.verdict.headSha).toBe("f6299112233aabbccdd");
-    expect(result.verdict.reviewerVersion).toBe("v2");
-    expect(result.body.startsWith("<!-- ogenticai-reviewer-v2 -->")).toBe(true);
+    // Reference the constants rather than hardcoding a version — otherwise
+    // every REVIEWER_VERSION bump breaks a test that isn't about versioning.
+    expect(result.verdict.reviewerVersion).toBe(REVIEWER_VERSION);
+    expect(result.body.startsWith(COMMENT_MARKER)).toBe(true);
   });
 
   it("derives the right OverallStatus from the items", async () => {

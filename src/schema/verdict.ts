@@ -123,6 +123,11 @@ export const ReviewVerdict = z.object({
    * failing toward correctness rather than toward a stale reuse.
    */
   promptHash: z.string().optional(),
+  /**
+   * Fingerprint of normalised client-side tool output (OGE-1553). Recorded for
+   * observability — not part of the cache key. See `isCacheHit`.
+   */
+  toolOutputHash: z.string().optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdict>;
 

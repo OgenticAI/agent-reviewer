@@ -29,7 +29,9 @@ import type { GithubReader, VerdictModel } from "./review.js";
 import { LinearGraphqlClient } from "./linear/client.js";
 import { runWriteback } from "./linear/writeback.js";
 import { isCiGreen } from "./ci-green.js";
-import { upsertStickyComment } from "./github/sticky.js";
+import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
+import { extractResearchTrace, extractText } from "./research/trace.js";
+import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -236,18 +238,49 @@ async function runReviewCommand(env: {
   const linear = new LinearGraphqlClient({ token: linearToken });
 
   try {
+    // The previous sticky comment carries the previous verdict as a JSON
+    // sidecar — that's the cache. A read failure is not fatal: no cache just
+    // means we re-run the review (OGE-1566).
+    let cachedVerdict = null;
+    try {
+      const previous = await readStickyComment({
+        octokit,
+        owner: env.owner,
+        repo: env.repo,
+        issueNumber: env.number,
+      });
+      cachedVerdict = previous ? parseVerdictFromStickyBody(previous) : null;
+    } catch (err) {
+      console.error(
+        `[review] could not read the previous sticky comment (continuing without cache): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     const result = await runReview({
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
       model: makeAnthropicModel(anthropic),
+      researchEnabled: process.env.REVIEWER_RESEARCH === "true",
+      cachedVerdict,
     });
 
     process.stdout.write(result.body + "\n");
     console.error(
       `Overall: ${result.overall}  ·  ${result.verdict.items.length} item(s)  ·  ` +
-        `reviewer=${REVIEWER_VERSION}`,
+        `reviewer=${REVIEWER_VERSION}${result.cached ? "  ·  (cached)" : ""}`,
     );
+    console.error(`[research] ${result.researchReason}`);
+    // Audit trail. The model composes these and Anthropic dispatches them
+    // server-side, so this after-the-fact log is the only record of what
+    // actually left the building — see research/policy.ts.
+    for (const query of result.researchTrace.queries) {
+      console.error(`[research:query] ${query}`);
+    }
+    for (const code of result.researchTrace.errors) {
+      console.error(`[research:error] ${code}`);
+    }
 
     if (env.args.outputJson) {
       // Include the computed `overall` so the Action reads it straight off the
@@ -470,19 +503,63 @@ function makeGithubReader(octokit: Octokit): GithubReader {
   };
 }
 
+/**
+ * How many times we'll resume a `pause_turn`.
+ *
+ * Anthropic's server-side tool loop caps at ~10 internal iterations and then
+ * returns `stop_reason: "pause_turn"`, expecting the caller to re-send to
+ * continue. Without this the response is silently truncated mid-verdict — no
+ * error, just a JSON parse failure or a short answer. The cap keeps a
+ * misbehaving loop from billing indefinitely.
+ */
+const MAX_PAUSE_CONTINUATIONS = 3;
+
 function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
   return {
-    async produce({ systemPrompt, userPrompt }) {
-      const completion = await anthropic.messages.create({
-        model: "claude-sonnet-4-5",
-        max_tokens: 4096,
-        temperature: 0,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }],
-      });
-      return completion.content
-        .map((block) => (block.type === "text" ? block.text : ""))
-        .join("");
+    async produce({ systemPrompt, userPrompt, research }) {
+      // Only attach `tools` when research is on. An empty array would still
+      // advertise a search capability; omitting the key entirely means there
+      // is no search path at all on the majority of reviews (OGE-1566).
+      const tools: Anthropic.Messages.ToolUnion[] | undefined = research.enabled
+        ? [
+            {
+              type: "web_search_20250305",
+              name: "web_search",
+              max_uses: research.maxUses,
+              allowed_domains: [...research.allowedDomains],
+            },
+          ]
+        : undefined;
+
+      const messages: Anthropic.MessageParam[] = [{ role: "user", content: userPrompt }];
+      const collected: unknown[] = [];
+
+      for (let attempt = 0; attempt <= MAX_PAUSE_CONTINUATIONS; attempt++) {
+        const completion = await anthropic.messages.create({
+          model: "claude-sonnet-4-5",
+          max_tokens: 4096,
+          temperature: 0,
+          system: systemPrompt,
+          messages,
+          ...(tools ? { tools } : {}),
+        });
+        collected.push(...completion.content);
+
+        if (completion.stop_reason !== "pause_turn") break;
+
+        // Resume: append the partial assistant turn and re-send as-is. Do NOT
+        // add a "continue" user message — the API detects the trailing
+        // server-tool block and picks up where it left off.
+        messages.push({ role: "assistant", content: completion.content });
+        if (attempt === MAX_PAUSE_CONTINUATIONS) {
+          console.error(
+            `[review] hit the pause_turn continuation cap (${MAX_PAUSE_CONTINUATIONS}); ` +
+              `verdict may be truncated`,
+          );
+        }
+      }
+
+      return { text: extractText(collected), trace: extractResearchTrace(collected) };
     },
   };
 }

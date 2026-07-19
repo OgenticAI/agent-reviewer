@@ -24,6 +24,7 @@
 import { COMMENT_MARKER, REVIEWER_VERSION } from "../version.js";
 import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
+import type { ResearchPolicy } from "../research/policy.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -66,6 +67,68 @@ export interface BuildPromptArgs {
    * entirely so unrelated PRs see byte-identical output to v1.
    */
   linkedComments?: LinkedComment[];
+  /**
+   * Whether the server-side web-search tool is attached to this request
+   * (OGE-1566). Changes the grounding rules the model is given: with search
+   * available it is told to look things up and cite them; without it, it is
+   * told to stop at the edge of what the diff supports rather than reaching
+   * into memory. Omitted defaults to disabled, which keeps prompts for
+   * non-research repos byte-identical to v2.
+   */
+  research?: ResearchPolicy;
+}
+
+const DISABLED_RESEARCH: ResearchPolicy = {
+  enabled: false,
+  reason: "not requested",
+  allowedDomains: [],
+  maxUses: 0,
+};
+
+/**
+ * The grounding rules for `[human]` items, which differ by whether the model
+ * can actually look anything up.
+ *
+ * Both branches enforce the same principle — never assert a domain fact you
+ * can't point at a source for — but the available move differs. Without
+ * search, the honest move is to stop and name what would need checking. With
+ * search, the honest move is to go and check, then cite.
+ */
+function groundingRules(research: ResearchPolicy): string[] {
+  if (!research.enabled) {
+    return [
+      `Ground every claim in the diff or the ticket, and cite it. Do NOT assert`,
+      `domain facts from memory — no clinical, legal, regulatory, or standards claims`,
+      `you cannot point at a source for. A confident wrong claim about DSM-5 is worse`,
+      `than silence, because it anchors the expert who reads it. If narrowing the`,
+      `question requires domain knowledge you can't cite, say exactly what would need`,
+      `to be checked and stop there.`,
+    ];
+  }
+  return [
+    `You have a **web_search** tool, limited to authoritative sources`,
+    `(${research.allowedDomains.slice(0, 6).join(", ")}, and similar) and to`,
+    `${research.maxUses} searches for this whole review. Use it only to settle the`,
+    `factual half of a "human sign-off" item — whether the code's categories,`,
+    `names, or values actually match the standard the criterion names.`,
+    ``,
+    `Rules for searching:`,
+    `- Search for the **standard**, not for this PR. Query things like`,
+    `  "HIPAA Safe Harbor 18 identifiers" — never paste code, diff hunks, file`,
+    `  contents, or ticket text into a query.`,
+    `- Cite every source you rely on in \`evidenceRefs\` as`,
+    `  \`{ "kind": "external", "url": "<the URL the search returned>", "note": "..." }\`.`,
+    `  Use the URL verbatim from the search results. A citation that did not come`,
+    `  back from a search this run will be dropped before the comment is posted,`,
+    `  taking the claim's support with it.`,
+    `- Still do NOT assert a domain fact you did not find a source for. If the`,
+    `  searches don't settle it, say what remains open and stop — that is a useful`,
+    `  briefing too.`,
+    ``,
+    `Searching never changes the verdict: a "human sign-off" item stays`,
+    `**UNVERIFIABLE** no matter what you find. Research narrows the question for`,
+    `the person signing; it does not substitute for the signature.`,
+  ];
 }
 
 /**
@@ -78,6 +141,7 @@ export interface BuildPromptArgs {
  */
 export function buildReviewPrompt(args: BuildPromptArgs): string {
   const { pr, ticket, checklist, diff, linkedComments } = args;
+  const research = args.research ?? DISABLED_RESEARCH;
 
   const items = checklist.items
     .map((it) => {
@@ -152,12 +216,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     `specific cases look routine, and which one or two need their attention. Turn`,
     `"someone should look at this" into "check line 40 — the rest is mechanical".`,
     ``,
-    `Ground every claim in the diff or the ticket, and cite it. Do NOT assert`,
-    `domain facts from memory — no clinical, legal, regulatory, or standards claims`,
-    `you cannot point at a source for. A confident wrong claim about DSM-5 is worse`,
-    `than silence, because it anchors the expert who reads it. If narrowing the`,
-    `question requires domain knowledge you can't cite, say exactly what would need`,
-    `to be checked and stop there.`,
+    ...groundingRules(research),
     ``,
     `**Exception (ticked-box + verification comment):** if a UAT item is ticked`,
     `(\`(author marked done)\` annotation above) AND the "## Linked verification`,

@@ -25,17 +25,47 @@ import {
   type LinkedComment,
 } from "./prompt/review.js";
 import { REVIEWER_VERSION } from "./version.js";
+import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
+import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
+import { hashPrompt, isCacheHit } from "./cache/verdict-cache.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
+
+export interface VerdictModelRequest {
+  systemPrompt: string;
+  userPrompt: string;
+  /**
+   * Whether this run may use the server-side web-search tool, and against
+   * which sources. When `enabled` is false the implementation must send **no
+   * `tools` array at all** — not an empty one — so there is no search path on
+   * the vast majority of reviews. See `research/policy.ts`.
+   */
+  research: ResearchPolicy;
+}
+
+/**
+ * What the model produced: the raw JSON verdict text, plus what the
+ * server-side search actually did (for audit and citation validation).
+ */
+export interface VerdictModelOutput {
+  text: string;
+  trace: ResearchTrace;
+}
 
 /**
  * Minimal interface the LLM dependency must satisfy. Real impl is the
  * Anthropic SDK; tests pass a stub that returns canned JSON.
+ *
+ * The return type is a union so a stub can keep returning a bare string —
+ * that keeps every pre-OGE-1566 test mock compiling and meaningful, since a
+ * test that doesn't care about research shouldn't have to fabricate a trace.
+ * `normalizeModelOutput` collapses the two shapes.
  */
 export interface VerdictModel {
-  produce(args: {
-    systemPrompt: string;
-    userPrompt: string;
-  }): Promise<string /* raw JSON text from the model */>;
+  produce(args: VerdictModelRequest): Promise<string | VerdictModelOutput>;
+}
+
+function normalizeModelOutput(out: string | VerdictModelOutput): VerdictModelOutput {
+  return typeof out === "string" ? { text: out, trace: EMPTY_TRACE } : out;
 }
 
 /** Linear lookup, swappable between the GraphQL HTTP client and the MCP. */
@@ -89,6 +119,17 @@ export interface RunReviewArgs {
   model: VerdictModel;
   /** Override the default ISO timestamp source. Tests pin this to a constant. */
   now?: () => string;
+  /**
+   * Per-repo opt-in for research (OGE-1566). Default false — see the security
+   * note in `research/policy.ts` for why this is not on by default.
+   */
+  researchEnabled?: boolean;
+  /**
+   * A verdict recovered from the existing sticky comment, if any. When it was
+   * produced from a byte-identical prompt at the same SHA, `runReview` returns
+   * it without calling the model at all.
+   */
+  cachedVerdict?: ReviewVerdict | null;
 }
 
 export interface RunReviewResult {
@@ -101,6 +142,16 @@ export interface RunReviewResult {
   prContext: PrContext;
   /** The Linear ticket the verdict was scored against (the primary one). */
   ticket: LinearTicketContext;
+  /** True when the verdict was reused from the sticky comment (no model call). */
+  cached: boolean;
+  /**
+   * What the server-side search did. Callers log `queries` — because the model
+   * composes them and Anthropic dispatches them, this after-the-fact record is
+   * the only visibility we get into what left the building.
+   */
+  researchTrace: ResearchTrace;
+  /** Why research was on or off, for operator-facing logs. */
+  researchReason: string;
 }
 
 /**
@@ -140,25 +191,66 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     github: args.github,
   });
 
+  // Resolve the research policy *before* building the prompt: whether research
+  // is on changes the prompt text, and therefore the cache key.
+  const research = resolveResearchPolicy({
+    items: checklist.items,
+    enabledByConfig: args.researchEnabled === true,
+  });
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
     checklist,
     diff,
     linkedComments,
+    research,
   });
-  const rawJson = await args.model.produce({
-    systemPrompt: SYSTEM_PROMPT,
-    userPrompt,
-  });
+  const promptHash = hashPrompt(userPrompt);
+
+  // Reuse the previous verdict when nothing in the determinism vector moved.
+  // This is what stops web-result drift from churning the sticky comment on
+  // every push — see cache/verdict-cache.ts.
+  if (
+    isCacheHit({
+      cached: args.cachedVerdict ?? null,
+      headSha: pr.headSha,
+      promptHash,
+      reviewerVersion: REVIEWER_VERSION,
+    })
+  ) {
+    const cachedVerdict = args.cachedVerdict!;
+    return {
+      verdict: cachedVerdict,
+      body: renderStickyComment(cachedVerdict),
+      overall: overallStatus(cachedVerdict),
+      prContext: pr,
+      ticket,
+      cached: true,
+      researchTrace: EMPTY_TRACE,
+      researchReason: "cache hit — prompt unchanged since the last run",
+    };
+  }
+
+  const output = normalizeModelOutput(
+    await args.model.produce({
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt,
+      research,
+    }),
+  );
 
   const now = args.now ?? (() => new Date().toISOString());
-  const verdict = parseVerdict(rawJson, {
+  const verdict = parseVerdict(output.text, {
     ticketId: primaryTicketId,
     prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
     headSha: pr.headSha,
     generatedAt: now(),
+    promptHash,
     checklist,
+    trace: output.trace,
+    researchEnabled: research.enabled,
+    linkedCommentUrls: linkedComments.map((lc) => lc.sourceUrl),
   });
 
   const body = renderStickyComment(verdict);
@@ -168,6 +260,9 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     overall: overallStatus(verdict),
     prContext: pr,
     ticket,
+    cached: false,
+    researchTrace: output.trace,
+    researchReason: research.reason,
   };
 }
 
@@ -209,7 +304,11 @@ function parseVerdict(
     prRef: string;
     headSha: string;
     generatedAt: string;
+    promptHash: string;
     checklist: { items: Array<{ id: number; text: string; human?: boolean }> };
+    trace: ResearchTrace;
+    researchEnabled: boolean;
+    linkedCommentUrls: string[];
   },
 ): ReviewVerdict {
   const stripped = modelOutput
@@ -245,13 +344,21 @@ function parseVerdict(
       typeof item.itemText === "string" && item.itemText.length > 0
         ? item.itemText
         : (source?.text ?? `Item ${id}`);
-    const evidenceRefs = Array.isArray(item.evidenceRefs)
+    const coerced = Array.isArray(item.evidenceRefs)
       ? (item.evidenceRefs as unknown[]).map(coerceEvidenceRef).filter((r) => r !== null)
       : [];
     // `human` comes from the parsed checklist, never from the model — whether
     // a criterion needs a person is the author's declaration, not a verdict
     // the model gets to make. Overwrite anything the model emitted (OGE-1559).
-    return { ...item, id, itemText, evidenceRefs, human: source?.human === true };
+    const human = source?.human === true;
+    const evidenceRefs = dropUnsourcedCitations(coerced, {
+      itemId: id,
+      human,
+      trace: injected.trace,
+      researchEnabled: injected.researchEnabled,
+      linkedCommentUrls: injected.linkedCommentUrls,
+    });
+    return { ...item, id, itemText, evidenceRefs, human };
   });
 
   const candidate = {
@@ -263,8 +370,60 @@ function parseVerdict(
     prRef: injected.prRef,
     headSha: injected.headSha,
     generatedAt: injected.generatedAt,
+    promptHash: injected.promptHash,
   };
   return ReviewVerdict.parse(candidate);
+}
+
+/**
+ * Strip external citations on `[human]` items that no search actually
+ * returned (OGE-1566).
+ *
+ * This is the structural half of "no uncited domain claims". The prompt asks
+ * the model not to assert standards it can't cite; this makes the ask
+ * enforceable, because a model that invents `https://hhs.gov/...` to dress up
+ * a half-remembered fact produces a citation that looks authoritative and
+ * isn't. A wrong DSM-5 claim carrying a real-looking government URL is worse
+ * than no briefing at all — it anchors the expert who reads it, and the entire
+ * value of a briefing is that they trust it enough to move faster.
+ *
+ * Scope is deliberately narrow — only `[human]` items, and only when research
+ * actually ran:
+ *   - Non-`[human]` items legitimately cite URLs from the diff, the ticket
+ *     description, or a linked verification comment. Filtering those would
+ *     break the OGE-365 promotion path.
+ *   - With research off there is no result set to check against, so every
+ *     external ref would be dropped — silently gutting evidence on repos that
+ *     never opted in.
+ *
+ * Same-PR verification-comment URLs stay permitted: they were fetched by the
+ * orchestrator and are evidence of a different kind.
+ */
+function dropUnsourcedCitations(
+  refs: unknown[],
+  ctx: {
+    itemId: number;
+    human: boolean;
+    trace: ResearchTrace;
+    researchEnabled: boolean;
+    linkedCommentUrls: string[];
+  },
+): unknown[] {
+  if (!ctx.human || !ctx.researchEnabled) return refs;
+
+  const permitted = new Set([...ctx.trace.citedUrls, ...ctx.linkedCommentUrls]);
+
+  return refs.filter((ref) => {
+    if (typeof ref !== "object" || ref === null) return true;
+    const r = ref as Record<string, unknown>;
+    if (r.kind !== "external" || typeof r.url !== "string") return true;
+    if (permitted.has(r.url)) return true;
+    console.error(
+      `[review] dropped uncited external evidence on item ${ctx.itemId}: ${r.url} ` +
+        `(not returned by any search this run)`,
+    );
+    return false;
+  });
 }
 
 /**

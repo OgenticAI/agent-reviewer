@@ -88,6 +88,8 @@ export interface RunWritebackArgs {
     /** Punt counts around adjudication (OGE-1587). */
     puntsBefore?: number;
     puntsAfter?: number;
+    /** Outcome rates vs the previous verdict (OGE-1592). */
+    outcomes?: { actedOnRate: number | null; overrideRate: number | null };
   };
   writer: LinearWriter;
   /** Verdict produced by `runReview()`. */
@@ -106,6 +108,12 @@ export interface RunWritebackArgs {
    * mutating Linear state.
    */
   dryRun?: boolean;
+  /**
+   * Whether the PR has merged (OGE-1592). Merge is what turns a still-open
+   * punt into a shipped-unanswered question, so it is what promotes
+   * UNVERIFIABLE items into follow-up child issues.
+   */
+  merged?: boolean;
 }
 
 export interface WritebackPlan {
@@ -200,8 +208,18 @@ export async function runWriteback(args: RunWritebackArgs): Promise<WritebackPla
   });
 
   // 3) Child issues for FAIL / PARTIAL items ---------------------------------
+  //
+  // At merge, still-UNVERIFIABLE items join them (OGE-1592). Before merge a
+  // punt is a live question and filing a ticket for it would be noise on every
+  // push; once the PR lands, that question shipped unanswered and nothing else
+  // in the system would ever ask it again. `[human]` items are included
+  // deliberately — merging means the code went out without the sign-off its
+  // author said it needed, which is exactly the follow-up worth owning.
   const followUps = args.verdict.items.filter(
-    (it) => it.status === "FAIL" || it.status === "PARTIAL",
+    (it) =>
+      it.status === "FAIL" ||
+      it.status === "PARTIAL" ||
+      (args.merged === true && it.status === "UNVERIFIABLE"),
   );
   if (followUps.length > 0) {
     const existingChildren = args.dryRun

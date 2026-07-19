@@ -36,6 +36,7 @@ import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
 import type { RefFileReader } from "./config.js";
+import { toOutcomeRows, renderOutcomeRows } from "./metrics/outcomes.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
@@ -352,6 +353,21 @@ async function runReviewCommand(env: {
       );
     }
 
+    if (result.outcomes && env.args.outputJson) {
+      // Labeled outcome rows for the eval harness (OGE-1589), JSONL beside the
+      // verdict sidecar. One row per item; append-friendly across runs/repos.
+      const rows = toOutcomeRows({
+        verdict: result.verdict,
+        summary: result.outcomes,
+        repo: `${env.owner}/${env.repo}`,
+        pr: env.number,
+        generatedAt: new Date().toISOString(),
+      });
+      const rowsPath = env.args.outputJson.replace(/\.json$/, "") + ".outcomes.jsonl";
+      writeFileSync(rowsPath, renderOutcomeRows(rows) + "\n", "utf8");
+      console.error(`[outcomes] wrote ${rows.length} row(s) to ${rowsPath}`);
+    }
+
     if (env.args.post) {
       const upsert = await upsertStickyComment({
         octokit,
@@ -384,12 +400,24 @@ async function runReviewCommand(env: {
             ref: `${env.owner}/${env.repo}#${env.number}`,
           },
           ciGreen,
+          // The merge event is what turns a still-open punt into a shipped-
+          // unanswered question (OGE-1592). The Action sets this on `closed`
+          // with `merged == true`.
+          merged: process.env.REVIEWER_PR_MERGED === "true",
           metrics: {
             toolCalls: result.transcript.length,
             researchQueries: result.researchTrace.queries.length,
             cached: result.cached,
             puntsBefore: result.puntsBefore,
             puntsAfter: result.puntsAfter,
+            ...(result.outcomes
+              ? {
+                  outcomes: {
+                    actedOnRate: result.outcomes.actedOnRate,
+                    overrideRate: result.outcomes.overrideRate,
+                  },
+                }
+              : {}),
             ...(result.degraded ? { degraded: result.degraded } : {}),
           },
         });
@@ -646,6 +674,16 @@ function makeGithubReader(octokit: Octokit): GithubReader {
     },
     async getCiSummary({ owner, repo, ref }) {
       return fetchCiSummary(octokit, { owner, repo, ref });
+    },
+    async getChangedPaths({ owner, repo, base, head }) {
+      // Outcome telemetry only (OGE-1592) — a failure here must cost telemetry,
+      // never the review, so it returns empty rather than throwing.
+      try {
+        const resp = await octokit.repos.compareCommits({ owner, repo, base, head });
+        return (resp.data.files ?? []).map((f) => f.filename);
+      } catch {
+        return [];
+      }
     },
     async getIssueComment({ owner, repo, commentId }) {
       try {

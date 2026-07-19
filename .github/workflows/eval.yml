@@ -1,0 +1,42 @@
+name: Eval
+
+# Prompt and model changes ship on vibes unless something measures whether
+# verdicts got *better* (OGE-1589). This gate replays the committed fixture set
+# and fails on any verdict-label regression or a punt-rate regression beyond
+# tolerance — exact structured-label matching, no LLM judge in the gate.
+#
+# Triggered only when the things that can move a verdict change: the prompt
+# templates and the reviewer version. It is hermetic (no network, no API key),
+# so it needs no secrets.
+
+on:
+  pull_request:
+    paths:
+      - "src/prompt/**"
+      - "src/version.ts"
+      - "src/schema/verdict.ts"
+      - "eval/**"
+      - "src/eval/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      # Fails on: any fixture whose verdict-label table diverges from its
+      # archived baseline, or an aggregate punt-rate rise beyond ±2%.
+      - run: npm run eval

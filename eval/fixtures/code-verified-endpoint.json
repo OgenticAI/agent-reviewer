@@ -1,0 +1,39 @@
+{
+  "name": "code-verified-endpoint",
+  "description": "Code plainly delivers but runtime proof is missing — CODE_VERIFIED.",
+  "origin": "snapshot",
+  "pr": {
+    "owner": "OgenticAI",
+    "repo": "agent-reviewer",
+    "number": 1001,
+    "headSha": "sha1002",
+    "headRef": "david/oge-1002-code-verified-endpoint",
+    "title": "feat(OGE-1002): Code plainly delivers but runtime proof is missing — CODE_VERIFIED.",
+    "body": "## Summary\n\nImplements OGE-1002.\n\n## UAT checklist\n\n- [ ] POST /webhooks validates the signature\n- [ ] handler returns 401 on bad signature",
+    "author": "davidoladeji-ogenticai",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  "ticket": {
+    "identifier": "OGE-1002",
+    "id": "uuid-OGE-1002",
+    "title": "Code plainly delivers but runtime proof is missing — CODE_VERIFIED.",
+    "description": "Ticket OGE-1002: Code plainly delivers but runtime proof is missing — CODE_VERIFIED.",
+    "status": "In Review",
+    "url": "https://linear.app/ogenticai/issue/OGE-1002"
+  },
+  "diff": "diff --git a/src/code-verified-endpoint.ts b/src/code-verified-endpoint.ts\n@@ -1,1 +1,2 @@\n+// change for OGE-1002\n",
+  "modelResponse": "{\"items\":[{\"id\":1,\"itemText\":\"POST /webhooks validates the signature\",\"status\":\"CODE_VERIFIED\",\"rationale\":\"Signature check present; end-to-end needs a running server.\",\"evidenceRefs\":[]},{\"id\":2,\"itemText\":\"handler returns 401 on bad signature\",\"status\":\"PASS\",\"rationale\":\"Explicit 401 branch with a unit test.\",\"evidenceRefs\":[]}],\"summary\":\"Code plainly delivers but runtime proof is missing — CODE_VERIFIED.\"}",
+  "expected": {
+    "items": [
+      {
+        "id": 1,
+        "status": "CODE_VERIFIED"
+      },
+      {
+        "id": 2,
+        "status": "PASS"
+      }
+    ],
+    "overall": "PASS_WITH_PARTIALS"
+  }
+}

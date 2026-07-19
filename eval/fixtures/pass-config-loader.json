@@ -1,0 +1,39 @@
+{
+  "name": "pass-config-loader",
+  "description": "Config loader delivered — PASS control.",
+  "origin": "snapshot",
+  "pr": {
+    "owner": "OgenticAI",
+    "repo": "agent-reviewer",
+    "number": 1004,
+    "headSha": "sha1005",
+    "headRef": "david/oge-1005-pass-config-loader",
+    "title": "feat(OGE-1005): Config loader delivered — PASS control.",
+    "body": "## Summary\n\nImplements OGE-1005.\n\n## UAT checklist\n\n- [ ] config loads from the default branch\n- [ ] malformed config degrades to empty",
+    "author": "davidoladeji-ogenticai",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  "ticket": {
+    "identifier": "OGE-1005",
+    "id": "uuid-OGE-1005",
+    "title": "Config loader delivered — PASS control.",
+    "description": "Ticket OGE-1005: Config loader delivered — PASS control.",
+    "status": "In Review",
+    "url": "https://linear.app/ogenticai/issue/OGE-1005"
+  },
+  "diff": "diff --git a/src/pass-config-loader.ts b/src/pass-config-loader.ts\n@@ -1,1 +1,2 @@\n+// change for OGE-1005\n",
+  "modelResponse": "{\"items\":[{\"id\":1,\"itemText\":\"config loads from the default branch\",\"status\":\"PASS\",\"rationale\":\"loadRepoConfig reads at the default-branch ref.\",\"evidenceRefs\":[]},{\"id\":2,\"itemText\":\"malformed config degrades to empty\",\"status\":\"PASS\",\"rationale\":\"parseReviewerConfig returns EMPTY_CONFIG on error.\",\"evidenceRefs\":[]}],\"summary\":\"Config loader delivered — PASS control.\"}",
+  "expected": {
+    "items": [
+      {
+        "id": 1,
+        "status": "PASS"
+      },
+      {
+        "id": 2,
+        "status": "PASS"
+      }
+    ],
+    "overall": "PASS"
+  }
+}

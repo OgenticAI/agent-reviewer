@@ -18,7 +18,9 @@
  *   process is a credential-exfiltration path, not a capability upgrade. Read
  *   tools (file reads, log fetches, HTTP GETs against an allowlist) are fine.
  *   Anything that runs code the PR author controls belongs in a separate,
- *   secretless job — see OGE-1557.
+ *   secretless job — see OGE-1557. That safe side now exists: `tools/exec.ts`
+ *   provides the single `run_command` tool, added to the registry ONLY behind
+ *   `sandbox_enabled` (OGE-1584) and fail-closed if any secret is in its env.
  */
 
 /** A JSON Schema object describing a tool's input. */

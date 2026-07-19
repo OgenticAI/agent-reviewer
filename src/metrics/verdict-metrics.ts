@@ -20,6 +20,13 @@
  * `rawPuntRate` keeps the unadjusted figure, because the historical 88% was
  * measured before `[human]` existed and comparing an adjusted number against
  * it would flatter the result.
+ *
+ * CODE_VERIFIED (OGE-1580) counts as a non-punt in BOTH rates. That is a real
+ * discontinuity in the series, not a quiet improvement: a verdict that would
+ * have been UNVERIFIABLE last week is now an affirmative outcome. When
+ * comparing against the 88% baseline, read `counts.CODE_VERIFIED` alongside
+ * the rate — a drop driven entirely by reclassification is a vocabulary win,
+ * which is worth having but is not the same as verifying more.
  */
 
 import type { ReviewVerdict, VerdictStatus } from "../schema/verdict.js";
@@ -50,6 +57,22 @@ export interface VerdictMetrics {
   cached: boolean;
   /** Set when the tool loop hit a cap. */
   degraded?: string;
+  /**
+   * Punt rate before / after the OGE-1587 adjudication pass, when it ran.
+   * Reported as a pair so the adjudicator's contribution is measurable per run
+   * rather than inferred from a moving aggregate.
+   */
+  puntRatePre?: number | null;
+  puntRatePost?: number | null;
+  /**
+   * Outcome telemetry (OGE-1592). `puntRate` alone cannot tell better
+   * verification from bolder guessing — these can. `actedOnRate` is the share
+   * of flipped findings that came with a change to a file the reviewer cited;
+   * the rest are unexplained flips, which is the number to watch. Omitted when
+   * there is no previous verdict to compare against.
+   */
+  actedOnRate?: number | null;
+  overrideRate?: number | null;
 }
 
 export function computeVerdictMetrics(args: {
@@ -58,9 +81,15 @@ export function computeVerdictMetrics(args: {
   researchQueries: number;
   cached: boolean;
   degraded?: string;
+  /** Punt counts around adjudication (OGE-1587), when it ran. */
+  puntsBefore?: number;
+  puntsAfter?: number;
+  /** Outcome rates vs the previous verdict (OGE-1592), when one existed. */
+  outcomes?: { actedOnRate: number | null; overrideRate: number | null };
 }): VerdictMetrics {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
+    CODE_VERIFIED: 0,
     FAIL: 0,
     PARTIAL: 0,
     UNVERIFIABLE: 0,
@@ -91,6 +120,15 @@ export function computeVerdictMetrics(args: {
     researchQueries: args.researchQueries,
     cached: args.cached,
     ...(args.degraded ? { degraded: args.degraded } : {}),
+    ...(args.puntsBefore !== undefined && args.puntsAfter !== undefined && verifiableItems > 0
+      ? {
+          puntRatePre: args.puntsBefore / verifiableItems,
+          puntRatePost: args.puntsAfter / verifiableItems,
+        }
+      : {}),
+    ...(args.outcomes
+      ? { actedOnRate: args.outcomes.actedOnRate, overrideRate: args.outcomes.overrideRate }
+      : {}),
   };
 }
 

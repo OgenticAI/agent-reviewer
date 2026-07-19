@@ -29,7 +29,42 @@ import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
 import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
+import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
+import { packDiff, splitDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
+import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
+import { ingestFindings } from "./findings/ingest.js";
+import type { JobFindings } from "./findings/schema.js";
+import { gateFindings, type FindingsFailLevel, type FindingsGateResult } from "./findings/gate.js";
+import type { CiLogClient } from "./tools/ci-logs.js";
+import {
+  buildPositionMap,
+  renderFallbackSection,
+  renderInlineFindingBody,
+  splitFindings,
+  type InlineComment,
+} from "./render/inline.js";
+import { attachSuggestions } from "./render/suggestion.js";
+import {
+  runTriage,
+  priorityFilesFrom,
+  type TriageModel,
+  type TriageResult,
+} from "./triage/triage.js";
+import {
+  appendReviewedSha,
+  highestReviewedSha,
+  mergeCarriedForward,
+  selectItems,
+} from "./incremental/select.js";
+import {
+  loadRepoConfig,
+  matchingLearnedRules,
+  matchingPathInstructions,
+  triggeredRecipes,
+  type RefFileReader,
+} from "./config.js";
+import { buildRepoMap, type RepoFile } from "./repomap/index.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -111,6 +146,17 @@ export interface GithubReader {
    * section entirely rather than claiming CI is unknown.
    */
   getCiSummary?(args: { owner: string; repo: string; ref: string }): Promise<CiSummary>;
+  /**
+   * Repo-relative paths changed between two commits (OGE-1592). Used to tell a
+   * finding that was acted on from one that merely flipped. Optional: without
+   * it every flip reads as unexplained, which errs toward flagging.
+   */
+  getChangedPaths?(args: {
+    owner: string;
+    repo: string;
+    base: string;
+    head: string;
+  }): Promise<string[]>;
 }
 
 /**
@@ -148,6 +194,63 @@ export interface RunReviewArgs {
    * it without calling the model at all.
    */
   cachedVerdict?: ReviewVerdict | null;
+  /**
+   * Cheap second-pass model that challenges each UNVERIFIABLE verdict
+   * (OGE-1587). Omitted means no adjudication — the default, so this cannot
+   * change behaviour for callers that have not opted in.
+   */
+  adjudicator?: AdjudicatorModel;
+  /**
+   * Diff packing controls (OGE-1581 / OGE-1591). Omitted uses the defaults;
+   * `readFile` enables function-boundary hunk expansion.
+   */
+  diffPack?: PackDiffOptions;
+  /**
+   * Reads files at a git ref, used to load `.agent-reviewer.yml` and the
+   * repo's `AGENTS.md` / `CLAUDE.md` from the default branch (OGE-1585).
+   * Omitted means no per-repo config — prompts stay byte-identical.
+   */
+  configReader?: RefFileReader;
+  /**
+   * Item ids a human force-passed via `/uat-override` (OGE-1592). Labelled
+   * `overridden` in the outcome data rather than counted as the reviewer
+   * being agreed with — those mean opposite things.
+   */
+  overriddenItemIds?: number[];
+  /**
+   * CI log/artifact reader for deterministic findings ingestion (OGE-1588).
+   * Reuses OGE-1557's client surface. Omitted means no ingestion — prompts
+   * stay byte-identical for repos that don't wire it.
+   */
+  findingsClient?: CiLogClient;
+  /** Severity at/above which analyzer findings fail the Check (OGE-1588). */
+  findingsFailLevel?: FindingsFailLevel;
+  /**
+   * Anchor FAIL/PARTIAL evidence as inline review comments (OGE-1586). Default
+   * off — when off, the sticky body stays byte-identical and no inline comments
+   * are produced.
+   */
+  inlineCommentsEnabled?: boolean;
+  /**
+   * Haiku-class triage model (OGE-1595). When supplied, a cheap pre-pass routes
+   * the tool loop onto the hard items and prioritizes the files it flags in the
+   * diff pack. Omitted / errors → today's uniform behaviour, unchanged.
+   */
+  triageModel?: TriageModel;
+  /**
+   * Carry untouched verdicts forward across pushes (OGE-1590). Requires a
+   * previous verdict (`cachedVerdict`) and `github.getChangedPaths`. Off by
+   * default; the CLI decides via the `incremental_*` thresholds.
+   */
+  incrementalEnabled?: boolean;
+  /**
+   * Checked-out repo files for the ranked repo map (OGE-1582). When supplied,
+   * `runReview` builds a signature-only map before the tool loop and injects it
+   * read-only. Omitted keeps the prompt byte-identical.
+   */
+  repoFiles?: RepoFile[];
+  /** Base token budget for the repo map; scales inversely with diff size. */
+  mapTokens?: number;
 }
 
 export interface RunReviewResult {
@@ -170,6 +273,27 @@ export interface RunReviewResult {
   researchTrace: ResearchTrace;
   /** Why research was on or off, for operator-facing logs. */
   researchReason: string;
+  /** Punt count before adjudication ran; equals the after count when it didn't. */
+  puntsBefore: number;
+  /** Punt count after adjudication. */
+  puntsAfter: number;
+  /**
+   * Per-item outcomes vs the previous verdict (OGE-1592). Undefined on the
+   * first review of a PR, when there is nothing to compare against.
+   */
+  outcomes?: OutcomeSummary;
+  /** Ingested analyzer/test findings, per job (OGE-1588). */
+  findings?: JobFindings[];
+  /** The deterministic findings-gate result (OGE-1588). */
+  findingsGate?: FindingsGateResult;
+  /** Inline review comments to post (OGE-1586), when inline mode is on. */
+  inlineComments?: InlineComment[];
+  /** Item ids that got a committable suggestion block (OGE-1596). */
+  suggestedItemIds?: number[];
+  /** Per-item routing from the cheap triage pre-pass (OGE-1595), when it ran. */
+  triage?: TriageResult;
+  /** Carried vs re-verified counts when incremental review ran (OGE-1590). */
+  incremental?: { carried: number; reverified: number };
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -241,14 +365,117 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Ingest structured analyzer/test output as established facts (OGE-1588).
+  // Deterministic, up front — the mechanical items ("lint passes", "no new
+  // type errors") no longer depend on the model reading a log tail well.
+  let findings: JobFindings[] | undefined;
+  if (args.findingsClient) {
+    try {
+      findings = await ingestFindings(args.findingsClient, {
+        owner: pr.owner,
+        repo: pr.repo,
+        headSha: pr.headSha,
+      });
+    } catch {
+      // Ingestion is best-effort context. A failure costs the facts, not the run.
+      findings = undefined;
+    }
+  }
+
+  // Pack before prompting: an unbounded diff either overflows the window or
+  // crowds out the checklist and tool results (OGE-1581).
+  // Per-repo config, read from the DEFAULT BRANCH only (OGE-1585) — loaded
+  // before packing because `exclude_globs` decides what gets packed at all.
+  const repoConfig =
+    args.configReader && pr.defaultBranch
+      ? await loadRepoConfig(args.configReader, pr.defaultBranch)
+      : null;
+  for (const w of repoConfig?.warnings ?? []) {
+    console.error(`[config] ${w}`);
+  }
+
+  // Cheap-model triage BEFORE packing (OGE-1595): route the tool loop onto the
+  // hard items and let the files it flags survive the token budget. Fail-open —
+  // absent a triage model, or on any error, this is a no-op.
+  let triage: TriageResult | undefined;
+  if (args.triageModel) {
+    triage = await runTriage({
+      model: args.triageModel,
+      checklist: checklist.items.map((it) => ({ id: it.id, text: it.text })),
+      changedFiles: splitDiff(diff).map((f) => f.path),
+    });
+    const counts = triage.items.reduce<Record<string, number>>((acc, it) => {
+      acc[it.routing] = (acc[it.routing] ?? 0) + 1;
+      return acc;
+    }, {});
+    console.error(`[triage] ${JSON.stringify(counts)}`);
+  }
+  const triagePriority = triage ? priorityFilesFrom(triage) : [];
+
+  const packed = packDiff(diff, {
+    ...args.diffPack,
+    excludeGlobs: [...(args.diffPack?.excludeGlobs ?? []), ...(repoConfig?.config.exclude_globs ?? [])],
+    checklistTexts: checklist.items.map((it) => it.text),
+    ...(triagePriority.length > 0 ? { priorityPaths: triagePriority } : {}),
+  });
+  if (packed.truncated) {
+    console.error(
+      `[diff] packed ${packed.includedFiles.length} file(s); skipped ${packed.skippedFiles.length}` +
+        ` (${packed.skippedFiles.map((s) => s.reason).join(", ")})`,
+    );
+  }
+
+  // Only the guidance this PR actually triggers reaches the prompt — an
+  // instruction for files nobody touched is context spent for nothing.
+  const changedFiles = packed.includedFiles.concat(packed.skippedFiles.map((s) => s.path));
+  const repoGuidance = repoConfig
+    ? {
+        files: repoConfig.guidance,
+        pathInstructions: matchingPathInstructions(repoConfig.config, changedFiles),
+        recipes: triggeredRecipes(
+          repoConfig.config,
+          checklist.items.map((it) => it.text),
+        ),
+        // Learned rules join the prompt on exactly the same terms as
+        // hand-written ones (OGE-1594) — they earned that standing by being
+        // accepted through a human merge.
+        learnedRules: matchingLearnedRules(
+          repoConfig.config,
+          checklist.items.map((it) => it.text),
+          changedFiles,
+        ),
+      }
+    : undefined;
+
+  // Ranked repo map before the tool loop (OGE-1582): answer repo-wide claims
+  // from a standing symbol map instead of paying per tool iteration to explore.
+  let repoMap: string | undefined;
+  if (args.repoFiles && args.repoFiles.length > 0) {
+    const map = buildRepoMap({
+      files: args.repoFiles,
+      diffTouchedFiles: changedFiles,
+      checklistTexts: checklist.items.map((it) => it.text),
+      diffText: packed.text,
+      ...(args.mapTokens !== undefined ? { baseTokens: args.mapTokens } : {}),
+    });
+    if (map.text) {
+      repoMap = map.text;
+      console.error(`[repomap] ${map.fileCount} file(s), budget ${map.budget} tokens`);
+    }
+  }
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
     checklist,
-    diff,
+    diff: packed.text,
     linkedComments,
     research,
     ci,
+    skippedFiles: packed.skippedFiles,
+    repoGuidance,
+    ...(findings ? { findings } : {}),
+    ...(repoMap ? { repoMap } : {}),
   });
   const promptHash = hashPrompt(userPrompt);
 
@@ -274,43 +501,161 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       researchTrace: EMPTY_TRACE,
       researchReason: "cache hit — prompt unchanged since the last run",
       transcript: [],
+      puntsBefore: cachedVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length,
+      puntsAfter: cachedVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length,
     };
   }
 
-  const output = normalizeModelOutput(
-    await args.model.produce({
-      systemPrompt: SYSTEM_PROMPT,
-      userPrompt,
-      research,
-    }),
-  );
-
   const now = args.now ?? (() => new Date().toISOString());
-  const verdict = parseVerdict(output.text, {
-    ticketId: primaryTicketId,
-    prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
-    headSha: pr.headSha,
-    generatedAt: now(),
-    promptHash,
-    toolOutputHash: hashToolOutputs(output.transcript ?? []),
-    checklist,
-    trace: output.trace,
-    researchEnabled: research.enabled,
-    linkedCommentUrls: linkedComments.map((lc) => lc.sourceUrl),
+  const { output, verdict: finalVerdict, retries } = await produceVerdictWithRetry({
+    model: args.model,
+    userPrompt,
+    research,
+    parse: (text, attemptOutput) =>
+      parseVerdict(text, {
+        ticketId: primaryTicketId,
+        prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
+        headSha: pr.headSha,
+        generatedAt: now(),
+        promptHash,
+        // Hash and citation-filter against the attempt that actually produced
+        // this text — a retry has its own transcript and trace.
+        toolOutputHash: hashToolOutputs(attemptOutput.transcript ?? []),
+        checklist,
+        trace: attemptOutput.trace,
+        researchEnabled: research.enabled,
+        linkedCommentUrls: linkedComments.map((lc) => lc.sourceUrl),
+      }),
   });
 
-  const body = renderStickyComment(verdict);
+  // Challenge the punts before anything is rendered — the sticky comment, the
+  // Check, and the Linear mirror should all reflect the adjudicated table.
+  let adjudicated = finalVerdict;
+  let puntsBefore = finalVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length;
+  let puntsAfter = puntsBefore;
+  if (args.adjudicator && puntsBefore > 0) {
+    const result = await adjudicateVerdict({
+      verdict: finalVerdict,
+      transcript: output.transcript ?? [],
+      prBody: pr.body,
+      model: args.adjudicator,
+    });
+    adjudicated = result.verdict;
+    puntsBefore = result.puntsBefore;
+    puntsAfter = result.puntsAfter;
+    for (const o of result.outcomes) {
+      console.error(
+        `[adjudicate] item ${o.itemId}: ${o.keptPunt ? "kept" : "overturned"}` +
+          `${o.spentCall ? "" : " (no call)"} — ${o.reason}`,
+      );
+    }
+  }
+
+  // Incremental review: carry untouched items forward from the previous
+  // verdict so an unrelated push can't churn a verdict whose code didn't move
+  // (OGE-1590). The previous verdict is the same sidecar the cache reads.
+  let incrementalInfo: { carried: number; reverified: number } | undefined;
+  const previousVerdict = args.cachedVerdict ?? null;
+  const reviewedShas = appendReviewedSha(previousVerdict, pr.headSha);
+  if (args.incrementalEnabled && previousVerdict && args.github.getChangedPaths) {
+    const base = highestReviewedSha(previousVerdict);
+    let changedPaths: string[] = [];
+    if (base && base !== pr.headSha) {
+      try {
+        changedPaths = await args.github.getChangedPaths({
+          owner: pr.owner,
+          repo: pr.repo,
+          base,
+          head: pr.headSha,
+        });
+      } catch (err) {
+        // Fail-open: no delta means re-verify everything, never carry a stale
+        // verdict on a failed diff read.
+        console.error(
+          `[incremental] delta ${base}..${pr.headSha} failed; full review — ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const selection = selectItems({
+      previousItems: previousVerdict.items,
+      currentItemIds: adjudicated.items.map((it) => it.id),
+      changedPaths,
+    });
+    const mergedItems = mergeCarriedForward({ fresh: adjudicated, previous: previousVerdict, selection });
+    adjudicated = { ...adjudicated, items: mergedItems };
+    incrementalInfo = { carried: selection.carryForward.size, reverified: selection.reverify.size };
+    console.error(
+      `[incremental] carried ${incrementalInfo.carried}, re-verified ${incrementalInfo.reverified}`,
+    );
+  }
+  adjudicated = { ...adjudicated, reviewedShas };
+
+  // Outcome telemetry: did the last verdict change anything? (OGE-1592)
+  // `puntRate` alone cannot tell better verification from bolder guessing.
+  const outcomes = await computeOutcomesForRun({
+    previous: args.cachedVerdict ?? null,
+    current: adjudicated,
+    pr,
+    github: args.github,
+    overriddenItemIds: args.overriddenItemIds,
+  });
+
+  // The findings gate is deterministic and independent of the verdict
+  // (OGE-1588): an error-level analyzer finding fails the Check whatever the
+  // model concluded, because "tsc reported 3 errors" is not the model's call.
+  const findingsGate = findings
+    ? gateFindings(findings, args.findingsFailLevel ?? "off")
+    : undefined;
+
+  // Anchor FAIL/PARTIAL evidence inline, routing the rest to the sticky
+  // fallback (OGE-1586). Off by default keeps the body byte-identical.
+  let inlineComments: InlineComment[] | undefined;
+  let fallbackSection: string | null | undefined;
+  let suggested: number[] | undefined;
+  if (args.inlineCommentsEnabled) {
+    const positionMap = buildPositionMap(diff);
+    const rawSplit = splitFindings(adjudicated.items, positionMap, renderInlineFindingBody);
+    // Upgrade small, certain FAIL fixes to committable suggestion blocks
+    // (OGE-1596); everything else keeps its prose comment / draft-PR path.
+    const { split, suggestedItemIds } = attachSuggestions({
+      split: rawSplit,
+      items: adjudicated.items,
+      positionMap,
+    });
+    inlineComments = split.inline;
+    fallbackSection = renderFallbackSection(split.unanchored);
+    if (suggestedItemIds.length > 0) {
+      suggested = suggestedItemIds;
+      console.error(`[inline] committable suggestions for item(s) ${suggestedItemIds.join(", ")}`);
+    }
+  }
+
+  const body = renderStickyComment(adjudicated, fallbackSection);
+  const retryNote =
+    retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
   return {
-    verdict,
+    verdict: adjudicated,
     body,
-    overall: overallStatus(verdict),
+    overall: overallStatus(adjudicated),
+    puntsBefore,
+    puntsAfter,
+    ...(outcomes ? { outcomes } : {}),
+    ...(findings ? { findings } : {}),
+    ...(findingsGate ? { findingsGate } : {}),
+    ...(inlineComments ? { inlineComments } : {}),
+    ...(suggested ? { suggestedItemIds: suggested } : {}),
+    ...(triage ? { triage } : {}),
+    ...(incrementalInfo ? { incremental: incrementalInfo } : {}),
     prContext: pr,
     ticket,
     cached: false,
     researchTrace: output.trace,
     researchReason: research.reason,
     transcript: output.transcript ?? [],
-    ...(output.degraded ? { degraded: output.degraded } : {}),
+    ...(output.degraded || retryNote
+      ? { degraded: [output.degraded, retryNote].filter(Boolean).join("; ") }
+      : {}),
   };
 }
 
@@ -325,6 +670,94 @@ export class ReviewSkippedError extends Error {
     super(message);
     this.name = "ReviewSkippedError";
   }
+}
+
+/**
+ * The model's output could not be turned into a trustworthy verdict table.
+ *
+ * Distinct from a generic parse failure because the caller acts on it: it
+ * re-prompts with this exact message, which is far more effective than
+ * silently repairing (SWE-agent measured recovery dropping from 90.5% to 57.2%
+ * once a bad action is absorbed rather than corrected at the boundary).
+ */
+export class VerdictShapeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VerdictShapeError";
+  }
+}
+
+/** Validation retries. Cheap relative to a wrong merge-gating verdict. */
+const MAX_VERDICT_RETRIES = 2;
+
+/**
+ * Ask the model for a verdict, re-prompting with the exact validation error
+ * before falling back to repair heuristics (OGE-1593).
+ *
+ * The heuristics are kept — `claude-code-security-review` retains a fallback
+ * tier at production scale for good reason — but they are now the *last*
+ * resort rather than the first, and a run that needs them is marked degraded
+ * instead of passing silently.
+ *
+ * Retries do not consume tool-loop iterations: the loop's caps govern
+ * investigation, this governs output shape.
+ */
+async function produceVerdictWithRetry(args: {
+  model: VerdictModel;
+  userPrompt: string;
+  research: ResearchPolicy;
+  parse: (text: string, output: VerdictModelOutput) => ReviewVerdict;
+}): Promise<{ output: VerdictModelOutput; verdict: ReviewVerdict; retries: number }> {
+  let lastText = "";
+  let lastError = "";
+
+  for (let attempt = 0; attempt <= MAX_VERDICT_RETRIES; attempt++) {
+    const prompt =
+      attempt === 0
+        ? args.userPrompt
+        : [
+            args.userPrompt,
+            ``,
+            `## Your previous response was rejected`,
+            ``,
+            `It did not validate against the ReviewVerdict schema:`,
+            ``,
+            "```",
+            lastError,
+            "```",
+            ``,
+            `Return the corrected JSON only — same checklist, one object per item,`,
+            `each with its 1-based "id". Do not explain the correction.`,
+          ].join("\n");
+
+    const output = normalizeModelOutput(
+      await args.model.produce({ systemPrompt: SYSTEM_PROMPT, userPrompt: prompt, research: args.research }),
+    );
+    lastText = output.text;
+
+    try {
+      return { output, verdict: args.parse(output.text, output), retries: attempt };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[review] verdict validation failed (attempt ${attempt + 1}/${MAX_VERDICT_RETRIES + 1}): ${lastError}`,
+      );
+    }
+  }
+
+  // Retries exhausted. Deliberately NOT falling back to a permissive parse:
+  // the repairs that are safe (backfilling itemText from the checklist,
+  // coercing bare-string evidenceRefs) already ran inside `parse` on every
+  // attempt. The only thing a laxer pass could add is positional renumbering,
+  // which is the mis-mapping hazard this ticket exists to remove.
+  //
+  // Throwing here routes to the caller's failure-safe path — a `neutral`
+  // Check, never a `failure` — so an unparseable response blocks nothing and
+  // is visible, rather than silently gating a merge on a shifted table.
+  throw new VerdictShapeError(
+    `Model output failed schema validation after ${MAX_VERDICT_RETRIES + 1} attempts. ` +
+      `Last error: ${lastError}`,
+  );
 }
 
 /**
@@ -384,6 +817,23 @@ function parseVerdict(
   const checklistById = new Map(
     injected.checklist.items.map((it) => [it.id, it]),
   );
+
+  // Positional id backfill is only safe when the model returned exactly the
+  // checklist it was given (OGE-1593). If it dropped a mid-list item and we
+  // renumber by position, every later verdict silently lands on the WRONG
+  // checklist item — and that mis-mapped table goes straight into a
+  // merge-gating comment with no error anywhere. Refuse instead; the caller
+  // re-prompts with this message.
+  const missingIds = rawItems.some(
+    (raw) => !(raw && typeof raw === "object" && typeof (raw as Record<string, unknown>).id === "number"),
+  );
+  if (missingIds && rawItems.length !== injected.checklist.items.length) {
+    throw new VerdictShapeError(
+      `Model returned ${rawItems.length} item(s) for a ${injected.checklist.items.length}-item ` +
+        `checklist and at least one has no "id". Refusing to renumber by position — return one ` +
+        `object per checklist item, each with its 1-based "id".`,
+    );
+  }
 
   const repairedItems = rawItems.map((raw, idx) => {
     const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
@@ -595,4 +1045,51 @@ function isSamePrCommentLink(
     link.repo === pr.repo &&
     link.prNumber === pr.number
   );
+}
+
+/**
+ * Outcome telemetry for one run (OGE-1592).
+ *
+ * Returns undefined rather than an empty summary when there is nothing to
+ * compare against — a first review has no outcomes, and reporting zeroes would
+ * read as "nothing was acted on", which is a different and much worse claim.
+ *
+ * Every failure path degrades to no telemetry. Measurement must never be able
+ * to take down the thing it measures.
+ */
+async function computeOutcomesForRun(args: {
+  previous: ReviewVerdict | null;
+  current: ReviewVerdict;
+  pr: PrContext;
+  github: GithubReader;
+  overriddenItemIds?: number[];
+}): Promise<OutcomeSummary | undefined> {
+  const { previous, current } = args;
+  if (!previous) return undefined;
+  // Same commit means nothing could have been acted on since.
+  if (previous.headSha === current.headSha) return undefined;
+
+  let changedPaths: string[] = [];
+  if (args.github.getChangedPaths) {
+    try {
+      changedPaths = await args.github.getChangedPaths({
+        owner: args.pr.owner,
+        repo: args.pr.repo,
+        base: previous.headSha,
+        head: current.headSha,
+      });
+    } catch (err) {
+      console.error(
+        `[outcomes] could not diff ${previous.headSha}..${current.headSha}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return computeOutcomes({
+    previous,
+    current,
+    changedPaths,
+    ...(args.overriddenItemIds ? { overriddenItemIds: args.overriddenItemIds } : {}),
+  });
 }

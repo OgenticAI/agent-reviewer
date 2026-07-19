@@ -18,12 +18,15 @@
     "test:watch": "vitest",
     "lint": "eslint src tests",
     "format": "prettier --write src tests",
-    "review-pr": "tsx src/cli.ts"
+    "review-pr": "tsx src/cli.ts",
+    "eval": "tsx scripts/run-eval.ts",
+    "eval:gen": "tsx scripts/gen-eval-fixtures.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.1",
     "@octokit/auth-app": "^7.1.4",
     "@octokit/rest": "^21.0.2",
+    "yaml": "^2.9.0",
     "zod": "^4.1.13"
   },
   "devDependencies": {

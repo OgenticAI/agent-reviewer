@@ -26,6 +26,10 @@ import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
 import { renderCiSection, type CiSummary } from "../ci/summary.js";
+import { renderFindingsSection } from "../findings/render.js";
+import type { JobFindings } from "../findings/schema.js";
+import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../tools/sanitize.js";
+import type { SkippedFile } from "./diff-pack.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -82,6 +86,44 @@ export interface BuildPromptArgs {
    * the prompt byte-identical to v2 for callers that don't supply it.
    */
   ci?: CiSummary;
+  /**
+   * Files the packer left out of `diff` (OGE-1581). Rendered so the model can
+   * fetch them or punt with a concrete reason — never silently missed.
+   */
+  skippedFiles?: SkippedFile[];
+  /**
+   * Per-repo guidance assembled from `.agent-reviewer.yml` and the repo's
+   * `AGENTS.md` / `CLAUDE.md`, all read from the DEFAULT BRANCH (OGE-1585).
+   * Omitted keeps the prompt byte-identical for repos with no config.
+   */
+  repoGuidance?: RepoGuidance;
+  /**
+   * Analyzer/test findings ingested from CI (OGE-1588), rendered as an
+   * established-facts section the model must not re-derive. Omitted keeps the
+   * prompt byte-identical for repos with no recognized CI output.
+   */
+  findings?: JobFindings[];
+  /**
+   * A ranked, signature-only repo map (OGE-1582), injected read-only so the
+   * model can answer repo-wide claims and target further reads without spending
+   * tool iterations exploring. Omitted keeps the prompt byte-identical.
+   */
+  repoMap?: string;
+}
+
+/** Per-repo guidance, already filtered to what this PR actually triggers. */
+export interface RepoGuidance {
+  /** Verbatim `AGENTS.md` / `CLAUDE.md` content, already clamped. */
+  files?: Array<{ path: string; content: string }>;
+  /** Path instructions whose glob matched at least one changed file. */
+  pathInstructions?: Array<{ glob: string; instructions: string; files: string[] }>;
+  /** Recipes whose trigger words appeared in a checklist item. */
+  recipes?: Array<{ triggers: string[]; instructions: string }>;
+  /**
+   * Learned rules that fired (OGE-1594) — carry provenance so a wrong rule is
+   * traceable to the decision it came from and deletable.
+   */
+  learnedRules?: Array<{ trigger: string; glob?: string; instructions: string; provenance: string }>;
 }
 
 const DISABLED_RESEARCH: ResearchPolicy = {
@@ -169,7 +211,13 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     : "(No `## UAT checklist` block found in the PR description.)";
 
   const linkedCommentsSection = renderLinkedCommentsSection(linkedComments);
-  const ciSection = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
+  // CI job names and statuses come from workflow files in the PR — a job can
+  // be named to look like an instruction. Fenced like everything else.
+  const findingsSection = args.findings ? renderFindingsSection(args.findings) : null;
+  const rawCi = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
+  const ciSection = rawCi
+    ? fenceUntrusted(sanitizeUntrusted(rawCi), { source: "ci-status" })
+    : null;
 
   return [
     `# Review request`,
@@ -181,21 +229,34 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     ``,
     `## Linear ticket description`,
     ``,
-    ticket.description.trim() || "_(empty)_",
+    fenceUntrusted(sanitizeUntrusted(ticket.description.trim() || "_(empty)_"), {
+      source: "linear-ticket",
+    }),
     ``,
     `## UAT checklist (from PR description)`,
     ``,
-    checklistBlock,
+    // Checklist text is PR-authored prose, so it is both sanitized (hidden
+    // instructions stripped) and fenced.
+    fenceUntrusted(sanitizeUntrusted(checklistBlock), { source: "uat-checklist" }),
     ``,
+    ...renderRepoGuidance(args.repoGuidance),
+    ...renderRepoMap(args.repoMap),
+    ...(findingsSection ? [findingsSection, ``] : []),
     ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,
     ``,
-    "```diff",
-    diff,
-    "```",
+    // The diff is written by whoever opened the PR and their merge depends on
+    // this verdict — it is the single most attacker-influenced input we have
+    // (OGE-1579). Fenced, not sanitized: stripping HTML comments out of a diff
+    // would corrupt the code under review. The fence plus the standing rule is
+    // the mitigation here.
+    fenceUntrusted(["```diff", diff, "```"].join("\n"), { source: "pr-diff" }),
+    ...renderSkippedFiles(args.skippedFiles),
     ``,
     `## Your task`,
+    ``,
+    UNTRUSTED_CONTENT_RULE,
     ``,
     `For each numbered UAT item above, decide whether the diff (in the context of`,
     `the existing repo) delivers it. Produce a JSON object exactly matching the`,
@@ -206,10 +267,31 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     `- **FAIL** — clear evidence the item is NOT delivered, or a regression.`,
     `- **PARTIAL** — partially done. Use sparingly and explain. Also the ceiling`,
     `  for the ticked-with-verification-comment promotion path — see below.`,
-    `- **UNVERIFIABLE** — cannot be checked from the diff alone (visual claims, manual`,
-    `  reproduction steps, etc). Explain why a human is needed.`,
+    `- **CODE_VERIFIED** — the code plainly delivers the item and you have evidence`,
+    `  for it, but proving it end-to-end would need running the system. Use this`,
+    `  instead of UNVERIFIABLE whenever the code-level answer is positive and only`,
+    `  runtime validation is missing. It is an affirmative result, it does not gate`,
+    `  the merge, and it is NOT a punt — say what you verified and what remains.`,
+    `- **UNVERIFIABLE** — you investigated and still cannot tell. Name the specific`,
+    `  capability you lacked ("no way to run the suite", "needs a person to look").`,
     ``,
     `Author tick-marks alone are advisory — don't trust them. Decide from the diff.`,
+    ``,
+    `**Confidence, and when a punt is legitimate.** Give every item a`,
+    `\`confidence\` between 0 and 1, and list what you actually looked at in`,
+    `\`evidence\` ("read src/foo.ts:40-58", "CI job \`test\` reported success").`,
+    ``,
+    `- Above **0.7** you know the answer — commit to PASS, CODE_VERIFIED, PARTIAL,`,
+    `  or FAIL. Hedging to UNVERIFIABLE at high confidence is the single most`,
+    `  common failure in this reviewer's history and is not acceptable.`,
+    `- **0.4–0.7** usually means PARTIAL or CODE_VERIFIED with the gap stated —`,
+    `  not a punt.`,
+    `- Below **0.4**, UNVERIFIABLE is right, and \`evidence\` must name the missing`,
+    `  capability rather than restating the item.`,
+    ``,
+    `Do not inflate confidence to avoid a punt. A confident wrong PASS on a`,
+    `merge-gating check is far worse than an honest UNVERIFIABLE — the point of`,
+    `the confidence field is that both mistakes are visible afterwards.`,
     ``,
     `**Items marked "human sign-off"** were explicitly declared by the author as`,
     `needing a person (clinician approval, design judgment, docs clarity). Always`,
@@ -292,6 +374,131 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
  * contract. Order is preserved from `linkedComments` (orchestrator preserves
  * checklist order).
  */
+/**
+ * Name what the packer dropped.
+ *
+ * A file the model is told about produces a targeted read or an honest punt.
+ * A file it is NOT told about produces a confident PASS on a change it never
+ * saw — which is the failure this section exists to prevent.
+ */
+/**
+ * Render per-repo guidance (OGE-1585).
+ *
+ * Fenced like every other repo-authored input, but with one difference stated
+ * inline: this content comes from the DEFAULT BRANCH, so it cannot be edited
+ * by the PR under review. That distinction matters — it is the reason these
+ * instructions may be followed while the diff's own prose may not.
+ */
+function renderRepoGuidance(guidance: RepoGuidance | undefined): string[] {
+  if (!guidance) return [];
+  const { files = [], pathInstructions = [], recipes = [], learnedRules = [] } = guidance;
+  if (
+    files.length === 0 &&
+    pathInstructions.length === 0 &&
+    recipes.length === 0 &&
+    learnedRules.length === 0
+  )
+    return [];
+
+  const lines = [
+    `## Repo conventions (from the default branch)`,
+    ``,
+    `Maintainer-authored and committed to the default branch, so the PR under`,
+    `review cannot have changed it. Treat it as instruction, not as data — this`,
+    `is the one input here that outranks your defaults. It narrows how to verify`,
+    `items; it can never widen a PASS.`,
+    ``,
+  ];
+
+  for (const f of files) {
+    lines.push(`### \`${f.path}\``, ``, f.content, ``);
+  }
+
+  if (pathInstructions.length > 0) {
+    lines.push(`### Path instructions`, ``);
+    for (const pi of pathInstructions) {
+      const shown = pi.files.slice(0, 5);
+      const more = pi.files.length > shown.length ? `, +${pi.files.length - shown.length} more` : "";
+      lines.push(
+        `- \`${pi.glob}\` (matched ${shown.map((f) => `\`${f}\``).join(", ")}${more}): ${pi.instructions}`,
+      );
+    }
+    lines.push(``);
+  }
+
+  if (recipes.length > 0) {
+    lines.push(`### Triggered recipes`, ``);
+    for (const r of recipes) {
+      lines.push(`- triggered by ${r.triggers.map((t) => `\`${t}\``).join(", ")}: ${r.instructions}`);
+    }
+    lines.push(``);
+  }
+
+  if (learnedRules.length > 0) {
+    // Provenance is shown deliberately: a learned rule earns the same standing
+    // as a hand-written one only because a human accepted it (OGE-1594). Naming
+    // the source keeps a bad rule traceable and deletable, and tells the model
+    // this guidance came from a real prior decision, not a guess.
+    lines.push(`### Learned rules (accepted by a maintainer)`, ``);
+    for (const r of learnedRules) {
+      lines.push(
+        `- triggered by \`${r.trigger}\`${r.glob ? ` on \`${r.glob}\`` : ""}: ${r.instructions} ` +
+          `_(learned from ${r.provenance})_`,
+      );
+    }
+    lines.push(``);
+  }
+
+  return [lines.join("\n"), ``];
+}
+
+/**
+ * Render the ranked repo map (OGE-1582).
+ *
+ * Read-only and framed as Aider frames it: a standing map to answer repo-wide
+ * questions and to target further reads, not a substitute for reading the code
+ * an item actually turns on. It is signature-only, so the model must still open
+ * a file to see a body.
+ */
+function renderRepoMap(map: string | undefined): string[] {
+  if (!map || !map.trim()) return [];
+  return [
+    [
+      `## Repo map (ranked symbols, read-only)`,
+      ``,
+      `Signatures of the most relevant symbols across the repo, ranked by how`,
+      `central they are to this PR. Use it to answer repo-wide questions ("is`,
+      `this called elsewhere?", "does every path emit an audit event?") and to`,
+      `decide which files to read — it is signatures only, so open a file when`,
+      `an item turns on its body. It is not evidence on its own.`,
+      ``,
+      "```",
+      map,
+      "```",
+    ].join("\n"),
+    ``,
+  ];
+}
+
+function renderSkippedFiles(skipped: SkippedFile[] | undefined): string[] {
+  if (!skipped || skipped.length === 0) return [];
+  const byReason = {
+    "token-budget": "too large to inline — use read_file if an item depends on it",
+    generated: "machine-generated — excluded deliberately",
+    excluded: "excluded by repo config",
+  } as const;
+  const lines = [`## Files not shown in the diff above`, ``];
+  for (const s of skipped) {
+    lines.push(`- \`${s.path}\` — ${byReason[s.reason]}`);
+  }
+  lines.push(``);
+  lines.push(
+    `If a checklist item depends on one of these, read it or say so — do not`,
+  );
+  lines.push(`assume an unshown file is unchanged.`);
+  return [lines.join("\n"), ``];
+}
+
 function renderLinkedCommentsSection(
   linkedComments: LinkedComment[] | undefined,
 ): string | null {
@@ -301,9 +508,12 @@ function renderLinkedCommentsSection(
     return [
       `Item ${lc.itemId} → comment by @${lc.author} (${lc.createdAt}) — ${lc.sourceUrl}`,
       ``,
-      "```",
-      `${lc.body}${truncatedNote}`,
-      "```",
+      // A verification comment is written by the PR author to argue their own
+      // item should pass — squarely adversarial input (OGE-1579).
+      fenceUntrusted(sanitizeUntrusted(`${lc.body}${truncatedNote}`), {
+        source: "pr-comment",
+        attrs: { item: String(lc.itemId), author: lc.author },
+      }),
     ].join("\n");
   });
   return [

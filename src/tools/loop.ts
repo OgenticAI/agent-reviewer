@@ -24,6 +24,7 @@
  */
 
 import type { ToolRegistry } from "./registry.js";
+import { collectKnownSecrets, fenceUntrusted, scrubObservation } from "./sanitize.js";
 
 /** Structural stand-in for an Anthropic message param. */
 export interface LoopMessage {
@@ -68,8 +69,56 @@ export const DEFAULT_MAX_WALL_CLOCK_MS = 5 * 60_000;
 /** Transcript entries are for humans debugging a run, not for replay. */
 const TRANSCRIPT_RESULT_MAX_CHARS = 500;
 
+/**
+ * How many recent observations stay in full (OGE-1583).
+ *
+ * SWE-agent ablated this directly: keeping the full history scored 15.0% vs
+ * 18.0% with older observations collapsed. Carrying every tool result across
+ * all 12 iterations means one big early read crowds out the evidence gathered
+ * later — and a crowded context late in the loop is exactly where hedged punts
+ * come from. OpenHands ships the same idea as its default condenser.
+ *
+ * The model's own reasoning and tool CALLS are never collapsed; only the bulky
+ * results it has already read.
+ */
+const KEEP_FULL_OBSERVATIONS = 5;
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** A user message carrying tool_result blocks. */
+function isObservationMessage(m: LoopMessage): boolean {
+  return (
+    m.role === "user" &&
+    Array.isArray(m.content) &&
+    (m.content as unknown[]).some((b) => isRecord(b) && b.type === "tool_result")
+  );
+}
+
+/**
+ * Replace all but the most recent observations with one-line placeholders.
+ *
+ * Mutates in place because `messages` is the live conversation. The tool_use_id
+ * is preserved — dropping it would orphan the model's tool call and invalidate
+ * the request.
+ */
+function collapseOldObservations(messages: LoopMessage[]): void {
+  const idxs = messages.flatMap((m, i) => (isObservationMessage(m) ? [i] : []));
+  for (const i of idxs.slice(0, Math.max(0, idxs.length - KEEP_FULL_OBSERVATIONS))) {
+    const message = messages[i]!;
+    const blocks = message.content as Array<Record<string, unknown>>;
+    message.content = blocks.map((b) => {
+      if (!isRecord(b) || b.type !== "tool_result") return b;
+      if (typeof b.content !== "string") return b;
+      if (b.content.startsWith("[earlier observation")) return b; // already collapsed
+      const chars = b.content.length;
+      return {
+        ...b,
+        content: `[earlier observation omitted — ${chars} chars; call the tool again if you need it]`,
+      };
+    });
+  }
 }
 
 interface ToolUseBlock {
@@ -109,6 +158,9 @@ export async function runToolLoop(args: {
   const now = args.now ?? (() => Date.now());
 
   const startedAt = now();
+  // Resolved once: reading process.env per observation would be wasteful and
+  // would let a mid-run env change produce inconsistent masking.
+  const knownSecrets = collectKnownSecrets();
   const messages: LoopMessage[] = [{ role: "user", content: args.userPrompt }];
   const collected: unknown[] = [];
   const transcript: ToolCallRecord[] = [];
@@ -156,7 +208,7 @@ export async function runToolLoop(args: {
     // calls, which is a slow, hard-to-spot degradation.
     const results = await Promise.all(
       toolUses.map(async (use) => {
-        const { record, content } = await executeTool(args.registry, use, now);
+        const { record, content } = await executeTool(args.registry, use, now, knownSecrets);
         transcript.push(record);
         return {
           type: "tool_result",
@@ -164,12 +216,17 @@ export async function runToolLoop(args: {
           // The model gets the FULL result; only the transcript is truncated.
           // Feeding back the shortened copy would quietly degrade every tool
           // whose output runs long, in a way that looks like a model problem.
-          content,
+          //
+          // Fenced because every tool output is attacker-influenced: a CI log
+          // line or fetched page can address the model directly (OGE-1579).
+          // The fence is inert without the standing rule in the prompt.
+          content: fenceUntrusted(content, { source: use.name }),
           ...(record.isError ? { is_error: true } : {}),
         };
       }),
     );
     messages.push({ role: "user", content: results });
+    collapseOldObservations(messages);
 
     if (now() - startedAt > maxWallClockMs) {
       degraded = `wall-clock cap of ${maxWallClockMs}ms reached after ${iterations} iteration(s)`;
@@ -192,20 +249,27 @@ async function executeTool(
   registry: ToolRegistry,
   use: ToolUseBlock,
   now: () => number,
+  knownSecrets: string[],
 ): Promise<{ record: ToolCallRecord; content: string }> {
   const startedAt = now();
   const tool = registry.get(use.name);
 
-  const finish = (content: string, isError: boolean) => ({
-    record: {
-      name: use.name,
-      input: use.input,
-      result: truncate(content),
-      isError,
-      durationMs: now() - startedAt,
-    },
-    content,
-  });
+  // Scrub BEFORE anything downstream sees it: the model, the transcript, the
+  // operator log, and — critically — the cache hash computed from the
+  // transcript, which must never embed a secret value (OGE-1579).
+  const finish = (raw: string, isError: boolean) => {
+    const content = scrubObservation(raw, knownSecrets);
+    return {
+      record: {
+        name: use.name,
+        input: use.input,
+        result: truncate(content),
+        isError,
+        durationMs: now() - startedAt,
+      },
+      content,
+    };
+  };
 
   if (!tool) {
     // The model asked for something we never advertised. Tell it plainly so it

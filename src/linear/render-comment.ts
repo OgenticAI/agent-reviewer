@@ -36,6 +36,7 @@ const OVERALL_HEADLINE: Record<OverallStatus, string> = {
 
 const STATUS_BADGE: Record<VerdictStatus, string> = {
   PASS: "✅",
+  CODE_VERIFIED: "🟢",
   FAIL: "❌",
   PARTIAL: "🟡",
   UNVERIFIABLE: "🤔",
@@ -49,7 +50,12 @@ export function renderLinearComment(args: {
   prUrl: string;
   overall: OverallStatus;
   /** Run telemetry for the metrics block (OGE-1562). Defaults to a cache-less, tool-less run. */
-  metrics?: Partial<Pick<VerdictMetrics, "toolCalls" | "researchQueries" | "cached" | "degraded">>;
+  metrics?: Partial<Pick<VerdictMetrics, "toolCalls" | "researchQueries" | "cached" | "degraded">> & {
+    puntsBefore?: number;
+    puntsAfter?: number;
+    /** Outcome rates vs the previous verdict (OGE-1592). */
+    outcomes?: { actedOnRate: number | null; overrideRate: number | null };
+  };
 }): string {
   const counts = countByStatus(args.verdict);
   const lines: string[] = [];
@@ -104,6 +110,10 @@ export function renderLinearComment(args: {
         researchQueries: args.metrics?.researchQueries ?? 0,
         cached: args.metrics?.cached ?? false,
         ...(args.metrics?.degraded ? { degraded: args.metrics.degraded } : {}),
+        ...(args.metrics?.puntsBefore !== undefined
+          ? { puntsBefore: args.metrics.puntsBefore, puntsAfter: args.metrics.puntsAfter }
+          : {}),
+        ...(args.metrics?.outcomes ? { outcomes: args.metrics.outcomes } : {}),
       }),
     ),
   );
@@ -114,6 +124,7 @@ export function renderLinearComment(args: {
 function countByStatus(verdict: ReviewVerdict): Record<VerdictStatus, number> {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
+    CODE_VERIFIED: 0,
     FAIL: 0,
     PARTIAL: 0,
     UNVERIFIABLE: 0,

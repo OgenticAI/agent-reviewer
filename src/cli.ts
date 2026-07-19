@@ -20,7 +20,8 @@
  *   1  any other failure
  */
 
-import { statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -33,11 +34,21 @@ import { fetchCiSummary } from "./ci/summary.js";
 import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
+import { highestReviewedSha } from "./incremental/select.js";
+import { decideIncremental } from "./incremental/thresholds.js";
+import type { RepoFile } from "./repomap/index.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
+import type { AdjudicatorModel } from "./adjudicate.js";
+import type { RefFileReader } from "./config.js";
+import { toOutcomeRows, renderOutcomeRows } from "./metrics/outcomes.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
-import { makeRepoTools } from "./tools/repo.js";
+import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
+import { makeExecTool, assertSecretlessEnv } from "./tools/exec.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
+import { parseFailLevel } from "./findings/gate.js";
+import { reconcileInlineComments, type InlineCommentClient } from "./github/inline-comments.js";
+import type { TriageModel } from "./triage/triage.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -277,13 +288,94 @@ async function runReviewCommand(env: {
       headSha: prMeta.data.head.sha,
     });
 
+    // Decide whether to take the incremental path (OGE-1590): carry untouched
+    // verdicts forward instead of re-reviewing the whole checklist.
+    let incrementalEnabled = false;
+    if (cachedVerdict) {
+      const base = highestReviewedSha(cachedVerdict);
+      const head = prMeta.data.head.sha;
+      let newCommits = 0;
+      if (base && base !== head) {
+        try {
+          const cmp = await octokit.repos.compareCommits({
+            owner: env.owner,
+            repo: env.repo,
+            base,
+            head,
+          });
+          newCommits = cmp.data.total_commits ?? 1;
+        } catch {
+          newCommits = 1; // a compare failure shouldn't block the decision
+        }
+      }
+      const minutesSinceLast = cachedVerdict.generatedAt
+        ? (Date.parse(prMeta.data.updated_at) - Date.parse(cachedVerdict.generatedAt)) / 60000
+        : Number.POSITIVE_INFINITY;
+      const decision = decideIncremental({
+        hasPrevious: true,
+        newCommits,
+        minutesSinceLast,
+        thresholds: {
+          minCommits: Number(process.env.REVIEWER_INCREMENTAL_MIN_COMMITS ?? "1"),
+          minMinutes: Number(process.env.REVIEWER_INCREMENTAL_MIN_MINUTES ?? "0"),
+        },
+      });
+      incrementalEnabled = decision.incremental;
+      console.error(`[incremental] ${decision.incremental ? "on" : "off"} — ${decision.reason}`);
+    }
+
     const result = await runReview({
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
+      configReader: makeRefFileReader(octokit, { owner: env.owner, repo: env.repo }),
+      // Deterministic analyzer/test ingestion (OGE-1588), reusing the CI log
+      // client. The gate is off unless the repo opts in.
+      findingsClient: makeCiLogClient(octokit),
+      findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
+      inlineCommentsEnabled: process.env.REVIEWER_INLINE_COMMENTS === "true",
+      incrementalEnabled,
+      ...(process.env.REVIEWER_REPO_MAP === "true" && resolveRepoRoot()
+        ? {
+            repoFiles: collectRepoFiles(resolveRepoRoot()!),
+            ...(process.env.REVIEWER_MAP_TOKENS
+              ? { mapTokens: Number(process.env.REVIEWER_MAP_TOKENS) }
+              : {}),
+          }
+        : {}),
+      ...(process.env.REVIEWER_TRIAGE === "true"
+        ? { triageModel: makeTriageModel(anthropic) }
+        : {}),
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
+      diffPack: {
+        ...(process.env.REVIEWER_DIFF_TOKEN_BUDGET
+          ? { tokenBudget: Number(process.env.REVIEWER_DIFF_TOKEN_BUDGET) }
+          : {}),
+        ...(process.env.REVIEWER_EXCLUDE_GLOBS
+          ? {
+              excludeGlobs: process.env.REVIEWER_EXCLUDE_GLOBS.split(",")
+                .map((g) => g.trim())
+                .filter(Boolean),
+            }
+          : {}),
+        // Hunk expansion needs the file on disk (OGE-1591). Reuses the same
+        // containment as the read tools, so a diff naming a path outside the
+        // checkout cannot pull an arbitrary file into the prompt.
+        readFile: (path: string) => {
+          const root = resolveRepoRoot();
+          if (!root) return null;
+          try {
+            return readFileSync(resolveWithinRoot(root, path), "utf8");
+          } catch {
+            return null;
+          }
+        },
+      },
+      ...(process.env.REVIEWER_ADJUDICATION === "true"
+        ? { adjudicator: makeAdjudicatorModel(anthropic) }
+        : {}),
     });
 
     process.stdout.write(result.body + "\n");
@@ -317,9 +409,44 @@ async function runReviewCommand(env: {
       // being excluded from the roll-up (OGE-1559) — one source of truth now.
       writeFileSync(
         env.args.outputJson,
-        JSON.stringify({ ...result.verdict, overall: result.overall }, null, 2),
+        JSON.stringify(
+          {
+            ...result.verdict,
+            overall: result.overall,
+            // Deterministic findings gate (OGE-1588): the Action reads
+            // `findingsGateFailed` to flip the Check to failure independent of
+            // the verdict, so an error-level analyzer finding blocks merge on
+            // its own.
+            ...(result.findingsGate
+              ? {
+                  findingsGateFailed: result.findingsGate.failed,
+                  findingsGateReason: result.findingsGate.reason,
+                }
+              : {}),
+            // Triage routing recorded so the eval harness can measure whether
+            // it helps or hurts (OGE-1595).
+            ...(result.triage ? { triage: result.triage } : {}),
+          },
+          null,
+          2,
+        ),
         "utf8",
       );
+    }
+
+    if (result.outcomes && env.args.outputJson) {
+      // Labeled outcome rows for the eval harness (OGE-1589), JSONL beside the
+      // verdict sidecar. One row per item; append-friendly across runs/repos.
+      const rows = toOutcomeRows({
+        verdict: result.verdict,
+        summary: result.outcomes,
+        repo: `${env.owner}/${env.repo}`,
+        pr: env.number,
+        generatedAt: new Date().toISOString(),
+      });
+      const rowsPath = env.args.outputJson.replace(/\.json$/, "") + ".outcomes.jsonl";
+      writeFileSync(rowsPath, renderOutcomeRows(rows) + "\n", "utf8");
+      console.error(`[outcomes] wrote ${rows.length} row(s) to ${rowsPath}`);
     }
 
     if (env.args.post) {
@@ -331,6 +458,22 @@ async function runReviewCommand(env: {
         body: result.body,
       });
       console.error(`[github:${upsert.action}] ${upsert.url}`);
+
+      // Anchor findings inline (OGE-1586). Never a formal review — the client
+      // surface has no createReview method to call.
+      if (result.inlineComments && result.inlineComments.length > 0) {
+        const rec = await reconcileInlineComments({
+          client: makeInlineCommentClient(octokit),
+          owner: env.owner,
+          repo: env.repo,
+          pullNumber: env.number,
+          commitId: result.prContext.headSha,
+          desired: result.inlineComments,
+        });
+        console.error(
+          `[github:inline] created=${rec.created} updated=${rec.updated} deleted=${rec.deleted}`,
+        );
+      }
 
       if (env.args.linearWriteback) {
         const meta = await linear.getIssueMeta(result.verdict.ticketId);
@@ -354,10 +497,24 @@ async function runReviewCommand(env: {
             ref: `${env.owner}/${env.repo}#${env.number}`,
           },
           ciGreen,
+          // The merge event is what turns a still-open punt into a shipped-
+          // unanswered question (OGE-1592). The Action sets this on `closed`
+          // with `merged == true`.
+          merged: process.env.REVIEWER_PR_MERGED === "true",
           metrics: {
             toolCalls: result.transcript.length,
             researchQueries: result.researchTrace.queries.length,
             cached: result.cached,
+            puntsBefore: result.puntsBefore,
+            puntsAfter: result.puntsAfter,
+            ...(result.outcomes
+              ? {
+                  outcomes: {
+                    actedOnRate: result.outcomes.actedOnRate,
+                    overrideRate: result.outcomes.overrideRate,
+                  },
+                }
+              : {}),
             ...(result.degraded ? { degraded: result.degraded } : {}),
           },
         });
@@ -494,6 +651,59 @@ function resolveRepoRoot(): string | null {
   }
 }
 
+/** Directories never worth mapping — build output, deps, VCS. */
+const REPO_MAP_SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", "coverage", ".next", "out", "vendor",
+]);
+const REPO_MAP_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
+/** Bound on files mapped, so a huge monorepo can't blow the map build (OGE-1582). */
+const REPO_MAP_MAX_FILES = 2000;
+
+/**
+ * Collect TS/JS source files under the checkout for the repo map (OGE-1582).
+ *
+ * Bounded and best-effort: skips build/dep dirs, caps the file count, and
+ * carries each file's mtime so the tag cache can skip unchanged files across
+ * runs. Returns [] on any error — the map is an optimization, never a gate.
+ */
+function collectRepoFiles(root: string): RepoFile[] {
+  const out: RepoFile[] = [];
+  const walk = (dir: string): void => {
+    if (out.length >= REPO_MAP_MAX_FILES) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= REPO_MAP_MAX_FILES) return;
+      if (entry.isDirectory()) {
+        if (REPO_MAP_SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+        walk(join(dir, entry.name));
+      } else if (REPO_MAP_EXT.test(entry.name)) {
+        const full = join(dir, entry.name);
+        try {
+          const stat = statSync(full);
+          out.push({
+            path: relative(root, full),
+            content: readFileSync(full, "utf8"),
+            mtimeMs: stat.mtimeMs,
+          });
+        } catch {
+          // skip unreadable file
+        }
+      }
+    }
+  };
+  try {
+    walk(root);
+  } catch {
+    return [];
+  }
+  return out;
+}
+
 /**
  * Octokit-backed CI log reader (OGE-1557).
  *
@@ -549,9 +759,95 @@ function buildToolRegistry(
     console.error("[tools] no repo checkout found — running without repo read access");
   }
 
+  // The exec tool runs PR-authored code, so it is added ONLY behind
+  // `sandbox_enabled` (OGE-1584) — the Action wires that input to a separate
+  // secretless job. The tool itself fails closed if a secret is present, so
+  // even a misconfiguration can't run a PR command next to a credential.
+  if (process.env.REVIEWER_SANDBOX_ENABLED === "true") {
+    const hygiene = assertSecretlessEnv();
+    if (!hygiene.ok) {
+      console.error(
+        `[tools] sandbox_enabled but env is NOT secretless (${hygiene.leaked.join(", ")}); ` +
+          `refusing to register run_command`,
+      );
+    } else {
+      tools.push(makeExecTool(root ? { cwd: root } : {}));
+      console.error("[tools] sandbox exec enabled (secretless env verified)");
+    }
+  }
+
   if (tools.length === 0) return EMPTY_REGISTRY;
   console.error(`[tools] registry: ${tools.map((t) => t.definition.name).join(", ")}`);
   return makeRegistry(tools);
+}
+
+/**
+ * Reads repo files at a ref through the GitHub contents API (OGE-1585).
+ *
+ * Bound to one repo at construction so a caller cannot accidentally point it
+ * at the head fork — the whole security property of per-repo config is that
+ * it comes from the upstream default branch.
+ */
+function makeRefFileReader(
+  octokit: Octokit,
+  repo: { owner: string; repo: string },
+): RefFileReader {
+  return {
+    async readAtRef(path, ref) {
+      try {
+        const resp = await octokit.repos.getContent({ ...repo, path, ref });
+        const data = resp.data as { content?: string; encoding?: string; type?: string };
+        if (data.type !== "file" || typeof data.content !== "string") return null;
+        return Buffer.from(data.content, (data.encoding as BufferEncoding) ?? "base64").toString(
+          "utf8",
+        );
+      } catch {
+        // 404 is the common case (repo has no config) and is not an error.
+        return null;
+      }
+    },
+  };
+}
+
+/**
+ * Octokit-backed inline comment client (OGE-1586).
+ *
+ * Exposes only comment create/update/delete/list. It has no `createReview` and
+ * no approve path — the reviewer physically cannot submit a formal GitHub
+ * review, matching claude-code-action's own security boundary.
+ */
+function makeInlineCommentClient(octokit: Octokit): InlineCommentClient {
+  return {
+    async listReviewComments({ owner, repo, pullNumber }) {
+      const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: 100,
+      });
+      return comments.map((c) => ({ id: c.id, body: c.body ?? "" }));
+    },
+    async createReviewComment({ owner, repo, pullNumber, commitId, path, line, startLine, body }) {
+      const resp = await octokit.pulls.createReviewComment({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        commit_id: commitId,
+        path,
+        line,
+        // Multi-line anchor for a committable suggestion (OGE-1596).
+        ...(startLine !== undefined ? { start_line: startLine } : {}),
+        body,
+      });
+      return { id: resp.data.id };
+    },
+    async updateReviewComment({ owner, repo, commentId, body }) {
+      await octokit.pulls.updateReviewComment({ owner, repo, comment_id: commentId, body });
+    },
+    async deleteReviewComment({ owner, repo, commentId }) {
+      await octokit.pulls.deleteReviewComment({ owner, repo, comment_id: commentId });
+    },
+  };
 }
 
 function makeGithubReader(octokit: Octokit): GithubReader {
@@ -569,6 +865,10 @@ function makeGithubReader(octokit: Octokit): GithubReader {
         body: pr.body ?? "",
         author: pr.user?.login ?? "unknown",
         createdAt: pr.created_at,
+        // Where per-repo config is read from (OGE-1585). `base.repo` is the
+        // upstream repo even on a fork PR, which is the point: a fork must not
+        // be able to supply the config that gates its own merge.
+        defaultBranch: pr.base.repo.default_branch,
       };
     },
     async getDiff({ owner, repo, number }) {
@@ -582,6 +882,16 @@ function makeGithubReader(octokit: Octokit): GithubReader {
     },
     async getCiSummary({ owner, repo, ref }) {
       return fetchCiSummary(octokit, { owner, repo, ref });
+    },
+    async getChangedPaths({ owner, repo, base, head }) {
+      // Outcome telemetry only (OGE-1592) — a failure here must cost telemetry,
+      // never the review, so it returns empty rather than throwing.
+      try {
+        const resp = await octokit.repos.compareCommits({ owner, repo, base, head });
+        return (resp.data.files ?? []).map((f) => f.filename);
+      } catch {
+        return [];
+      }
     },
     async getIssueComment({ owner, repo, commentId }) {
       try {
@@ -678,6 +988,51 @@ function makeAnthropicModel(
         transcript: loop.transcript,
         ...(loop.degraded ? { degraded: loop.degraded } : {}),
       };
+    },
+  };
+}
+
+/**
+ * The cheap second-pass model that challenges punts (OGE-1587).
+ *
+ * Deliberately a different, smaller model than the reviewer: per-task routing
+ * is Anthropic's own norm (claude-code-action runs a Haiku classify gate over
+ * inline comments before posting), and the adjudicator's job is one narrow
+ * binary question over evidence that has already been gathered — not a second
+ * full review.
+ *
+ * No tools, low max_tokens: it must not be able to go investigating on its own
+ * and reach a conclusion the main pass never had evidence for.
+ */
+function makeAdjudicatorModel(anthropic: Anthropic): AdjudicatorModel {
+  return {
+    async adjudicate({ systemPrompt, userPrompt }) {
+      const completion = await anthropic.messages.create({
+        model: process.env.REVIEWER_ADJUDICATION_MODEL ?? "claude-haiku-4-5",
+        max_tokens: 512,
+        temperature: 0,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userPrompt }],
+      });
+      return completion.content
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
+    },
+  };
+}
+
+function makeTriageModel(anthropic: Anthropic): TriageModel {
+  return {
+    async triage({ prompt }) {
+      const completion = await anthropic.messages.create({
+        model: process.env.REVIEWER_TRIAGE_MODEL ?? "claude-haiku-4-5",
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [{ role: "user", content: prompt }],
+      });
+      return completion.content
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
     },
   };
 }

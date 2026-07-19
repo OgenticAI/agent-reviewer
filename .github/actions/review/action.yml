@@ -31,6 +31,13 @@ inputs:
       'failure'. Default: empty — the v1 advisory mode never fails the Check.
       Bumping this is the lever that flips the reviewer from advisory to
       enforcing (see OGE-340).
+
+      Note on CODE_VERIFIED (OGE-1580): items with that verdict never gate a
+      merge. Like `[human]`-marked items they are excluded from the punt
+      roll-up — CODE_VERIFIED means the code demonstrably delivers the item and
+      only runtime validation is outstanding, so it rolls up as
+      PASS_WITH_PARTIALS rather than HUMAN_REVIEW. A checklist of nothing but
+      CODE_VERIFIED items is deliberately NOT reported as a clean PASS.
     required: false
     default: ""
   research:
@@ -50,6 +57,133 @@ inputs:
       tools array at all.
     required: false
     default: "false"
+  diff_token_budget:
+    description: >-
+      Approximate token budget for the diff section of the prompt (OGE-1581).
+      Deliberately a fraction of the context window: the checklist, ticket, CI
+      summary, and every tool result have to fit alongside it, and those are
+      what actually settle items. Files that do not fit are listed by path in
+      the prompt so the model reads them or punts with a concrete reason —
+      never silently misses them.
+    required: false
+    default: "24000"
+  exclude_globs:
+    description: >-
+      Comma-separated repo-relative globs to drop from the diff entirely, e.g.
+      "generated/**,vendor/**". Lockfiles, build output, and files marked
+      @generated are already excluded without configuration.
+    required: false
+    default: ""
+  findings_fail_level:
+    description: >-
+      Deterministic analyzer/test gate, independent of the LLM verdict
+      (OGE-1588). When set to 'error', 'warning', or 'info', ingested findings
+      at or above that severity fail the Check on their own — "tsc reported 3
+      errors" is not a matter of opinion the model gets to overrule. Default
+      'off': findings still reach the prompt as established facts, but never
+      gate the merge.
+
+      Ingestion PARSES analyzer output; it never EXECUTES a PR-supplied config.
+      That distinction is the whole reason it adds no attack surface — see the
+      Kudelski RCE that came through executing a PR's `.rubocop.yml`.
+    required: false
+    default: "off"
+  inline_comments:
+    description: >-
+      When 'true', anchor FAIL/PARTIAL evidence as inline review comments on the
+      changed lines, with a two-channel fallback: findings whose evidence is
+      outside the diff go into an "evidence outside this diff" section of the
+      sticky comment, never dropped (OGE-1586). Default 'false'.
+
+      Each comment is posted individually via pulls.createReviewComment. The
+      reviewer NEVER submits a formal GitHub review or approves a PR — that is
+      forbidden by design, matching claude-code-action's own boundary.
+    required: false
+    default: "false"
+  incremental_min_commits:
+    description: >-
+      Minimum new commits since the last review before the reviewer takes the
+      incremental path (OGE-1590) — carrying untouched verdicts forward instead
+      of re-reviewing the whole checklist. Below this, a full review runs. An
+      item whose evidence files did not change on the push keeps its prior
+      verdict (annotated "verified at <sha>"), so an unrelated push cannot churn
+      it; every FAIL and every touched item is always re-verified. Default 1.
+    required: false
+    default: "1"
+  incremental_min_minutes:
+    description: >-
+      Minimum minutes since the last review before taking the incremental path
+      (OGE-1590). Default 0 (no time gate). Pair with incremental_min_commits.
+    required: false
+    default: "0"
+  sandbox_enabled:
+    description: >-
+      When 'true', the reviewer may run shell commands (test suites, builds,
+      greps) via a single run_command tool to verify "run X and check Y" items
+      that otherwise punt UNVERIFIABLE by construction (OGE-1584).
+
+      Isolation is mandatory and is the operator's responsibility. This runs
+      PR-authored code, so it must execute in a SECRETLESS environment: no
+      workflow secrets in the env (no ANTHROPIC_API_KEY, no LINEAR_API_TOKEN, no
+      GitHub App private key — the Kudelski RCE on CodeRabbit worked because
+      analyzer execution ran beside these), a read-only repo-scoped GITHUB_TOKEN
+      only, and restricted network egress.
+
+      The tool FAILS CLOSED: if any known secret is present in its env it refuses
+      to run rather than executing a PR command next to a credential. Enabling
+      this in the same job that holds the reviewer's keys will therefore
+      correctly refuse — run the exec pass in a dedicated secretless job. Off by
+      default.
+    required: false
+    default: "false"
+  repo_map:
+    description: >-
+      When 'true', a ranked, signature-only repo map is injected read-only into
+      the prompt before the tool loop (OGE-1582), so repo-wide claims ("is this
+      called elsewhere?", "does every path emit an audit event?") are answered
+      from a standing symbol map instead of costing tool iterations. Ranked by
+      personalized PageRank over the symbol graph, seeded from diff-touched files
+      and checklist identifiers. Off by default.
+    required: false
+    default: "false"
+  map_tokens:
+    description: >-
+      Base token budget for the repo map (OGE-1582). The effective budget scales
+      INVERSELY with diff size — a small diff with repo-wide claims gets a big
+      map; a large diff gets a small one (down to 25% of this). Default 1024.
+    required: false
+    default: "1024"
+  triage:
+    description: >-
+      When 'true', a cheap haiku-class pass runs before the expensive review
+      (OGE-1595), classifying each checklist item as trivial / untouched /
+      needs_tools over the checklist + changed-file list (not the full diff).
+      needs_tools items get their suggested files prioritized in the diff pack.
+      Fail-open: any triage error falls back to today's uniform behaviour, so it
+      can only make the review cheaper, never wrong. Off by default.
+    required: false
+    default: "false"
+  adjudication:
+    description: >-
+      When 'true', every UNVERIFIABLE verdict gets one cheap second-pass call
+      that asks whether the item was actually decidable from the evidence the
+      reviewer already gathered (OGE-1587). Off by default.
+
+      Bounded and one-directional: punts the checklist linter classes as
+      legitimately human (post-merge, operator-action, prod-credentials) and
+      `[human]`-marked items are never challenged and spend no call. Every
+      ambiguous outcome — API error, unparseable reply, confidence below the
+      floor — keeps the original punt. The pass can only ever REDUCE the punt
+      count by finding evidence; it can never manufacture a PASS from silence.
+    required: false
+    default: "false"
+  adjudication_model:
+    description: >-
+      Model used for the adjudication pass. Defaults to a Haiku-class model —
+      the job is one narrow binary question over already-gathered evidence, not
+      a second full review.
+    required: false
+    default: "claude-haiku-4-5"
   auto_patch:
     description: >-
       When 'true' AND the verdict has at least one FAIL item flagged
@@ -109,6 +243,18 @@ runs:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
         REVIEWER_RESEARCH: ${{ inputs.research }}
+        REVIEWER_DIFF_TOKEN_BUDGET: ${{ inputs.diff_token_budget }}
+        REVIEWER_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
+        REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
+        REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
+        REVIEWER_TRIAGE: ${{ inputs.triage }}
+        REVIEWER_REPO_MAP: ${{ inputs.repo_map }}
+        REVIEWER_SANDBOX_ENABLED: ${{ inputs.sandbox_enabled }}
+        REVIEWER_MAP_TOKENS: ${{ inputs.map_tokens }}
+        REVIEWER_INCREMENTAL_MIN_COMMITS: ${{ inputs.incremental_min_commits }}
+        REVIEWER_INCREMENTAL_MIN_MINUTES: ${{ inputs.incremental_min_minutes }}
+        REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}
+        REVIEWER_ADJUDICATION_MODEL: ${{ inputs.adjudication_model }}
         PR_URL: ${{ github.event.pull_request.html_url }}
         VERDICT_PATH: ${{ runner.temp }}/verdict.json
       run: |
@@ -121,6 +267,9 @@ runs:
           # reduce inline, which diverged as soon as `[human]` items were
           # excluded from the roll-up (OGE-1559). Read it, don't recompute it.
           overall=$(node -e "console.log(require(process.env.VERDICT_PATH).overall)")
+          # Deterministic findings gate (OGE-1588) — independent of the verdict.
+          findings_failed=$(node -e "console.log(require(process.env.VERDICT_PATH).findingsGateFailed === true ? 'true' : 'false')")
+          echo "findings_failed=$findings_failed" >> "$GITHUB_OUTPUT"
         elif [ $rc -eq 3 ]; then
           overall="SKIPPED"
         else
@@ -137,6 +286,7 @@ runs:
       env:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         OVERALL: ${{ steps.review.outputs.overall }}
+        FINDINGS_FAILED: ${{ steps.review.outputs.findings_failed }}
         FAIL_ON: ${{ inputs.fail_on }}
         OWNER: ${{ github.repository_owner }}
         REPO: ${{ github.event.repository.name }}
@@ -159,6 +309,11 @@ runs:
             ;;
           ERROR|*) conclusion="neutral" ;;
         esac
+        # The analyzer gate is deterministic and overrules a passing verdict:
+        # an error-level finding fails the Check whatever the model concluded.
+        if [ "$FINDINGS_FAILED" = "true" ]; then
+          conclusion="failure"
+        fi
         # Title needs to be reasonably stable for branch-protection contexts to match.
         gh api -X POST "repos/$OWNER/$REPO/check-runs" \
           -f name='OgenticAI Reviewer / UAT' \

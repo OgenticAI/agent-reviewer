@@ -138,7 +138,11 @@ describe("runToolLoop — tool execution", () => {
       userPrompt: "p",
     });
     const resultMsg = seen[1]!.at(-1) as { content: Array<{ content: string }> };
-    expect(resultMsg.content[0]!.content).toHaveLength(2000);
+    // Assert on the payload, not the total length: results are wrapped in an
+    // untrusted fence (OGE-1579), so the block is longer than the body. What
+    // matters is that the model receives all 2000 characters while the
+    // transcript keeps only its truncated copy.
+    expect(resultMsg.content[0]!.content).toContain("x".repeat(2000));
     expect(result.transcript[0]!.result).toMatch(/… \[truncated\]$/);
   });
 
@@ -311,5 +315,75 @@ describe("makeRegistry", () => {
 
   it("builds an empty registry from no tools", () => {
     expect(makeRegistry([]).size).toBe(0);
+  });
+});
+
+describe("observation collapsing (OGE-1583)", () => {
+  function bigToolTurn(id: string): LoopTurnResponse {
+    return {
+      content: [{ type: "tool_use", id, name: "read_file", input: {} }],
+      stopReason: "tool_use",
+    };
+  }
+
+  it("collapses all but the most recent observations", async () => {
+    const seen: unknown[][] = [];
+    let call = 0;
+    const turn: TurnFn = async (messages) => {
+      seen.push(JSON.parse(JSON.stringify(messages)));
+      call += 1;
+      return call <= 8 ? bigToolTurn(`t${call}`) : FINAL;
+    };
+    await runToolLoop({
+      turn,
+      registry: makeRegistry([echoTool({ execute: async () => ({ content: "x".repeat(5000) }) })]),
+      userPrompt: "p",
+      maxIterations: 10,
+    });
+
+    const last = seen.at(-1)!;
+    const observations = last.filter(
+      (m) =>
+        (m as { role: string }).role === "user" &&
+        Array.isArray((m as { content: unknown }).content),
+    );
+    const collapsed = observations.filter((m) =>
+      JSON.stringify(m).includes("earlier observation omitted"),
+    );
+    // 8 observations, 5 kept in full.
+    expect(observations.length).toBe(8);
+    expect(collapsed.length).toBe(3);
+  });
+
+  it("keeps tool_use_id on a collapsed observation", async () => {
+    // Dropping it would orphan the model's tool call and invalidate the request.
+    const seen: unknown[][] = [];
+    let call = 0;
+    const turn: TurnFn = async (messages) => {
+      seen.push(JSON.parse(JSON.stringify(messages)));
+      call += 1;
+      return call <= 7 ? bigToolTurn(`t${call}`) : FINAL;
+    };
+    await runToolLoop({
+      turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 10,
+    });
+    const collapsed = JSON.stringify(seen.at(-1)).match(/"tool_use_id":"t1"/);
+    expect(collapsed).not.toBeNull();
+  });
+
+  it("leaves the transcript uncollapsed — hashing uses full output", async () => {
+    let call = 0;
+    const turn: TurnFn = async () => (++call <= 7 ? bigToolTurn(`t${call}`) : FINAL);
+    const result = await runToolLoop({
+      turn,
+      registry: makeRegistry([echoTool({ execute: async () => ({ content: "full result" }) })]),
+      userPrompt: "p",
+      maxIterations: 10,
+    });
+    expect(result.transcript).toHaveLength(7);
+    for (const rec of result.transcript) expect(rec.result).toContain("full result");
   });
 });

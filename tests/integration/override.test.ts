@@ -14,6 +14,7 @@ import {
   applyOverride,
   CHECK_NAME,
   isMaintainer,
+  isOverrideAuthorized,
   OVERRIDE_LABEL,
   parseOverrideComment,
   type CheckPublisher,
@@ -21,6 +22,7 @@ import {
   type PermissionChecker,
   type PrReplyWriter,
 } from "../../src/override.js";
+import { parseReviewerConfig } from "../../src/config.js";
 
 // ─── Mock builders ───────────────────────────────────────────────────────────
 
@@ -155,6 +157,55 @@ describe("isMaintainer", () => {
   });
 });
 
+// ─── isOverrideAuthorized (config-aware gate, OGE-1585) ──────────────────────
+
+describe("isOverrideAuthorized", () => {
+  function checkerReturning(level: string): PermissionChecker {
+    return { async getCollaboratorPermission() { return level; } };
+  }
+  const admin = checkerReturning("admin");
+  const reader = checkerReturning("read");
+
+  const { config: POLICY } = parseReviewerConfig(
+    'override_policy:\n  allowed_actors: ["release-captain"]\n',
+  );
+
+  it("allows a maintainer when the repo sets no policy", async () => {
+    const r = await isOverrideAuthorized({ checker: admin, username: "anyone" });
+    expect(r.allowed).toBe(true);
+  });
+
+  it("rejects an actor outside override_policy even with admin rights", async () => {
+    const r = await isOverrideAuthorized({
+      checker: admin,
+      username: "someone-else",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/override_policy/);
+  });
+
+  it("allows a listed actor who is also a maintainer", async () => {
+    const r = await isOverrideAuthorized({
+      checker: admin,
+      username: "release-captain",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(true);
+  });
+
+  it("never lets the policy grant rights GitHub would refuse", async () => {
+    // The policy narrows the collaborator gate; it is not a second way in.
+    const r = await isOverrideAuthorized({
+      checker: reader,
+      username: "release-captain",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/maintainer/);
+  });
+});
+
 // ─── applyOverride orchestrator ──────────────────────────────────────────────
 
 describe("applyOverride", () => {
@@ -217,6 +268,51 @@ describe("applyOverride", () => {
     expect(reply.body).toContain("spot-check passed");
     expect(reply.body).toContain("OGE-308");
     expect(reply.body).toContain(OVERRIDE_LABEL);
+  });
+
+  describe("per-item override tagging (OGE-1592)", () => {
+    const verdict = {
+      items: [
+        { id: 1, itemText: "redact works", status: "FAIL" },
+        { id: 2, itemText: "renders on GitHub", status: "UNVERIFIABLE" },
+        { id: 3, itemText: "round-trips", status: "PASS" },
+        { id: 4, itemText: "docs updated", status: "PARTIAL" },
+      ],
+    };
+
+    it("reports only the blocking items as force-passed, not the already-green ones", async () => {
+      const state = freshState();
+      const result = await applyOverride({
+        request: { reason: "known-good, shipping" },
+        context: { ...CONTEXT, verdict },
+        clients: makeClients(state),
+      });
+      // 1 FAIL, 2 UNVERIFIABLE, 4 PARTIAL were blocking; 3 PASS was not.
+      expect(result.overriddenItemIds).toEqual([1, 2, 4]);
+    });
+
+    it("names the force-passed items in the Linear audit comment", async () => {
+      const state = freshState();
+      await applyOverride({
+        request: { reason: "x" },
+        context: { ...CONTEXT, verdict },
+        clients: makeClients(state),
+      });
+      const body = state.linearComments[0]!.body;
+      expect(body).toContain("Force-passed items");
+      expect(body).toContain("redact works");
+      expect(body).not.toContain("round-trips"); // the already-green item
+    });
+
+    it("returns an empty id list when no verdict is supplied", async () => {
+      const state = freshState();
+      const result = await applyOverride({
+        request: { reason: "x" },
+        context: CONTEXT,
+        clients: makeClients(state),
+      });
+      expect(result.overriddenItemIds).toEqual([]);
+    });
   });
 
   describe("failure-safety (single failed step doesn't abort others)", () => {

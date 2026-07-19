@@ -241,3 +241,101 @@ describe("buildReviewPrompt — OGE-365 linked verification comments", () => {
     expect(diffIdx).toBeGreaterThan(linkedIdx);
   });
 });
+
+describe("buildReviewPrompt — repo guidance & learned rules (OGE-1585/1594)", () => {
+  it("renders learned rules with their provenance, so a bad rule is traceable", () => {
+    const prompt = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "Database migration applies", checked: true }]),
+      diff: DIFF,
+      repoGuidance: {
+        learnedRules: [
+          {
+            trigger: "migration",
+            glob: "db/**",
+            instructions: "Verified by the schema-snapshot job.",
+            provenance: "OGE-1200 override on PR #48",
+          },
+        ],
+      },
+    });
+    expect(prompt).toContain("Learned rules (accepted by a maintainer)");
+    expect(prompt).toContain("Verified by the schema-snapshot job.");
+    // Provenance is the whole point: a wrong rule must be traceable to its
+    // source decision and deletable.
+    expect(prompt).toContain("learned from OGE-1200 override on PR #48");
+  });
+
+  it("marks repo conventions as coming from the default branch — the trust boundary", () => {
+    const prompt = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+      repoGuidance: { files: [{ path: "CLAUDE.md", content: "Never trust tick-marks." }] },
+    });
+    expect(prompt).toContain("Repo conventions (from the default branch)");
+    expect(prompt).toContain("Never trust tick-marks.");
+  });
+
+  it("omits the guidance section entirely when nothing is supplied — byte-identical to before", () => {
+    const withEmpty = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+      repoGuidance: { files: [], pathInstructions: [], recipes: [], learnedRules: [] },
+    });
+    const without = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+    });
+    expect(withEmpty).toBe(without);
+  });
+});
+
+describe("buildReviewPrompt — established facts from analyzers (OGE-1588)", () => {
+  it("renders findings and per-job verified absence, before the diff", () => {
+    const prompt = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "lint passes", checked: true }]),
+      diff: DIFF,
+      findings: [
+        {
+          job: "lint",
+          parsed: true,
+          findings: [
+            { path: "src/a.ts", message: "unused var", severity: "error", source: "eslint", code: "no-unused-vars" },
+          ],
+        },
+        { job: "typecheck", parsed: true, findings: [] },
+      ],
+    });
+    expect(prompt).toContain("Established facts from analyzers (do not re-derive)");
+    expect(prompt).toContain("ERROR src/a.ts");
+    expect(prompt).toContain("typecheck — reported no findings");
+    // Facts come before the diff, so the model reads settled evidence first.
+    expect(prompt.indexOf("Established facts")).toBeLessThan(prompt.indexOf("## Diff to review"));
+  });
+
+  it("omits the section entirely when no findings are supplied — byte-identical", () => {
+    const withEmpty = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+      findings: [{ job: "x", parsed: false, findings: [] }],
+    });
+    const without = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+    });
+    expect(withEmpty).toBe(without);
+  });
+});

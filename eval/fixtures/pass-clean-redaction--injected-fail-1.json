@@ -1,0 +1,39 @@
+{
+  "name": "pass-clean-redaction--injected-fail-1",
+  "description": "Injected FAIL against item 1 of pass-clean-redaction",
+  "origin": "injected",
+  "pr": {
+    "owner": "OgenticAI",
+    "repo": "agent-reviewer",
+    "number": 1000,
+    "headSha": "sha1001",
+    "headRef": "david/oge-1001-pass-clean-redaction",
+    "title": "feat(OGE-1001): All items delivered — a clean PASS control.",
+    "body": "## Summary\n\nImplements OGE-1001.\n\n## UAT checklist\n\n- [ ] redact() masks SSNs\n- [ ] unredact() reverses the round-trip",
+    "author": "davidoladeji-ogenticai",
+    "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  "ticket": {
+    "identifier": "OGE-1001",
+    "id": "uuid-OGE-1001",
+    "title": "All items delivered — a clean PASS control.",
+    "description": "Ticket OGE-1001: All items delivered — a clean PASS control.",
+    "status": "In Review",
+    "url": "https://linear.app/ogenticai/issue/OGE-1001"
+  },
+  "diff": "diff --git a/src/pass-clean-redaction.ts b/src/pass-clean-redaction.ts\n@@ -1,1 +1,2 @@\n+// change for OGE-1001\n\n# [defect-injected] item 1 sabotaged for eval ground truth\n",
+  "modelResponse": "{\"items\":[{\"id\":1,\"itemText\":\"redact() masks SSNs\",\"status\":\"FAIL\",\"rationale\":\"Injected defect: the change for this item was removed/corrupted, so it is not delivered.\",\"evidenceRefs\":[]},{\"id\":2,\"itemText\":\"unredact() reverses the round-trip\",\"status\":\"PASS\",\"rationale\":\"Round-trip test asserts restored == original.\",\"evidenceRefs\":[]}],\"summary\":\"All items delivered — a clean PASS control.\"}",
+  "expected": {
+    "items": [
+      {
+        "id": 1,
+        "status": "FAIL"
+      },
+      {
+        "id": 2,
+        "status": "PASS"
+      }
+    ],
+    "overall": "NEEDS_WORK"
+  }
+}

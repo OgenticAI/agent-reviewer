@@ -18,6 +18,7 @@ import { overallStatus, type OverallStatus } from "../schema/verdict.js";
 
 const STATUS_BADGE: Record<VerdictStatus, string> = {
   PASS: "✅ PASS",
+  CODE_VERIFIED: "🟢 CODE VERIFIED",
   FAIL: "❌ FAIL",
   PARTIAL: "🟡 PARTIAL",
   UNVERIFIABLE: "🤔 UNVERIFIABLE",
@@ -30,7 +31,16 @@ const OVERALL_HEADLINE: Record<OverallStatus, string> = {
   HUMAN_REVIEW: "🤔 UAT needs human review — at least one item can't be verified from the diff.",
 };
 
-export function renderStickyComment(verdict: ReviewVerdict): string {
+export function renderStickyComment(
+  verdict: ReviewVerdict,
+  /**
+   * Rendered "evidence outside this diff" section (OGE-1586). Supplied only
+   * when inline comments are on and some findings couldn't be anchored — those
+   * must never vanish, so they surface here instead. Omitted keeps the body
+   * byte-identical, preserving the determinism contract for every other repo.
+   */
+  fallbackSection?: string | null,
+): string {
   const overall = overallStatus(verdict);
   const lines: string[] = [];
 
@@ -50,14 +60,37 @@ export function renderStickyComment(verdict: ReviewVerdict): string {
     lines.push("");
   }
 
-  lines.push("| # | Item | Verdict | Rationale |");
-  lines.push("|---|------|---------|-----------|");
+  // The "When" column appears only once any item carried forward (OGE-1590),
+  // so PRs that never went incremental keep a byte-identical 4-column table.
+  const anyCarried = verdict.items.some((it) => it.verifiedAtSha);
+  if (anyCarried) {
+    lines.push("| # | Item | Verdict | When | Rationale |");
+    lines.push("|---|------|---------|------|-----------|");
+  } else {
+    lines.push("| # | Item | Verdict | Rationale |");
+    lines.push("|---|------|---------|-----------|");
+  }
   for (const item of verdict.items) {
     const text = escapeTableCell(item.itemText);
     const rationale = escapeTableCell(item.rationale);
-    lines.push(`| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${rationale} |`);
+    if (anyCarried) {
+      const when = item.verifiedAtSha
+        ? `carried from \`${item.verifiedAtSha.slice(0, 7)}\``
+        : "re-checked";
+      lines.push(
+        `| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${when} | ${rationale} |`,
+      );
+    } else {
+      lines.push(`| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${rationale} |`);
+    }
   }
   lines.push("");
+
+  // Two-channel fallback (OGE-1586): findings that couldn't anchor inline.
+  if (fallbackSection) {
+    lines.push(fallbackSection);
+    lines.push("");
+  }
 
   // Evidence list, only when there's anything to show.
   const itemsWithEvidence = verdict.items.filter((it) => it.evidenceRefs.length > 0);

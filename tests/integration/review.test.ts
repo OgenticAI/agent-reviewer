@@ -750,3 +750,36 @@ describe("runReview (end-to-end)", () => {
     });
   });
 });
+
+describe("runReview — cheap-model triage (OGE-1595)", () => {
+  it("records triage routing on the result when a triage model is supplied", async () => {
+    const triageModel = {
+      triage: async () =>
+        JSON.stringify({
+          items: [
+            { id: 1, routing: "trivial", suggestedFiles: [] },
+            { id: 2, routing: "needs_tools", suggestedFiles: ["src/foo"] },
+            { id: 3, routing: "untouched", suggestedFiles: [] },
+            { id: 4, routing: "needs_tools", suggestedFiles: [] },
+          ],
+        }),
+    };
+    const result = await runReview(buildArgs({ triageModel }));
+    expect(result.triage).toBeDefined();
+    expect(result.triage!.items).toHaveLength(4);
+    expect(result.triage!.items[1]!.routing).toBe("needs_tools");
+  });
+
+  it("fails open to a normal review when triage throws (no triage on the result)", async () => {
+    const triageModel = { triage: async () => { throw new Error("triage 503"); } };
+    const result = await runReview(buildArgs({ triageModel }));
+    // The review still produced its verdict; triage degraded to uniform.
+    expect(result.verdict.items).toHaveLength(4);
+    expect(result.triage!.items.every((i) => i.routing === "needs_tools")).toBe(true);
+  });
+
+  it("does not run triage at all when no triage model is supplied", async () => {
+    const result = await runReview(buildArgs());
+    expect(result.triage).toBeUndefined();
+  });
+});

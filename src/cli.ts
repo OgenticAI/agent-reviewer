@@ -43,6 +43,7 @@ import { makeHttpTools } from "./tools/http.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseFailLevel } from "./findings/gate.js";
 import { reconcileInlineComments, type InlineCommentClient } from "./github/inline-comments.js";
+import type { TriageModel } from "./triage/triage.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -292,6 +293,9 @@ async function runReviewCommand(env: {
       findingsClient: makeCiLogClient(octokit),
       findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
       inlineCommentsEnabled: process.env.REVIEWER_INLINE_COMMENTS === "true",
+      ...(process.env.REVIEWER_TRIAGE === "true"
+        ? { triageModel: makeTriageModel(anthropic) }
+        : {}),
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
@@ -369,6 +373,9 @@ async function runReviewCommand(env: {
                   findingsGateReason: result.findingsGate.reason,
                 }
               : {}),
+            // Triage routing recorded so the eval harness can measure whether
+            // it helps or hurts (OGE-1595).
+            ...(result.triage ? { triage: result.triage } : {}),
           },
           null,
           2,
@@ -886,6 +893,22 @@ function makeAdjudicatorModel(anthropic: Anthropic): AdjudicatorModel {
         temperature: 0,
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }],
+      });
+      return completion.content
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
+    },
+  };
+}
+
+function makeTriageModel(anthropic: Anthropic): TriageModel {
+  return {
+    async triage({ prompt }) {
+      const completion = await anthropic.messages.create({
+        model: process.env.REVIEWER_TRIAGE_MODEL ?? "claude-haiku-4-5",
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [{ role: "user", content: prompt }],
       });
       return completion.content
         .map((block) => (block.type === "text" ? block.text : ""))

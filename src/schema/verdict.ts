@@ -127,6 +127,15 @@ export const ItemVerdict = z.object({
    */
   evidence: z.array(z.string()).optional(),
   /**
+   * True when the OGE-1587 adjudication pass revisited this item.
+   *
+   * Structured rather than only appended to the rationale prose: the whole
+   * point of adjudication is that its contribution is measurable after the
+   * fact, and a regex over rationale text is not a measurement. Set on any
+   * item the pass actually challenged, whether or not it overturned the punt.
+   */
+  adjudicated: z.boolean().optional(),
+  /**
    * Files this verdict cited, denormalized from `evidenceRefs` (OGE-1590).
    *
    * Incremental review intersects these with the push-delta to decide whether

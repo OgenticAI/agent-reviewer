@@ -231,3 +231,20 @@ describe("per-repo config, end to end", () => {
     expect(a.prompt()).not.toBe(b.prompt());
   });
 });
+
+describe("fail_on precedence (OGE-1585)", () => {
+  it("surfaces committed fail_on so it overrides the action input", async () => {
+    // The Action prefers `effectiveFailOn` over its own input. Without this
+    // the config key parsed cleanly and was then silently ignored — a repo
+    // committing fail_on would get a no-op while the README said otherwise.
+    const reader = makeReader({ ".agent-reviewer.yml": "fail_on: [NEEDS_WORK]\n" });
+    const result = await runReview(buildArgs({ configReader: reader }));
+    expect(result.effectiveFailOn).toEqual(["NEEDS_WORK"]);
+  });
+
+  it("leaves it undefined when the repo commits no fail_on — the input stands", async () => {
+    const reader = makeReader({ ".agent-reviewer.yml": 'exclude_globs: ["x/**"]\n' });
+    const result = await runReview(buildArgs({ configReader: reader }));
+    expect(result.effectiveFailOn).toBeUndefined();
+  });
+});

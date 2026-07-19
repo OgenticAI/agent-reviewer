@@ -79,6 +79,15 @@ export const ItemVerdict = z.object({
    * model output to spell out `false` redundantly.
    */
   autoPatchable: z.boolean().optional(),
+  /**
+   * Mirrors `UatItem.human` — the author declared this criterion as needing a
+   * person via a `[human]` marker (OGE-1559). Set by the orchestrator from the
+   * parsed checklist, NOT by the model; it is not the model's call to make.
+   *
+   * Optional for the same reason as `autoPatchable`: keeps existing fixtures
+   * and older sidecar payloads valid. Read as `=== true` everywhere.
+   */
+  human: z.boolean().optional(),
 });
 export type ItemVerdict = z.infer<typeof ItemVerdict>;
 
@@ -119,10 +128,38 @@ export type ReviewVerdict = z.infer<typeof ReviewVerdict>;
 export type OverallStatus = "PASS" | "PASS_WITH_PARTIALS" | "NEEDS_WORK" | "HUMAN_REVIEW";
 
 export function overallStatus(verdict: ReviewVerdict): OverallStatus {
+  // Items the author explicitly declared as needing a person (`[human]`) are
+  // excluded from the UNVERIFIABLE roll-up (OGE-1559).
+  //
+  // Why: before this, a well-written checklist that honestly declared two
+  // human criteria was indistinguishable from a blind punt — both reported
+  // HUMAN_REVIEW. That made the reviewer's headline metric unmovable no matter
+  // how much verification capability it gained, and it quietly penalised the
+  // authoring behaviour we want. Declaring a human criterion is good practice.
+  //
+  // A FAIL on a `[human]` item still counts. The marker says "a person decides
+  // whether this passes", not "ignore this item" — so if the model finds
+  // positive evidence the item is broken, that's a real signal and it stands.
+  //
+  // Note for repos running `fail_on: HUMAN_REVIEW`: this is a deliberate
+  // loosening. Correctly-marked human items no longer gate merge. They never
+  // gated it meaningfully anyway — HUMAN_REVIEW maps to a `neutral` Check
+  // conclusion by default, and human sign-off is enforced by PR approval, not
+  // by this Check.
   const statuses = verdict.items.map((it) => it.status);
   if (statuses.includes("FAIL")) return "NEEDS_WORK";
-  if (statuses.includes("UNVERIFIABLE")) return "HUMAN_REVIEW";
-  if (statuses.includes("PARTIAL")) return "PASS_WITH_PARTIALS";
+
+  const verifiable = verdict.items.filter((it) => it.human !== true);
+
+  // Every item is `[human]`-marked: there is nothing here the reviewer was
+  // ever going to check, so HUMAN_REVIEW is the honest answer rather than a
+  // vacuous PASS. Reporting PASS would read as a green light on a checklist
+  // nobody has actually verified.
+  if (verifiable.length === 0 && verdict.items.length > 0) return "HUMAN_REVIEW";
+
+  const verifiableStatuses = verifiable.map((it) => it.status);
+  if (verifiableStatuses.includes("UNVERIFIABLE")) return "HUMAN_REVIEW";
+  if (verifiableStatuses.includes("PARTIAL")) return "PASS_WITH_PARTIALS";
   return "PASS";
 }
 

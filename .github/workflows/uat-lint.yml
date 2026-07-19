@@ -1,0 +1,84 @@
+# UAT-checklist linter (OGE-1559) — advisory notes on criteria the reviewer
+# can never verify from a pre-merge diff.
+#
+# Deliberately a separate workflow from `self-review.yml` rather than a step
+# inside the review action:
+#
+#   - It's cheap. No Anthropic call, no Linear call, no diff fetch — it reads
+#     the PR body and nothing else. So it can afford to run on `edited`, which
+#     is exactly when a checklist changes.
+#   - Running the *review* on every body edit would burn an LLM call per
+#     typo fix. Splitting them keeps the expensive path on push-only.
+#
+# Consumers mirror this via `templates/workflows/uat-lint.yml`.
+
+name: OgenticAI Reviewer — UAT Lint
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  lint:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Same config precheck as self-review.yml: before the GitHub App is
+      # registered we skip cleanly rather than failing every PR.
+      - name: Check reviewer config
+        id: cfg
+        env:
+          APP_ID: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
+          APP_KEY: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
+        run: |
+          if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OgenticAI Reviewer App not configured — skipping UAT lint."
+          fi
+
+      - if: steps.cfg.outputs.configured == 'true'
+        uses: actions/checkout@v5
+
+      - if: steps.cfg.outputs.configured == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - if: steps.cfg.outputs.configured == 'true'
+        run: npm ci --silent
+
+      - name: Mint GitHub App token
+        id: app_token
+        if: steps.cfg.outputs.configured == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.OGENTICAI_REVIEWER_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Lint UAT checklist
+        if: steps.cfg.outputs.configured == 'true'
+        env:
+          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # Advisory only — the linter must never fail a PR. Exit 3 means
+          # "no checklist to lint", which is a normal skip, not an error.
+          set +e
+          npx tsx src/cli.ts lint-checklist "$PR_URL" --post
+          rc=$?
+          if [ $rc -eq 3 ]; then
+            echo "::notice::No UAT checklist found — nothing to lint."
+          elif [ $rc -ne 0 ]; then
+            echo "::warning::UAT linter exited $rc — continuing without a comment."
+          fi
+          exit 0

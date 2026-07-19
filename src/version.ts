@@ -8,3 +8,13 @@
  */
 export const REVIEWER_VERSION = "v2";
 export const COMMENT_MARKER = `<!-- ogenticai-reviewer-${REVIEWER_VERSION} -->`;
+
+/**
+ * Marker for the UAT-checklist linter's advisory comment (OGE-1559).
+ *
+ * Deliberately distinct from `COMMENT_MARKER`: the linter comment and the
+ * verdict sticky are two different messages with two different lifecycles, and
+ * sharing a marker would make them fight over the same comment slot — each run
+ * overwriting the other's body.
+ */
+export const LINT_COMMENT_MARKER = `<!-- ogenticai-reviewer-lint-${REVIEWER_VERSION} -->`;

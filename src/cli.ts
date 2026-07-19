@@ -30,7 +30,10 @@ import { LinearGraphqlClient } from "./linear/client.js";
 import { runWriteback } from "./linear/writeback.js";
 import { isCiGreen } from "./ci-green.js";
 import { upsertStickyComment } from "./github/sticky.js";
-import { REVIEWER_VERSION } from "./version.js";
+import { parseUatChecklist } from "./parser/uat.js";
+import { lintChecklist } from "./lint/checklist.js";
+import { renderLintComment } from "./render/lint-comment.js";
+import { LINT_COMMENT_MARKER, REVIEWER_VERSION } from "./version.js";
 import {
   applyOverride,
   CHECK_NAME,
@@ -45,7 +48,7 @@ import { resolveTickets } from "./linear/resolve.js";
 
 const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
 
-type Subcommand = "review-pr" | "override-pr";
+type Subcommand = "review-pr" | "override-pr" | "lint-checklist";
 
 interface ReviewArgs {
   command: "review-pr";
@@ -53,6 +56,12 @@ interface ReviewArgs {
   post: boolean;
   outputJson: string | undefined;
   linearWriteback: boolean;
+}
+
+interface LintArgs {
+  command: "lint-checklist";
+  prUrl: string;
+  post: boolean;
 }
 
 interface OverrideArgs {
@@ -66,14 +75,21 @@ interface OverrideArgs {
   skipPermissionCheck: boolean;
 }
 
-type CliArgs = ReviewArgs | OverrideArgs;
+type CliArgs = ReviewArgs | OverrideArgs | LintArgs;
 
 function parseArgs(argv: string[]): CliArgs {
   const args = argv.slice(2);
   const command = args[0] as Subcommand | undefined;
   if (command === "review-pr") return parseReviewArgs(args);
   if (command === "override-pr") return parseOverrideArgs(args);
+  if (command === "lint-checklist") return parseLintArgs(args);
   printUsageAndExit();
+}
+
+function parseLintArgs(args: string[]): LintArgs {
+  const prUrl = args[1];
+  if (!prUrl) printUsageAndExit();
+  return { command: "lint-checklist", prUrl, post: args.includes("--post") };
 }
 
 function parseReviewArgs(args: string[]): ReviewArgs {
@@ -103,13 +119,14 @@ function printUsageAndExit(): never {
   console.error(
     [
       "Usage:",
-      "  ogenticai-reviewer review-pr   <pr-url> [--post] [--output-json PATH] [--no-linear-writeback]",
-      "  ogenticai-reviewer override-pr <pr-url> --by <github-user> --reason \"<reason>\" [--skip-permission-check]",
+      "  ogenticai-reviewer review-pr      <pr-url> [--post] [--output-json PATH] [--no-linear-writeback]",
+      "  ogenticai-reviewer override-pr    <pr-url> --by <github-user> --reason \"<reason>\" [--skip-permission-check]",
+      "  ogenticai-reviewer lint-checklist <pr-url> [--post]",
       "",
       "Required env vars:",
       "  ANTHROPIC_API_KEY  (review-pr only)",
       "  GITHUB_TOKEN       always",
-      "  LINEAR_API_TOKEN   always",
+      "  LINEAR_API_TOKEN   review-pr / override-pr only",
     ].join("\n"),
   );
   process.exit(2);
@@ -129,7 +146,77 @@ async function main(): Promise<void> {
   if (args.command === "review-pr") {
     return runReviewCommand({ args, owner, repo, number });
   }
+  if (args.command === "lint-checklist") {
+    return runLintCommand({ args, owner, repo, number });
+  }
   return runOverrideCommand({ args, owner, repo, number });
+}
+
+// ─── lint-checklist (OGE-1559) ────────────────────────────────────────────────
+
+/**
+ * Lint the PR's UAT checklist and (with --post) leave an advisory comment.
+ *
+ * Deliberately cheap: no Anthropic call, no Linear call, no diff fetch. It
+ * reads the PR body and nothing else, so it can run on `opened`/`edited` well
+ * before the review pass and costs nothing to run often.
+ *
+ * Exit codes follow the review command's convention — 3 means "nothing to do"
+ * (no checklist), which the workflow treats as a clean skip, not a failure.
+ */
+async function runLintCommand(env: {
+  args: LintArgs;
+  owner: string;
+  repo: string;
+  number: number;
+}): Promise<void> {
+  const githubToken = requireEnv("GITHUB_TOKEN");
+  const octokit = new Octokit({ auth: githubToken });
+
+  const pr = await octokit.pulls.get({
+    owner: env.owner,
+    repo: env.repo,
+    pull_number: env.number,
+  });
+
+  const checklist = parseUatChecklist(pr.data.body ?? "");
+  if (!checklist.found) {
+    console.error(`[skip] No "## UAT checklist" block in the PR description.`);
+    process.exit(3);
+  }
+
+  const result = lintChecklist(checklist);
+  const body = renderLintComment(result);
+
+  console.error(
+    `Checklist: ${result.totalItems} item(s) · ${result.flaggedItems} flagged · ` +
+      `${result.humanMarkedItems} marked [human]` +
+      (result.nothingVerifiable ? " · NOTHING VERIFIABLE" : ""),
+  );
+  for (const f of result.findings) {
+    console.error(`  [${f.kind}] item ${f.itemId}: ${f.itemText}`);
+  }
+
+  if (!body) {
+    console.error("(checklist looks checkable — no comment to post)");
+    return;
+  }
+
+  process.stdout.write(body + "\n");
+
+  if (env.args.post) {
+    const upsert = await upsertStickyComment({
+      octokit,
+      owner: env.owner,
+      repo: env.repo,
+      issueNumber: env.number,
+      body,
+      marker: LINT_COMMENT_MARKER,
+    });
+    console.error(`[github:${upsert.action}] ${upsert.url}`);
+  } else {
+    console.error("(dry run — pass --post to upsert the advisory comment)");
+  }
 }
 
 // ─── review-pr ────────────────────────────────────────────────────────────────
@@ -163,7 +250,15 @@ async function runReviewCommand(env: {
     );
 
     if (env.args.outputJson) {
-      writeFileSync(env.args.outputJson, JSON.stringify(result.verdict, null, 2), "utf8");
+      // Include the computed `overall` so the Action reads it straight off the
+      // sidecar instead of reimplementing overallStatus() in inline node.
+      // That duplication silently diverged the moment `[human]` items started
+      // being excluded from the roll-up (OGE-1559) — one source of truth now.
+      writeFileSync(
+        env.args.outputJson,
+        JSON.stringify({ ...result.verdict, overall: result.overall }, null, 2),
+        "utf8",
+      );
     }
 
     if (env.args.post) {

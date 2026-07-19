@@ -89,7 +89,10 @@ describe("read_file", () => {
 
   it("honours a line range", async () => {
     const r = await tools.read_file!.execute({ path: "src/redaction.ts", start_line: 2, end_line: 2 });
-    expect(r.content).toBe("2\texport const B = 2;");
+    // The requested line, plus an omission note (OGE-1583) — a window that
+    // does not say what it hid reads as a complete file.
+    expect(r.content).toContain("2\texport const B = 2;");
+    expect(r.content).toMatch(/line\(s\) above/);
   });
 
   it("refuses to escape the repo", async () => {
@@ -238,5 +241,51 @@ describe("secrets deny-list — files inside the repo", () => {
   it("still allows ordinary files", () => {
     expect(isDeniedPath("src/redaction.ts")).toBe(false);
     expect(isDeniedPath("docs/environment.md")).toBe(false);
+  });
+});
+
+describe("tool-output reshaping (OGE-1583)", () => {
+  // SWE-agent ablated these directly: a 100-line window beat full files
+  // (18.0% vs 12.7%), and a truncated search result list performed WORSE than
+  // no search at all because the model reads the visible slice as complete.
+
+  it("windows a long file instead of returning it whole", async () => {
+    const long = Array.from({ length: 400 }, (_, i) => `const v${i} = ${i};`).join("\n");
+    writeFileSync(join(root, "src", "long.ts"), long);
+    const r = await tools.read_file!.execute({ path: "src/long.ts" });
+    const bodyLines = r.content.split("\n").filter((l) => /^\d+\t/.test(l));
+    expect(bodyLines.length).toBeLessThanOrEqual(100);
+    expect(r.content).toContain("1\tconst v0 = 0;");
+  });
+
+  it("tells the model how to page to the rest", async () => {
+    const r = await tools.read_file!.execute({ path: "src/long.ts" });
+    expect(r.content).toMatch(/read again with start_line=101/);
+  });
+
+  it("caps an over-wide explicit range rather than honouring it", async () => {
+    // Otherwise "give me the whole file" is smuggled in as end_line: 99999.
+    const r = await tools.read_file!.execute({
+      path: "src/long.ts",
+      start_line: 1,
+      end_line: 9999,
+    });
+    expect(r.content.split("\n").filter((l) => /^\d+\t/.test(l)).length).toBeLessThanOrEqual(100);
+  });
+
+  it("adds no omission note when the whole file fits", async () => {
+    const r = await tools.read_file!.execute({ path: "src/redaction.ts" });
+    expect(r.content).not.toMatch(/line\(s\) (above|below)/);
+  });
+
+  it("refuses an over-broad search instead of truncating it", async () => {
+    const many = Array.from({ length: 300 }, (_, i) => `needle ${i}`).join("\n");
+    writeFileSync(join(root, "src", "many.ts"), many);
+    const r = await tools.search_repo!.execute({ pattern: "needle" });
+    expect(r.isError).toBe(true);
+    expect(r.content).toMatch(/too many to be useful/);
+    expect(r.content).toMatch(/Narrow it/);
+    // Crucially: no partial list, which the model would read as complete.
+    expect(r.content).not.toMatch(/many\.ts:1:/);
   });
 });

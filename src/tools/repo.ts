@@ -87,6 +87,16 @@ const MAX_LIST_RESULTS = 200;
 const MAX_SEARCH_MATCHES = 100;
 const MAX_WALK_FILES = 20_000;
 
+/**
+ * Default lines returned by `read_file` (OGE-1583).
+ *
+ * SWE-agent's single most effective interface change: full-file returns scored
+ * 12.7% vs 18.0% with a 100-line window. A whole file dumped early crowds out
+ * everything gathered afterwards, and the model rarely needs more than the
+ * region around the thing it is checking.
+ */
+const READ_WINDOW_LINES = 100;
+
 export class PathEscapeError extends Error {
   constructor(requested: string) {
     super(`Path is outside the repository: ${requested}`);
@@ -192,8 +202,14 @@ function readFileTool(root: string): ReviewTool {
         type: "object",
         properties: {
           path: { type: "string", description: "Repo-relative path, e.g. src/redaction.py" },
-          start_line: { type: "integer", description: "1-based first line (optional)" },
-          end_line: { type: "integer", description: "1-based last line (optional)" },
+          start_line: {
+            type: "integer",
+            description: `1-based first line (optional). Reads up to ${READ_WINDOW_LINES} lines from here.`,
+          },
+          end_line: {
+            type: "integer",
+            description: `1-based last line (optional), capped at ${READ_WINDOW_LINES} lines from start_line.`,
+          },
         },
         required: ["path"],
         additionalProperties: false,
@@ -227,16 +243,29 @@ function readFileTool(root: string): ReviewTool {
       const lines = readFileSync(abs, "utf8").split(/\r?\n/);
       const raw = input as Record<string, unknown>;
       const start = typeof raw.start_line === "number" ? Math.max(1, raw.start_line) : 1;
-      const end = typeof raw.end_line === "number" ? Math.min(lines.length, raw.end_line) : lines.length;
       if (start > lines.length) {
         return err(`${path} has ${lines.length} lines; start_line ${start} is past the end.`);
       }
+      // Windowed by default. An explicit end_line is honoured but still capped,
+      // so "give me the whole file" cannot be smuggled in as a huge range.
+      const requestedEnd =
+        typeof raw.end_line === "number" ? Math.min(lines.length, raw.end_line) : lines.length;
+      const end = Math.min(requestedEnd, start - 1 + READ_WINDOW_LINES);
 
       const slice = lines
         .slice(start - 1, end)
         .map((line, i) => `${start + i}\t${line}`)
         .join("\n");
-      return ok(slice);
+
+      // Say what was left out and how to get it. An unannounced window reads
+      // as a complete file, which is how a model concludes something is absent
+      // when it simply was not shown.
+      const above = start - 1;
+      const below = lines.length - end;
+      const notes: string[] = [];
+      if (above > 0) notes.push(`${above} line(s) above`);
+      if (below > 0) notes.push(`${below} line(s) below — read again with start_line=${end + 1}`);
+      return ok(notes.length > 0 ? `${slice}\n… (${notes.join("; ")})` : slice);
     },
   };
 }
@@ -306,8 +335,17 @@ function searchRepoTool(root: string): ReviewTool {
       }, realpathSync(root));
 
       if (matches.length === 0) return ok(`No matches for /${pattern}/.`);
-      const note = truncated ? `\n… truncated at ${MAX_SEARCH_MATCHES} matches` : "";
-      return ok(matches.join("\n") + note);
+      if (truncated) {
+        // Refuse rather than truncate (OGE-1583). SWE-agent found a truncated
+        // result list performs WORSE than no search at all, because the model
+        // treats the visible slice as the complete answer and reasons from a
+        // partial picture without knowing it.
+        return err(
+          `/${pattern}/ matched more than ${MAX_SEARCH_MATCHES} lines — too many to be useful. ` +
+            `Narrow it: add surrounding syntax, anchor it, or pass path_prefix to scope the search.`,
+        );
+      }
+      return ok(matches.join("\n"));
     },
   };
 }

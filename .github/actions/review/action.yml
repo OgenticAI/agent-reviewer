@@ -57,6 +57,27 @@ inputs:
       tools array at all.
     required: false
     default: "false"
+  adjudication:
+    description: >-
+      When 'true', every UNVERIFIABLE verdict gets one cheap second-pass call
+      that asks whether the item was actually decidable from the evidence the
+      reviewer already gathered (OGE-1587). Off by default.
+
+      Bounded and one-directional: punts the checklist linter classes as
+      legitimately human (post-merge, operator-action, prod-credentials) and
+      `[human]`-marked items are never challenged and spend no call. Every
+      ambiguous outcome — API error, unparseable reply, confidence below the
+      floor — keeps the original punt. The pass can only ever REDUCE the punt
+      count by finding evidence; it can never manufacture a PASS from silence.
+    required: false
+    default: "false"
+  adjudication_model:
+    description: >-
+      Model used for the adjudication pass. Defaults to a Haiku-class model —
+      the job is one narrow binary question over already-gathered evidence, not
+      a second full review.
+    required: false
+    default: "claude-haiku-4-5"
   auto_patch:
     description: >-
       When 'true' AND the verdict has at least one FAIL item flagged
@@ -116,6 +137,8 @@ runs:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
         REVIEWER_RESEARCH: ${{ inputs.research }}
+        REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}
+        REVIEWER_ADJUDICATION_MODEL: ${{ inputs.adjudication_model }}
         PR_URL: ${{ github.event.pull_request.html_url }}
         VERDICT_PATH: ${{ runner.temp }}/verdict.json
       run: |

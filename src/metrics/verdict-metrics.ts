@@ -57,6 +57,13 @@ export interface VerdictMetrics {
   cached: boolean;
   /** Set when the tool loop hit a cap. */
   degraded?: string;
+  /**
+   * Punt rate before / after the OGE-1587 adjudication pass, when it ran.
+   * Reported as a pair so the adjudicator's contribution is measurable per run
+   * rather than inferred from a moving aggregate.
+   */
+  puntRatePre?: number | null;
+  puntRatePost?: number | null;
 }
 
 export function computeVerdictMetrics(args: {
@@ -65,6 +72,9 @@ export function computeVerdictMetrics(args: {
   researchQueries: number;
   cached: boolean;
   degraded?: string;
+  /** Punt counts around adjudication (OGE-1587), when it ran. */
+  puntsBefore?: number;
+  puntsAfter?: number;
 }): VerdictMetrics {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
@@ -99,6 +109,12 @@ export function computeVerdictMetrics(args: {
     researchQueries: args.researchQueries,
     cached: args.cached,
     ...(args.degraded ? { degraded: args.degraded } : {}),
+    ...(args.puntsBefore !== undefined && args.puntsAfter !== undefined && verifiableItems > 0
+      ? {
+          puntRatePre: args.puntsBefore / verifiableItems,
+          puntRatePost: args.puntsAfter / verifiableItems,
+        }
+      : {}),
   };
 }
 

@@ -255,6 +255,19 @@ Mechanical checklist items ("lint passes", "no new type errors", "tests cover th
 - **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
 - **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
 
+## Offline eval harness &mdash; `npm run eval`
+
+Prompt and model changes used to ship on vibes: a `REVIEWER_VERSION` bump invalidated the cache but nothing measured whether verdicts got *better*, and our history holds almost no confirmed-FAIL ground truth. The eval harness is the trust backstop.
+
+- **Hermetic replay.** `src/eval/replay.ts` runs the real `runReview()` with every dependency served from a committed fixture &mdash; no network, no checkout, no API key. The model is stubbed with the fixture's recorded response, so the whole pipeline is deterministic.
+- **Gold self-validation** (SWE-bench). A fixture's `expected` table is whatever the pipeline actually produced on its recorded input; the gate demands byte-identical reproduction before any measurement is trusted.
+- **Structured labels, never prose** (CRScore). The gate matches the `{id → status}` verdict table plus `overall`. Rationale text can be reworded freely; a label flip is a real regression. Text-similarity checks were measured worthless for this task.
+- **Defect injection** (Qodo). `src/eval/inject.ts` corrupts a clean known-PASS fixture against one checklist item to mint a labeled FAIL &mdash; the ground truth the punt-rate metric can't provide. There is one injected FAIL per verdict class.
+- **The gate.** `.github/workflows/eval.yml` runs on changes to `src/prompt/**`, `src/version.ts`, or the fixtures, and fails on any label flip or a punt-rate rise beyond ±2%. Regenerate fixtures with `npm run eval:gen`.
+- **The optional judge** (`src/eval/judge.ts`) scores rationale *quality* only, never the gate. It runs both candidate orders and scores a disagreement as a tie &mdash; the position-bias protocol from arXiv:2306.05685.
+
+**Fixture privacy.** The committed fixtures under `eval/fixtures/` are synthetic &mdash; no real customer diffs. This is deliberate: Qodo's benchmark work warns that any fixture derived from public or customer code is a contamination risk (the model may have trained on it, or it may leak private code). If you add fixtures from real PRs, keep them in a private store, never in this repo.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

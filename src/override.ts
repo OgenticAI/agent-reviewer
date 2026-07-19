@@ -17,6 +17,7 @@
  * the PR; nothing else.
  */
 
+import { CONFIG_PATH, isOverrideAllowed, type ReviewerConfig } from "./config.js";
 import type { LinearWriter } from "./linear/writeback.js";
 import { LINEAR_COMMENT_MARKER } from "./linear/render-comment.js";
 
@@ -65,6 +66,33 @@ export async function isMaintainer(
 ): Promise<boolean> {
   const level = await checker.getCollaboratorPermission(username);
   return ALLOWED_PERMISSIONS.has(level);
+}
+
+/**
+ * The full override gate: GitHub write access AND the repo's `override_policy`
+ * (OGE-1585). Both must pass.
+ *
+ * The policy can only narrow — a repo that lists nobody, or has no config at
+ * all, falls back to the collaborator check alone. It is never a way to grant
+ * override rights to someone GitHub would refuse.
+ *
+ * The policy is read from the default branch, so it cannot be widened from the
+ * PR conversation surface or from the PR's own commits.
+ */
+export async function isOverrideAuthorized(args: {
+  checker: PermissionChecker;
+  username: string;
+  config?: ReviewerConfig;
+  /** Team slugs the user belongs to, if the caller resolved them. */
+  teams?: string[];
+}): Promise<{ allowed: boolean; reason?: string }> {
+  if (!(await isMaintainer(args.checker, args.username))) {
+    return { allowed: false, reason: "not a maintainer on this repo" };
+  }
+  if (args.config && !isOverrideAllowed(args.config, args.username, args.teams ?? [])) {
+    return { allowed: false, reason: `not listed in \`override_policy\` in ${CONFIG_PATH}` };
+  }
+  return { allowed: true };
 }
 
 // ─── Override application ───────────────────────────────────────────────────

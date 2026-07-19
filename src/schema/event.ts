@@ -27,6 +27,13 @@ export const PrContext = z.object({
   author: z.string().min(1),
   /** ISO-8601 string of when the PR was opened. */
   createdAt: z.string().datetime(),
+  /**
+   * The repository's default branch (OGE-1585). Per-repo config is read from
+   * here and never from `headRef` — config decides whether the PR merges, so
+   * reading it from the PR would let a contributor disarm their own gate.
+   * Optional: when absent, no per-repo config is loaded.
+   */
+  defaultBranch: z.string().min(1).optional(),
 });
 export type PrContext = z.infer<typeof PrContext>;
 

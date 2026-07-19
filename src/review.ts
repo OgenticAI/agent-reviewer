@@ -32,6 +32,12 @@ import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.j
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
+import {
+  loadRepoConfig,
+  matchingPathInstructions,
+  triggeredRecipes,
+  type RefFileReader,
+} from "./config.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -161,6 +167,12 @@ export interface RunReviewArgs {
    * `readFile` enables function-boundary hunk expansion.
    */
   diffPack?: PackDiffOptions;
+  /**
+   * Reads files at a git ref, used to load `.agent-reviewer.yml` and the
+   * repo's `AGENTS.md` / `CLAUDE.md` from the default branch (OGE-1585).
+   * Omitted means no per-repo config — prompts stay byte-identical.
+   */
+  configReader?: RefFileReader;
 }
 
 export interface RunReviewResult {
@@ -260,8 +272,19 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
 
   // Pack before prompting: an unbounded diff either overflows the window or
   // crowds out the checklist and tool results (OGE-1581).
+  // Per-repo config, read from the DEFAULT BRANCH only (OGE-1585) — loaded
+  // before packing because `exclude_globs` decides what gets packed at all.
+  const repoConfig =
+    args.configReader && pr.defaultBranch
+      ? await loadRepoConfig(args.configReader, pr.defaultBranch)
+      : null;
+  for (const w of repoConfig?.warnings ?? []) {
+    console.error(`[config] ${w}`);
+  }
+
   const packed = packDiff(diff, {
     ...args.diffPack,
+    excludeGlobs: [...(args.diffPack?.excludeGlobs ?? []), ...(repoConfig?.config.exclude_globs ?? [])],
     checklistTexts: checklist.items.map((it) => it.text),
   });
   if (packed.truncated) {
@@ -270,6 +293,20 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
         ` (${packed.skippedFiles.map((s) => s.reason).join(", ")})`,
     );
   }
+
+  // Only the guidance this PR actually triggers reaches the prompt — an
+  // instruction for files nobody touched is context spent for nothing.
+  const changedFiles = packed.includedFiles.concat(packed.skippedFiles.map((s) => s.path));
+  const repoGuidance = repoConfig
+    ? {
+        files: repoConfig.guidance,
+        pathInstructions: matchingPathInstructions(repoConfig.config, changedFiles),
+        recipes: triggeredRecipes(
+          repoConfig.config,
+          checklist.items.map((it) => it.text),
+        ),
+      }
+    : undefined;
 
   const userPrompt = buildReviewPrompt({
     pr,
@@ -280,6 +317,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     research,
     ci,
     skippedFiles: packed.skippedFiles,
+    repoGuidance,
   });
   const promptHash = hashPrompt(userPrompt);
 

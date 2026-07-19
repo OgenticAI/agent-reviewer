@@ -14,6 +14,7 @@ import {
   applyOverride,
   CHECK_NAME,
   isMaintainer,
+  isOverrideAuthorized,
   OVERRIDE_LABEL,
   parseOverrideComment,
   type CheckPublisher,
@@ -21,6 +22,7 @@ import {
   type PermissionChecker,
   type PrReplyWriter,
 } from "../../src/override.js";
+import { parseReviewerConfig } from "../../src/config.js";
 
 // ─── Mock builders ───────────────────────────────────────────────────────────
 
@@ -152,6 +154,55 @@ describe("isMaintainer", () => {
     ["none", false],
   ])("level=%s → maintainer=%s", async (level, expected) => {
     expect(await isMaintainer(checkerReturning(level), "x")).toBe(expected);
+  });
+});
+
+// ─── isOverrideAuthorized (config-aware gate, OGE-1585) ──────────────────────
+
+describe("isOverrideAuthorized", () => {
+  function checkerReturning(level: string): PermissionChecker {
+    return { async getCollaboratorPermission() { return level; } };
+  }
+  const admin = checkerReturning("admin");
+  const reader = checkerReturning("read");
+
+  const { config: POLICY } = parseReviewerConfig(
+    'override_policy:\n  allowed_actors: ["release-captain"]\n',
+  );
+
+  it("allows a maintainer when the repo sets no policy", async () => {
+    const r = await isOverrideAuthorized({ checker: admin, username: "anyone" });
+    expect(r.allowed).toBe(true);
+  });
+
+  it("rejects an actor outside override_policy even with admin rights", async () => {
+    const r = await isOverrideAuthorized({
+      checker: admin,
+      username: "someone-else",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/override_policy/);
+  });
+
+  it("allows a listed actor who is also a maintainer", async () => {
+    const r = await isOverrideAuthorized({
+      checker: admin,
+      username: "release-captain",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(true);
+  });
+
+  it("never lets the policy grant rights GitHub would refuse", async () => {
+    // The policy narrows the collaborator gate; it is not a second way in.
+    const r = await isOverrideAuthorized({
+      checker: reader,
+      username: "release-captain",
+      config: POLICY,
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toMatch(/maintainer/);
   });
 });
 

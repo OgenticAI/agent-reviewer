@@ -40,6 +40,47 @@ import type { ReviewTool, ToolResult } from "./registry.js";
 /** Directories never worth reading and expensive to walk. */
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", "coverage"]);
 
+/**
+ * Paths refused even though they sit inside the repo root.
+ *
+ * Containment stops a traversal *out* of the checkout. It does nothing about
+ * secrets committed *inside* it, and those are common: a `.env` a contributor
+ * added by mistake, `.git/config` carrying a token in a remote URL, a stray
+ * `id_rsa` in a fixtures directory. The reviewer pastes tool output into a
+ * public PR comment, so reading one is a disclosure, not just a read.
+ *
+ * Deny-list before allow-list, and matched on the repo-relative path so a
+ * nested `config/.env.production` is caught as readily as a root `.env`.
+ */
+const DENIED_PATH_PATTERNS: RegExp[] = [
+  /(^|\/)\.git(\/|$)/,
+  /(^|\/)\.env($|\.|\/)/i,
+  /(^|\/)\.npmrc$/i,
+  /(^|\/)\.netrc$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/i,
+  /(^|\/)[^/]*\.pem$/i,
+  /(^|\/)[^/]*\.p12$/i,
+  /(^|\/)[^/]*\.pfx$/i,
+  /(^|\/)credentials$/i,
+];
+
+export class PathDeniedError extends Error {
+  constructor(requested: string) {
+    super(
+      `Refusing to read ${requested}: it matches the secrets deny-list ` +
+        `(.env, .git, keys, credentials). Tool output is pasted into a public ` +
+        `PR comment, so this file is off limits even though it is in the repo.`,
+    );
+    this.name = "PathDeniedError";
+  }
+}
+
+/** True when a repo-relative path is on the deny-list. */
+export function isDeniedPath(relPath: string): boolean {
+  const normalized = relPath.split(sep).join("/");
+  return DENIED_PATH_PATTERNS.some((re) => re.test(normalized));
+}
+
 /** Caps, so one tool call can't blow the context budget. */
 const MAX_FILE_BYTES = 64 * 1024;
 const MAX_LIST_RESULTS = 200;
@@ -79,10 +120,16 @@ export function resolveWithinRoot(root: string, requested: string): string {
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
     throw new PathEscapeError(requested);
   }
+  // Containment passed — now refuse secrets that live legitimately inside the
+  // checkout. Both the requested path and its resolved location are checked,
+  // so a symlink `notes.md -> .env` inside the repo is caught too.
+  if (isDeniedPath(rel) || isDeniedPath(requested)) {
+    throw new PathDeniedError(requested);
+  }
   return resolved;
 }
 
-function walk(root: string, onFile: (abs: string) => void): void {
+function walk(root: string, onFile: (abs: string) => void, rootForDeny: string = root): void {
   let seen = 0;
   const stack = [root];
   while (stack.length > 0) {
@@ -99,7 +146,12 @@ function walk(root: string, onFile: (abs: string) => void): void {
         stack.push(join(dir, entry.name));
       } else if (entry.isFile()) {
         if (++seen > MAX_WALK_FILES) return;
-        onFile(join(dir, entry.name));
+        const abs = join(dir, entry.name);
+        // Denied files are skipped during walks too — otherwise search_repo
+        // would happily print the contents of a .env it was never allowed to
+        // open directly.
+        if (isDeniedPath(relative(rootForDeny, abs))) continue;
+        onFile(abs);
       }
     }
   }
@@ -251,7 +303,7 @@ function searchRepoTool(root: string): ReviewTool {
           }
           if (re.test(line)) matches.push(`${rel}:${i + 1}: ${line.trim().slice(0, 200)}`);
         });
-      });
+      }, realpathSync(root));
 
       if (matches.length === 0) return ok(`No matches for /${pattern}/.`);
       const note = truncated ? `\n… truncated at ${MAX_SEARCH_MATCHES} matches` : "";
@@ -293,7 +345,7 @@ function listFilesTool(root: string): ReviewTool {
           return;
         }
         files.push(relative(realRoot, abs).split(sep).join("/"));
-      });
+      }, realRoot);
 
       if (files.length === 0) return ok("No files found.");
       files.sort();

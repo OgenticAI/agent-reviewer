@@ -12,7 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { makeRepoTools, PathEscapeError, resolveWithinRoot } from "../../src/tools/repo.js";
+import {
+  isDeniedPath,
+  makeRepoTools,
+  PathDeniedError,
+  PathEscapeError,
+  resolveWithinRoot,
+} from "../../src/tools/repo.js";
 import type { ReviewTool } from "../../src/tools/registry.js";
 
 let root: string;
@@ -31,6 +37,10 @@ beforeAll(() => {
   writeFileSync(join(root, "README.md"), "# Title\ncall redactText here\n");
   writeFileSync(join(root, "node_modules", "junk", "big.js"), "redactText\n");
   writeFileSync(join(outside, "secret.env"), "ANTHROPIC_API_KEY=sk-leak\n");
+  writeFileSync(join(root, ".env"), "LINEAR_API_TOKEN=lin_in_repo_leak\n");
+  mkdirSync(join(root, "config"), { recursive: true });
+  writeFileSync(join(root, "config", ".env.production"), "STRIPE_KEY=sk_live_leak\n");
+  writeFileSync(join(root, "deploy.pem"), "-----BEGIN PRIVATE KEY-----\n");
   symlinkSync(join(outside, "secret.env"), join(root, "escape-link"));
 
   tools = Object.fromEntries(makeRepoTools(root).map((t) => [t.definition.name, t]));
@@ -184,5 +194,49 @@ describe("tool surface", () => {
     for (const name of Object.keys(tools)) {
       expect(name).not.toMatch(/write|delete|exec|run|bash/i);
     }
+  });
+});
+
+describe("secrets deny-list — files inside the repo", () => {
+  // Containment stops traversal OUT of the checkout. It does nothing about
+  // secrets committed INSIDE it, and tool output is pasted into a public PR
+  // comment — so reading one is a disclosure, not just a read.
+  it.each([".env", "config/.env.production", "deploy.pem", ".git/config"])(
+    "refuses %s",
+    (path) => {
+      expect(() => resolveWithinRoot(root, path)).toThrow(PathDeniedError);
+    },
+  );
+
+  it("read_file refuses a repo-local .env without leaking its contents", async () => {
+    const r = await tools.read_file!.execute({ path: ".env" });
+    expect(r.isError).toBe(true);
+    expect(r.content).not.toContain("lin_in_repo_leak");
+    expect(r.content).toMatch(/deny-list/);
+  });
+
+  it("read_file refuses a nested .env.production", async () => {
+    const r = await tools.read_file!.execute({ path: "config/.env.production" });
+    expect(r.isError).toBe(true);
+    expect(r.content).not.toContain("sk_live_leak");
+  });
+
+  it("search_repo does not surface denied files", async () => {
+    // Without a deny-check in the walk, search would happily print the
+    // contents of a file read_file was never allowed to open.
+    const r = await tools.search_repo!.execute({ pattern: "LINEAR_API_TOKEN|STRIPE_KEY" });
+    expect(r.content).not.toContain("lin_in_repo_leak");
+    expect(r.content).not.toContain("sk_live_leak");
+  });
+
+  it("list_files does not list denied files", async () => {
+    const r = await tools.list_files!.execute({});
+    expect(r.content).not.toContain(".env");
+    expect(r.content).not.toContain("deploy.pem");
+  });
+
+  it("still allows ordinary files", () => {
+    expect(isDeniedPath("src/redaction.ts")).toBe(false);
+    expect(isDeniedPath("docs/environment.md")).toBe(false);
   });
 });

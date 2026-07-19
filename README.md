@@ -255,6 +255,14 @@ Mechanical checklist items ("lint passes", "no new type errors", "tests cover th
 - **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
 - **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
 
+## Sandboxed execution &mdash; `sandbox_enabled`
+
+Any checklist item of the form "run X and verify Y" &mdash; retries fire, the endpoint 404s, the suite covers the flag &mdash; punts `UNVERIFIABLE` **by construction**, because the model can read but never execute. That's the largest structural contributor to the 88% punt baseline that no prompting change can fix. `sandbox_enabled` gives the model a single `run_command` tool to close it.
+
+- **One tool.** mini-SWE-agent's existence proof: one stateless `run_command(cmd) → {stdoutTail, exitCode}` beats N bespoke tools. The structured observation is the only thing that crosses the boundary (OpenHands' pattern), and the substrate (a container step now, a microVM later) is swappable without the model noticing.
+- **Secretless, and it fails closed.** The security framing is load-bearing: the Kudelski RCE on CodeRabbit worked because analyzer execution ran in an env holding API keys and the GitHub App private key. This runs PR-authored code, so **isolation is mandatory and the operator's responsibility** &mdash; a dedicated job with no workflow secrets, a read-only repo-scoped token, and restricted egress. On top of that, the tool refuses to run if any known secret is present in its env, so enabling it in the wrong job correctly fails rather than executing a PR command next to a credential.
+- **Every observation is scrubbed and fenced** through the same OGE-1579 pipeline as all tool output &mdash; exec output is the most injection-prone class there is &mdash; and wall-clock spend counts against the existing tool-loop caps. Off by default.
+
 ## Ranked repo map &mdash; `repo_map` / `map_tokens`
 
 The model starts blind: iteration 1 is typically `list_files` or a speculative search, and with a 12-iteration / 5-minute cap that exploration overhead is the difference between verifying and punting. Punts of the form "cannot confirm this function is called from Y" or "does every path emit an audit event" &mdash; small diff, repo-wide claim &mdash; are exactly what a standing symbol map answers without spending a tool iteration. Aider's lesson: push ranked context up front rather than making the model pay per fact.

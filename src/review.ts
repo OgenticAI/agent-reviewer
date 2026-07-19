@@ -31,7 +31,7 @@ import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
-import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
+import { packDiff, splitDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
 import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
 import { ingestFindings } from "./findings/ingest.js";
 import type { JobFindings } from "./findings/schema.js";
@@ -45,6 +45,12 @@ import {
   type InlineComment,
 } from "./render/inline.js";
 import { attachSuggestions } from "./render/suggestion.js";
+import {
+  runTriage,
+  priorityFilesFrom,
+  type TriageModel,
+  type TriageResult,
+} from "./triage/triage.js";
 import {
   loadRepoConfig,
   matchingLearnedRules,
@@ -218,6 +224,12 @@ export interface RunReviewArgs {
    * are produced.
    */
   inlineCommentsEnabled?: boolean;
+  /**
+   * Haiku-class triage model (OGE-1595). When supplied, a cheap pre-pass routes
+   * the tool loop onto the hard items and prioritizes the files it flags in the
+   * diff pack. Omitted / errors → today's uniform behaviour, unchanged.
+   */
+  triageModel?: TriageModel;
 }
 
 export interface RunReviewResult {
@@ -257,6 +269,8 @@ export interface RunReviewResult {
   inlineComments?: InlineComment[];
   /** Item ids that got a committable suggestion block (OGE-1596). */
   suggestedItemIds?: number[];
+  /** Per-item routing from the cheap triage pre-pass (OGE-1595), when it ran. */
+  triage?: TriageResult;
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -357,10 +371,29 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     console.error(`[config] ${w}`);
   }
 
+  // Cheap-model triage BEFORE packing (OGE-1595): route the tool loop onto the
+  // hard items and let the files it flags survive the token budget. Fail-open —
+  // absent a triage model, or on any error, this is a no-op.
+  let triage: TriageResult | undefined;
+  if (args.triageModel) {
+    triage = await runTriage({
+      model: args.triageModel,
+      checklist: checklist.items.map((it) => ({ id: it.id, text: it.text })),
+      changedFiles: splitDiff(diff).map((f) => f.path),
+    });
+    const counts = triage.items.reduce<Record<string, number>>((acc, it) => {
+      acc[it.routing] = (acc[it.routing] ?? 0) + 1;
+      return acc;
+    }, {});
+    console.error(`[triage] ${JSON.stringify(counts)}`);
+  }
+  const triagePriority = triage ? priorityFilesFrom(triage) : [];
+
   const packed = packDiff(diff, {
     ...args.diffPack,
     excludeGlobs: [...(args.diffPack?.excludeGlobs ?? []), ...(repoConfig?.config.exclude_globs ?? [])],
     checklistTexts: checklist.items.map((it) => it.text),
+    ...(triagePriority.length > 0 ? { priorityPaths: triagePriority } : {}),
   });
   if (packed.truncated) {
     console.error(
@@ -531,6 +564,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ...(findingsGate ? { findingsGate } : {}),
     ...(inlineComments ? { inlineComments } : {}),
     ...(suggested ? { suggestedItemIds: suggested } : {}),
+    ...(triage ? { triage } : {}),
     prContext: pr,
     ticket,
     cached: false,

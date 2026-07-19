@@ -35,6 +35,7 @@ import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
+import type { RefFileReader } from "./config.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
@@ -282,6 +283,7 @@ async function runReviewCommand(env: {
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
+      configReader: makeRefFileReader(octokit, { owner: env.owner, repo: env.repo }),
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
@@ -584,6 +586,34 @@ function buildToolRegistry(
   return makeRegistry(tools);
 }
 
+/**
+ * Reads repo files at a ref through the GitHub contents API (OGE-1585).
+ *
+ * Bound to one repo at construction so a caller cannot accidentally point it
+ * at the head fork — the whole security property of per-repo config is that
+ * it comes from the upstream default branch.
+ */
+function makeRefFileReader(
+  octokit: Octokit,
+  repo: { owner: string; repo: string },
+): RefFileReader {
+  return {
+    async readAtRef(path, ref) {
+      try {
+        const resp = await octokit.repos.getContent({ ...repo, path, ref });
+        const data = resp.data as { content?: string; encoding?: string; type?: string };
+        if (data.type !== "file" || typeof data.content !== "string") return null;
+        return Buffer.from(data.content, (data.encoding as BufferEncoding) ?? "base64").toString(
+          "utf8",
+        );
+      } catch {
+        // 404 is the common case (repo has no config) and is not an error.
+        return null;
+      }
+    },
+  };
+}
+
 function makeGithubReader(octokit: Octokit): GithubReader {
   return {
     async getPr({ owner, repo, number }) {
@@ -599,6 +629,10 @@ function makeGithubReader(octokit: Octokit): GithubReader {
         body: pr.body ?? "",
         author: pr.user?.login ?? "unknown",
         createdAt: pr.created_at,
+        // Where per-repo config is read from (OGE-1585). `base.repo` is the
+        // upstream repo even on a fork PR, which is the point: a fork must not
+        // be able to supply the config that gates its own merge.
+        defaultBranch: pr.base.repo.default_branch,
       };
     },
     async getDiff({ owner, repo, number }) {

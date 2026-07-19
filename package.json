@@ -24,6 +24,7 @@
     "@anthropic-ai/sdk": "^0.71.1",
     "@octokit/auth-app": "^7.1.4",
     "@octokit/rest": "^21.0.2",
+    "yaml": "^2.9.0",
     "zod": "^4.1.13"
   },
   "devDependencies": {

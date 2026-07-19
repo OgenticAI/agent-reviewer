@@ -190,6 +190,44 @@ npx tsx src/cli.ts override-pr https://github.com/OgenticAI/ogentic-shield/pull/
   --by your-github-username --reason "spot-checking the override flow"
 ```
 
+## Per-repo configuration &mdash; `.agent-reviewer.yml`
+
+Drop `.agent-reviewer.yml` at the root of any repo the reviewer runs on to teach it that repo's conventions. Everything in it is optional.
+
+```yaml
+# Verdict statuses that should fail the Check (overrides the action input).
+fail_on: [FAIL]
+
+# Paths the reviewer should never inline into the diff. The file is still
+# NAMED in the prompt — the reviewer must never read silence as "unchanged".
+exclude_globs:
+  - "generated/**"
+  - "**/*.snap"
+
+# Guidance attached to a file only when its glob matches a changed file.
+path_instructions:
+  - glob: "db/migrations/**"
+    instructions: "Verify against the schema snapshot in db/schema.sql; do not try to run these."
+  - glob: "src/**/*.tsx"
+    instructions: "Every screen needs an explicit loading and error state."
+
+# Guidance attached when a trigger word appears in a UAT checklist item.
+recipes:
+  - triggers: ["migration", "schema"]
+    instructions: "Migrations are verified by the snapshot test, not by running them."
+
+# Narrows who may run `/uat-override`. Omit to allow any repo maintainer.
+override_policy:
+  allowed_actors: [davidoladeji-ogenticai]
+  allowed_teams: [release-captains]
+```
+
+**It is always read from the default branch, never from the PR head.** That is a trust boundary, not an implementation detail: `fail_on` and `override_policy` decide whether a PR merges, so reading them from the PR would let a contributor disarm the gate in the same commit the gate is judging. On a fork PR the config comes from the upstream repo. `tests/integration/repo-config.test.ts` fails loudly if any other ref is ever requested.
+
+A malformed config is a warning, not a failure &mdash; the review runs unconfigured rather than going red.
+
+`AGENTS.md` and `CLAUDE.md`, if present on the default branch, are injected as repo conventions automatically with no config at all (clamped to 4000 chars each so they can't crowd out the diff). `override_policy` can only *narrow* the existing GitHub maintainer check; it is never a second way in.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

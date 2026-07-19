@@ -246,6 +246,15 @@ Every human resolution carries repo-specific verification knowledge. When a main
 - **Demotion.** A finding class force-passed repeatedly *with no code change* is, by the evidence, noise; it's surfaced as a demotion checklist in the same PR for a maintainer to action.
 - **No model grades a model.** Rule text is the human's own words, triggers are literal strings, acceptance is a git merge, demotion is outcome telemetry. Greptile measured LLM self-scoring as "nearly random", so there is no LLM anywhere in the acceptance path.
 
+## Analyzer & test findings &mdash; `findings_fail_level`
+
+Mechanical checklist items ("lint passes", "no new type errors", "tests cover the flag") used to punt or mis-resolve because the model learned those facts by reading a 12KB CI-log tail inside a capped tool loop. The reviewer now ingests the analyzer's own structured output deterministically, up front, and hands it to the model as **established facts it must not re-derive** &mdash; the reviewbot pattern: linters find, the LLM annotates.
+
+- **Formats:** eslint (`-f json`), `tsc --noEmit` output, and JUnit XML, normalized to reviewdog's RDFormat `Finding` shape.
+- **Verified absence is a fact.** "eslint ran and reported nothing" is stated as a positive result, so the model never reads a clean run as missing evidence.
+- **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
+- **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

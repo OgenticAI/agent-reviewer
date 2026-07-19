@@ -296,3 +296,46 @@ describe("buildReviewPrompt — repo guidance & learned rules (OGE-1585/1594)", 
     expect(withEmpty).toBe(without);
   });
 });
+
+describe("buildReviewPrompt — established facts from analyzers (OGE-1588)", () => {
+  it("renders findings and per-job verified absence, before the diff", () => {
+    const prompt = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "lint passes", checked: true }]),
+      diff: DIFF,
+      findings: [
+        {
+          job: "lint",
+          parsed: true,
+          findings: [
+            { path: "src/a.ts", message: "unused var", severity: "error", source: "eslint", code: "no-unused-vars" },
+          ],
+        },
+        { job: "typecheck", parsed: true, findings: [] },
+      ],
+    });
+    expect(prompt).toContain("Established facts from analyzers (do not re-derive)");
+    expect(prompt).toContain("ERROR src/a.ts");
+    expect(prompt).toContain("typecheck — reported no findings");
+    // Facts come before the diff, so the model reads settled evidence first.
+    expect(prompt.indexOf("Established facts")).toBeLessThan(prompt.indexOf("## Diff to review"));
+  });
+
+  it("omits the section entirely when no findings are supplied — byte-identical", () => {
+    const withEmpty = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+      findings: [{ job: "x", parsed: false, findings: [] }],
+    });
+    const without = buildReviewPrompt({
+      pr: makePr(),
+      ticket: makeTicket(),
+      checklist: makeChecklist([{ text: "x", checked: true }]),
+      diff: DIFF,
+    });
+    expect(withEmpty).toBe(without);
+  });
+});

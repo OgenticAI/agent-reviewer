@@ -64,6 +64,7 @@ import {
   triggeredRecipes,
   type RefFileReader,
 } from "./config.js";
+import { buildRepoMap, type RepoFile } from "./repomap/index.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -242,6 +243,14 @@ export interface RunReviewArgs {
    * default; the CLI decides via the `incremental_*` thresholds.
    */
   incrementalEnabled?: boolean;
+  /**
+   * Checked-out repo files for the ranked repo map (OGE-1582). When supplied,
+   * `runReview` builds a signature-only map before the tool loop and injects it
+   * read-only. Omitted keeps the prompt byte-identical.
+   */
+  repoFiles?: RepoFile[];
+  /** Base token budget for the repo map; scales inversely with diff size. */
+  mapTokens?: number;
 }
 
 export interface RunReviewResult {
@@ -438,6 +447,23 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       }
     : undefined;
 
+  // Ranked repo map before the tool loop (OGE-1582): answer repo-wide claims
+  // from a standing symbol map instead of paying per tool iteration to explore.
+  let repoMap: string | undefined;
+  if (args.repoFiles && args.repoFiles.length > 0) {
+    const map = buildRepoMap({
+      files: args.repoFiles,
+      diffTouchedFiles: changedFiles,
+      checklistTexts: checklist.items.map((it) => it.text),
+      diffText: packed.text,
+      ...(args.mapTokens !== undefined ? { baseTokens: args.mapTokens } : {}),
+    });
+    if (map.text) {
+      repoMap = map.text;
+      console.error(`[repomap] ${map.fileCount} file(s), budget ${map.budget} tokens`);
+    }
+  }
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
@@ -449,6 +475,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     skippedFiles: packed.skippedFiles,
     repoGuidance,
     ...(findings ? { findings } : {}),
+    ...(repoMap ? { repoMap } : {}),
   });
   const promptHash = hashPrompt(userPrompt);
 

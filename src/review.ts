@@ -44,6 +44,7 @@ import {
   splitFindings,
   type InlineComment,
 } from "./render/inline.js";
+import { attachSuggestions } from "./render/suggestion.js";
 import {
   loadRepoConfig,
   matchingLearnedRules,
@@ -254,6 +255,8 @@ export interface RunReviewResult {
   findingsGate?: FindingsGateResult;
   /** Inline review comments to post (OGE-1586), when inline mode is on. */
   inlineComments?: InlineComment[];
+  /** Item ids that got a committable suggestion block (OGE-1596). */
+  suggestedItemIds?: number[];
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -495,10 +498,23 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
   // fallback (OGE-1586). Off by default keeps the body byte-identical.
   let inlineComments: InlineComment[] | undefined;
   let fallbackSection: string | null | undefined;
+  let suggested: number[] | undefined;
   if (args.inlineCommentsEnabled) {
-    const split = splitFindings(adjudicated.items, buildPositionMap(diff), renderInlineFindingBody);
+    const positionMap = buildPositionMap(diff);
+    const rawSplit = splitFindings(adjudicated.items, positionMap, renderInlineFindingBody);
+    // Upgrade small, certain FAIL fixes to committable suggestion blocks
+    // (OGE-1596); everything else keeps its prose comment / draft-PR path.
+    const { split, suggestedItemIds } = attachSuggestions({
+      split: rawSplit,
+      items: adjudicated.items,
+      positionMap,
+    });
     inlineComments = split.inline;
     fallbackSection = renderFallbackSection(split.unanchored);
+    if (suggestedItemIds.length > 0) {
+      suggested = suggestedItemIds;
+      console.error(`[inline] committable suggestions for item(s) ${suggestedItemIds.join(", ")}`);
+    }
   }
 
   const body = renderStickyComment(adjudicated, fallbackSection);
@@ -514,6 +530,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ...(findings ? { findings } : {}),
     ...(findingsGate ? { findingsGate } : {}),
     ...(inlineComments ? { inlineComments } : {}),
+    ...(suggested ? { suggestedItemIds: suggested } : {}),
     prContext: pr,
     ticket,
     cached: false,

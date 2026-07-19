@@ -700,7 +700,7 @@ function makeInlineCommentClient(octokit: Octokit): InlineCommentClient {
       });
       return comments.map((c) => ({ id: c.id, body: c.body ?? "" }));
     },
-    async createReviewComment({ owner, repo, pullNumber, commitId, path, line, body }) {
+    async createReviewComment({ owner, repo, pullNumber, commitId, path, line, startLine, body }) {
       const resp = await octokit.pulls.createReviewComment({
         owner,
         repo,
@@ -708,6 +708,8 @@ function makeInlineCommentClient(octokit: Octokit): InlineCommentClient {
         commit_id: commitId,
         path,
         line,
+        // Multi-line anchor for a committable suggestion (OGE-1596).
+        ...(startLine !== undefined ? { start_line: startLine } : {}),
         body,
       });
       return { id: resp.data.id };

@@ -85,6 +85,9 @@ export interface RunWritebackArgs {
     researchQueries?: number;
     cached?: boolean;
     degraded?: string;
+    /** Punt counts around adjudication (OGE-1587). */
+    puntsBefore?: number;
+    puntsAfter?: number;
   };
   writer: LinearWriter;
   /** Verdict produced by `runReview()`. */

@@ -29,6 +29,7 @@ import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
 import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
+import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
@@ -148,6 +149,12 @@ export interface RunReviewArgs {
    * it without calling the model at all.
    */
   cachedVerdict?: ReviewVerdict | null;
+  /**
+   * Cheap second-pass model that challenges each UNVERIFIABLE verdict
+   * (OGE-1587). Omitted means no adjudication — the default, so this cannot
+   * change behaviour for callers that have not opted in.
+   */
+  adjudicator?: AdjudicatorModel;
 }
 
 export interface RunReviewResult {
@@ -170,6 +177,10 @@ export interface RunReviewResult {
   researchTrace: ResearchTrace;
   /** Why research was on or off, for operator-facing logs. */
   researchReason: string;
+  /** Punt count before adjudication ran; equals the after count when it didn't. */
+  puntsBefore: number;
+  /** Punt count after adjudication. */
+  puntsAfter: number;
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -274,6 +285,8 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       researchTrace: EMPTY_TRACE,
       researchReason: "cache hit — prompt unchanged since the last run",
       transcript: [],
+      puntsBefore: cachedVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length,
+      puntsAfter: cachedVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length,
     };
   }
 
@@ -299,13 +312,38 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       }),
   });
 
-  const body = renderStickyComment(finalVerdict);
+  // Challenge the punts before anything is rendered — the sticky comment, the
+  // Check, and the Linear mirror should all reflect the adjudicated table.
+  let adjudicated = finalVerdict;
+  let puntsBefore = finalVerdict.items.filter((it) => it.status === "UNVERIFIABLE").length;
+  let puntsAfter = puntsBefore;
+  if (args.adjudicator && puntsBefore > 0) {
+    const result = await adjudicateVerdict({
+      verdict: finalVerdict,
+      transcript: output.transcript ?? [],
+      prBody: pr.body,
+      model: args.adjudicator,
+    });
+    adjudicated = result.verdict;
+    puntsBefore = result.puntsBefore;
+    puntsAfter = result.puntsAfter;
+    for (const o of result.outcomes) {
+      console.error(
+        `[adjudicate] item ${o.itemId}: ${o.keptPunt ? "kept" : "overturned"}` +
+          `${o.spentCall ? "" : " (no call)"} — ${o.reason}`,
+      );
+    }
+  }
+
+  const body = renderStickyComment(adjudicated);
   const retryNote =
     retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
   return {
-    verdict: finalVerdict,
+    verdict: adjudicated,
     body,
-    overall: overallStatus(finalVerdict),
+    overall: overallStatus(adjudicated),
+    puntsBefore,
+    puntsAfter,
     prContext: pr,
     ticket,
     cached: false,

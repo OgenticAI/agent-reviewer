@@ -328,10 +328,14 @@ async function fetchLinkedVerificationComments(args: {
     if (!item.checked) continue;
     for (const link of item.links) {
       if (!isSamePrCommentLink(link, pr)) continue;
+      /* eslint-disable @typescript-eslint/unbound-method --
+         The reference is deliberately unbound; it is invoked below via
+         `fetcher.call(github, ...)`, which supplies the correct `this`. */
       const fetcher =
         link.kind === "pr-comment-issue"
           ? github.getIssueComment
           : github.getReviewComment;
+      /* eslint-enable @typescript-eslint/unbound-method */
       if (!fetcher) continue; // test mock without comment fetchers
       let comment;
       try {

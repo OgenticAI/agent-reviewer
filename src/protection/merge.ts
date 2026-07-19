@@ -32,8 +32,10 @@ export interface BranchProtectionPut {
   } | null;
   /** Require admins to follow protection rules. We never silently flip this. */
   enforce_admins: boolean | null;
-  required_pull_request_reviews: unknown | null;
-  restrictions: unknown | null;
+  /** Opaque pass-through — we never inspect or merge these, only forward them
+   *  verbatim. `null` is a valid value and is already admitted by `unknown`. */
+  required_pull_request_reviews: unknown;
+  restrictions: unknown;
   required_linear_history?: boolean;
   allow_force_pushes?: boolean | null;
   allow_deletions?: boolean | null;

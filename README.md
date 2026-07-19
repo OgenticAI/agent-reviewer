@@ -17,6 +17,8 @@ On every `pull_request: [opened, synchronize, ready_for_review]` event:
 2. Pulls the ticket + its UAT checklist via the Linear API.
 3. Reads the PR diff via Octokit.
 4. Asks Claude (one call, temperature 0) for a per-item verdict: **PASS / FAIL / PARTIAL / UNVERIFIABLE** with a rationale and pinned evidence.
+
+> **Writing the checklist:** see [docs/UAT-CRITERIA.md](docs/UAT-CRITERIA.md) for criteria a pre-merge reviewer can actually check, and the `[human]` marker for the ones that genuinely need a person.
 5. Posts (or updates) a single **sticky comment** on the PR with a per-item verdict table.
 6. Mirrors the verdict to the Linear ticket; transitions status (Backlog/Todo &rarr; In Review on PR open; In Review &rarr; Ready to Merge on PASS + green CI).
 7. For each FAIL or PARTIAL item, opens an idempotent child Linear issue titled `Fix UAT: <truncated item>` so dropped work doesn't get lost.

@@ -20,7 +20,7 @@
  *   1  any other failure
  */
 
-import { writeFileSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { Octokit } from "@octokit/rest";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -34,7 +34,8 @@ import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
-import { EMPTY_REGISTRY, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
+import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
+import { makeRepoTools } from "./tools/repo.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -264,7 +265,7 @@ async function runReviewCommand(env: {
       pr: { owner: env.owner, repo: env.repo, number: env.number },
       github: makeGithubReader(octokit),
       linear,
-      model: makeAnthropicModel(anthropic),
+      model: makeAnthropicModel(anthropic, buildToolRegistry()),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
     });
@@ -447,6 +448,38 @@ function requireEnv(name: string): string {
     process.exit(4);
   }
   return v;
+}
+
+/**
+ * Where the repo under review is checked out (OGE-1555).
+ *
+ * NOT `process.cwd()`. The Action runs the CLI with `working-directory` set to
+ * the *reviewer's* own checkout (`github.action_path/../../..`), while the repo
+ * being reviewed sits at `GITHUB_WORKSPACE`. Using cwd would point the read
+ * tools at agent-reviewer's source and produce confidently wrong verdicts
+ * about a completely different codebase.
+ *
+ * Returns null when there is no usable checkout, in which case the reviewer
+ * runs with an empty registry exactly as before.
+ */
+function resolveRepoRoot(): string | null {
+  const candidate = process.env.REVIEWER_REPO_ROOT ?? process.env.GITHUB_WORKSPACE;
+  if (!candidate) return null;
+  try {
+    return statSync(candidate).isDirectory() ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildToolRegistry(): ToolRegistry {
+  const root = resolveRepoRoot();
+  if (!root) {
+    console.error("[tools] no repo checkout found — running without repo read access");
+    return EMPTY_REGISTRY;
+  }
+  console.error(`[tools] repo read access rooted at ${root}`);
+  return makeRegistry(makeRepoTools(root));
 }
 
 function makeGithubReader(octokit: Octokit): GithubReader {

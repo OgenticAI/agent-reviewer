@@ -83,6 +83,26 @@ interface StickyCommentMatch {
   url: string;
 }
 
+/**
+ * Read the current sticky comment's body, or null if there isn't one.
+ *
+ * Used by the verdict cache (OGE-1566): the previous comment embeds the
+ * previous verdict as a JSON sidecar, which makes the PR itself the cache
+ * store — the reviewer runs in a fresh container each time, so there is
+ * nowhere else durable to keep one.
+ */
+export async function readStickyComment(args: {
+  octokit: Octokit;
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  marker?: string;
+}): Promise<string | null> {
+  const marker = args.marker ?? COMMENT_MARKER;
+  const found = await findStickyComment({ ...args, body: marker }, marker);
+  return found?.body ?? null;
+}
+
 async function findStickyComment(
   args: UpsertStickyArgs,
   marker: string,

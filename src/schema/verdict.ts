@@ -109,6 +109,20 @@ export const ReviewVerdict = z.object({
   summary: z.string().min(1).max(600),
   /** UTC ISO-8601 timestamp the verdict was rendered. */
   generatedAt: z.string().datetime(),
+  /**
+   * SHA-256 of the exact user prompt this verdict was produced from (OGE-1566).
+   *
+   * This is the cache key for skipping a re-run. `headSha` alone is NOT
+   * sufficient: a PR description can be edited — adding a UAT item, fixing a
+   * `[human]` marker — without producing a new commit, and reusing a verdict
+   * across that change would score the new checklist with the old answers.
+   * Hashing the prompt covers every input in the determinism vector at once.
+   *
+   * Optional so verdicts written before this field existed still parse.
+   * A cached verdict without a hash simply never matches, so it re-runs —
+   * failing toward correctness rather than toward a stale reuse.
+   */
+  promptHash: z.string().optional(),
 });
 export type ReviewVerdict = z.infer<typeof ReviewVerdict>;
 

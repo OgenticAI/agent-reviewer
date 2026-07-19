@@ -33,6 +33,23 @@ inputs:
       enforcing (see OGE-340).
     required: false
     default: ""
+  research:
+    description: >-
+      When 'true', the reviewer may use Anthropic's server-side web search to
+      narrow the factual half of a `[human]`-marked UAT item, citing only
+      allowlisted standards sources (OGE-1566). Off by default.
+
+      Leave this OFF for repos importing @ogenticai/shield or @ogenticai/audit,
+      and for the Therapy and Private Credit verticals. The model composes the
+      search query and Anthropic dispatches it, so queries are audited after
+      the fact rather than gated before they leave — that is detection, not
+      prevention, and is not an acceptable trade where a leak would be PHI or
+      MNPI. Those repos wait for the client-side search path.
+
+      No effect on PRs with no `[human]`-marked items: the request carries no
+      tools array at all.
+    required: false
+    default: "false"
   auto_patch:
     description: >-
       When 'true' AND the verdict has at least one FAIL item flagged
@@ -91,6 +108,7 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         LINEAR_API_TOKEN: ${{ inputs.linear_api_token }}
+        REVIEWER_RESEARCH: ${{ inputs.research }}
         PR_URL: ${{ github.event.pull_request.html_url }}
         VERDICT_PATH: ${{ runner.temp }}/verdict.json
       run: |

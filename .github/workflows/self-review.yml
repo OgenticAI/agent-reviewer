@@ -74,6 +74,10 @@ jobs:
           # Auto-patch off for now — flip to "true" once we've watched a few
           # FAIL verdicts and the autoPatchable signal feels reliable.
           auto_patch: "false"
+          # Research on here because this is the dogfooding repo and it holds
+          # no PHI or MNPI (see the input's docs for who must leave it off).
+          # It only does anything on PRs that carry a `[human]`-marked item.
+          research: "true"
           # Merge gate: NEEDS_WORK → Check publishes `failure`, blocking merge
           # when branch protection requires this Check. We dogfood the gate
           # here first; consumer repos flip this on their own timeline.

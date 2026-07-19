@@ -24,6 +24,7 @@
 import { COMMENT_MARKER, REVIEWER_VERSION } from "../version.js";
 import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
+import type { ResearchPolicy } from "../research/policy.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -66,6 +67,68 @@ export interface BuildPromptArgs {
    * entirely so unrelated PRs see byte-identical output to v1.
    */
   linkedComments?: LinkedComment[];
+  /**
+   * Whether the server-side web-search tool is attached to this request
+   * (OGE-1566). Changes the grounding rules the model is given: with search
+   * available it is told to look things up and cite them; without it, it is
+   * told to stop at the edge of what the diff supports rather than reaching
+   * into memory. Omitted defaults to disabled, which keeps prompts for
+   * non-research repos byte-identical to v2.
+   */
+  research?: ResearchPolicy;
+}
+
+const DISABLED_RESEARCH: ResearchPolicy = {
+  enabled: false,
+  reason: "not requested",
+  allowedDomains: [],
+  maxUses: 0,
+};
+
+/**
+ * The grounding rules for `[human]` items, which differ by whether the model
+ * can actually look anything up.
+ *
+ * Both branches enforce the same principle — never assert a domain fact you
+ * can't point at a source for — but the available move differs. Without
+ * search, the honest move is to stop and name what would need checking. With
+ * search, the honest move is to go and check, then cite.
+ */
+function groundingRules(research: ResearchPolicy): string[] {
+  if (!research.enabled) {
+    return [
+      `Ground every claim in the diff or the ticket, and cite it. Do NOT assert`,
+      `domain facts from memory — no clinical, legal, regulatory, or standards claims`,
+      `you cannot point at a source for. A confident wrong claim about DSM-5 is worse`,
+      `than silence, because it anchors the expert who reads it. If narrowing the`,
+      `question requires domain knowledge you can't cite, say exactly what would need`,
+      `to be checked and stop there.`,
+    ];
+  }
+  return [
+    `You have a **web_search** tool, limited to authoritative sources`,
+    `(${research.allowedDomains.slice(0, 6).join(", ")}, and similar) and to`,
+    `${research.maxUses} searches for this whole review. Use it only to settle the`,
+    `factual half of a "human sign-off" item — whether the code's categories,`,
+    `names, or values actually match the standard the criterion names.`,
+    ``,
+    `Rules for searching:`,
+    `- Search for the **standard**, not for this PR. Query things like`,
+    `  "HIPAA Safe Harbor 18 identifiers" — never paste code, diff hunks, file`,
+    `  contents, or ticket text into a query.`,
+    `- Cite every source you rely on in \`evidenceRefs\` as`,
+    `  \`{ "kind": "external", "url": "<the URL the search returned>", "note": "..." }\`.`,
+    `  Use the URL verbatim from the search results. A citation that did not come`,
+    `  back from a search this run will be dropped before the comment is posted,`,
+    `  taking the claim's support with it.`,
+    `- Still do NOT assert a domain fact you did not find a source for. If the`,
+    `  searches don't settle it, say what remains open and stop — that is a useful`,
+    `  briefing too.`,
+    ``,
+    `Searching never changes the verdict: a "human sign-off" item stays`,
+    `**UNVERIFIABLE** no matter what you find. Research narrows the question for`,
+    `the person signing; it does not substitute for the signature.`,
+  ];
 }
 
 /**
@@ -78,15 +141,17 @@ export interface BuildPromptArgs {
  */
 export function buildReviewPrompt(args: BuildPromptArgs): string {
   const { pr, ticket, checklist, diff, linkedComments } = args;
+  const research = args.research ?? DISABLED_RESEARCH;
 
   const items = checklist.items
     .map((it) => {
       const annotations = [
         it.checked ? "author marked done" : null,
-        // OGE-1559: the author declared this one as needing a person. Say so
-        // explicitly rather than letting the model burn reasoning deciding it
-        // can't verify a clinician sign-off from a diff.
-        it.human ? "human sign-off — do not attempt to verify" : null,
+        // OGE-1559: the author declared this one as needing a person. The
+        // verdict is fixed at UNVERIFIABLE, but the model should still narrow
+        // the question for whoever signs — see the "human sign-off" block in
+        // the task section below.
+        it.human ? "human sign-off — brief the reviewer, don't rule on it" : null,
       ].filter((a): a is string => a !== null);
       const suffix = annotations.length > 0 ? ` (${annotations.join("; ")})` : "";
       return `${it.id}. ${it.text}${suffix}`;
@@ -139,10 +204,19 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     `Author tick-marks alone are advisory — don't trust them. Decide from the diff.`,
     ``,
     `**Items marked "human sign-off"** were explicitly declared by the author as`,
-    `needing a person (clinician approval, design judgment, docs clarity). Return`,
-    `**UNVERIFIABLE** for these with a one-line rationale naming who needs to look.`,
-    `Don't argue with the designation and don't spend effort trying to verify them —`,
-    `they're excluded from the merge gate downstream.`,
+    `needing a person (clinician approval, design judgment, docs clarity). Always`,
+    `return **UNVERIFIABLE** for these — the sign-off is an attestation and only a`,
+    `person can give it. They're excluded from the merge gate downstream.`,
+    ``,
+    `But "a person must sign it" is not "you have nothing to contribute". Most such`,
+    `items bundle an *attestation* with a *factual question the reviewer can narrow*`,
+    `— "clinician confirms the PHI categories match DSM-5 practice" is a signature`,
+    `plus a concrete question about what the code actually enumerates. Use the`,
+    `rationale to hand the reviewer a briefing: what the diff actually does, which`,
+    `specific cases look routine, and which one or two need their attention. Turn`,
+    `"someone should look at this" into "check line 40 — the rest is mechanical".`,
+    ``,
+    ...groundingRules(research),
     ``,
     `**Exception (ticked-box + verification comment):** if a UAT item is ticked`,
     `(\`(author marked done)\` annotation above) AND the "## Linked verification`,

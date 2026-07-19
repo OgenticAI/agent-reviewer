@@ -116,6 +116,26 @@ inputs:
       (OGE-1590). Default 0 (no time gate). Pair with incremental_min_commits.
     required: false
     default: "0"
+  sandbox_enabled:
+    description: >-
+      When 'true', the reviewer may run shell commands (test suites, builds,
+      greps) via a single run_command tool to verify "run X and check Y" items
+      that otherwise punt UNVERIFIABLE by construction (OGE-1584).
+
+      Isolation is mandatory and is the operator's responsibility. This runs
+      PR-authored code, so it must execute in a SECRETLESS environment: no
+      workflow secrets in the env (no ANTHROPIC_API_KEY, no LINEAR_API_TOKEN, no
+      GitHub App private key — the Kudelski RCE on CodeRabbit worked because
+      analyzer execution ran beside these), a read-only repo-scoped GITHUB_TOKEN
+      only, and restricted network egress.
+
+      The tool FAILS CLOSED: if any known secret is present in its env it refuses
+      to run rather than executing a PR command next to a credential. Enabling
+      this in the same job that holds the reviewer's keys will therefore
+      correctly refuse — run the exec pass in a dedicated secretless job. Off by
+      default.
+    required: false
+    default: "false"
   repo_map:
     description: >-
       When 'true', a ranked, signature-only repo map is injected read-only into
@@ -229,6 +249,7 @@ runs:
         REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
         REVIEWER_TRIAGE: ${{ inputs.triage }}
         REVIEWER_REPO_MAP: ${{ inputs.repo_map }}
+        REVIEWER_SANDBOX_ENABLED: ${{ inputs.sandbox_enabled }}
         REVIEWER_MAP_TOKENS: ${{ inputs.map_tokens }}
         REVIEWER_INCREMENTAL_MIN_COMMITS: ${{ inputs.incremental_min_commits }}
         REVIEWER_INCREMENTAL_MIN_MINUTES: ${{ inputs.incremental_min_minutes }}

@@ -44,6 +44,7 @@ import { toOutcomeRows, renderOutcomeRows } from "./metrics/outcomes.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
+import { makeExecTool, assertSecretlessEnv } from "./tools/exec.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseFailLevel } from "./findings/gate.js";
 import { reconcileInlineComments, type InlineCommentClient } from "./github/inline-comments.js";
@@ -756,6 +757,23 @@ function buildToolRegistry(
     console.error(`[tools] repo read access rooted at ${root}`);
   } else {
     console.error("[tools] no repo checkout found — running without repo read access");
+  }
+
+  // The exec tool runs PR-authored code, so it is added ONLY behind
+  // `sandbox_enabled` (OGE-1584) — the Action wires that input to a separate
+  // secretless job. The tool itself fails closed if a secret is present, so
+  // even a misconfiguration can't run a PR command next to a credential.
+  if (process.env.REVIEWER_SANDBOX_ENABLED === "true") {
+    const hygiene = assertSecretlessEnv();
+    if (!hygiene.ok) {
+      console.error(
+        `[tools] sandbox_enabled but env is NOT secretless (${hygiene.leaked.join(", ")}); ` +
+          `refusing to register run_command`,
+      );
+    } else {
+      tools.push(makeExecTool(root ? { cwd: root } : {}));
+      console.error("[tools] sandbox exec enabled (secretless env verified)");
+    }
   }
 
   if (tools.length === 0) return EMPTY_REGISTRY;

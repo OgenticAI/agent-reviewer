@@ -31,7 +31,16 @@ const OVERALL_HEADLINE: Record<OverallStatus, string> = {
   HUMAN_REVIEW: "🤔 UAT needs human review — at least one item can't be verified from the diff.",
 };
 
-export function renderStickyComment(verdict: ReviewVerdict): string {
+export function renderStickyComment(
+  verdict: ReviewVerdict,
+  /**
+   * Rendered "evidence outside this diff" section (OGE-1586). Supplied only
+   * when inline comments are on and some findings couldn't be anchored — those
+   * must never vanish, so they surface here instead. Omitted keeps the body
+   * byte-identical, preserving the determinism contract for every other repo.
+   */
+  fallbackSection?: string | null,
+): string {
   const overall = overallStatus(verdict);
   const lines: string[] = [];
 
@@ -59,6 +68,12 @@ export function renderStickyComment(verdict: ReviewVerdict): string {
     lines.push(`| ${item.id} | ${text} | ${STATUS_BADGE[item.status]} | ${rationale} |`);
   }
   lines.push("");
+
+  // Two-channel fallback (OGE-1586): findings that couldn't anchor inline.
+  if (fallbackSection) {
+    lines.push(fallbackSection);
+    lines.push("");
+  }
 
   // Evidence list, only when there's anything to show.
   const itemsWithEvidence = verdict.items.filter((it) => it.evidenceRefs.length > 0);

@@ -268,6 +268,15 @@ Prompt and model changes used to ship on vibes: a `REVIEWER_VERSION` bump invali
 
 **Fixture privacy.** The committed fixtures under `eval/fixtures/` are synthetic &mdash; no real customer diffs. This is deliberate: Qodo's benchmark work warns that any fixture derived from public or customer code is a contamination risk (the model may have trained on it, or it may leak private code). If you add fixtures from real PRs, keep them in a private store, never in this repo.
 
+## Inline evidence anchoring &mdash; `inline_comments`
+
+Verdicts live in one top-level sticky comment, so an author reading a FAIL has to hunt through the diff for the code behind it. With `inline_comments: true` the reviewer anchors each FAIL/PARTIAL finding to the line its evidence cites.
+
+- **Position map.** `src/render/inline.ts` builds a `(path, new-line) → anchorable` map from the unified diff (reviewdog's `difflines` approach): added and context lines anchor; deleted lines don't exist on the head SHA and never do.
+- **Two channels, never drop.** A finding whose evidence maps into the diff becomes an inline comment; one whose evidence sits outside the diff surfaces in an "evidence outside this diff" section of the sticky comment. Every finding lands somewhere.
+- **Idempotent reconciliation.** Each finding carries a marker id; on re-run the reviewer edits the matching comment in place and deletes stale ones, mirroring the sticky comment's byte-identical idempotency. Only its own marked comments are ever touched.
+- **Never a formal review.** Comments are posted individually via `pulls.createReviewComment`. The reviewer **never** calls `createReview` or approves a PR &mdash; the client surface has no such method, matching claude-code-action's own security boundary. Default `false`.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

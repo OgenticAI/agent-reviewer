@@ -75,6 +75,17 @@ export interface LinearIssueLite {
 // ─── Orchestrator ────────────────────────────────────────────────────────────
 
 export interface RunWritebackArgs {
+  /**
+   * Run telemetry for the metrics block (OGE-1562). Optional so existing
+   * callers and test mocks keep compiling; absent means a cache-less,
+   * tool-less run.
+   */
+  metrics?: {
+    toolCalls?: number;
+    researchQueries?: number;
+    cached?: boolean;
+    degraded?: string;
+  };
   writer: LinearWriter;
   /** Verdict produced by `runReview()`. */
   verdict: ReviewVerdict;
@@ -123,6 +134,7 @@ export async function runWriteback(args: RunWritebackArgs): Promise<WritebackPla
 
   // 1) Comment upsert ---------------------------------------------------------
   const commentBody = renderLinearComment({
+    ...(args.metrics ? { metrics: args.metrics } : {}),
     verdict: args.verdict,
     prUrl: args.pr.url,
     overall,

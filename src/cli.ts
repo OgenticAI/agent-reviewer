@@ -354,6 +354,12 @@ async function runReviewCommand(env: {
             ref: `${env.owner}/${env.repo}#${env.number}`,
           },
           ciGreen,
+          metrics: {
+            toolCalls: result.transcript.length,
+            researchQueries: result.researchTrace.queries.length,
+            cached: result.cached,
+            ...(result.degraded ? { degraded: result.degraded } : {}),
+          },
         });
         console.error(
           `[linear:comment:${plan.comment.action}] [linear:status:${plan.status.action}${

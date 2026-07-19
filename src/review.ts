@@ -33,6 +33,10 @@ import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
 import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
+import { ingestFindings } from "./findings/ingest.js";
+import type { JobFindings } from "./findings/schema.js";
+import { gateFindings, type FindingsFailLevel, type FindingsGateResult } from "./findings/gate.js";
+import type { CiLogClient } from "./tools/ci-logs.js";
 import {
   loadRepoConfig,
   matchingLearnedRules,
@@ -192,6 +196,14 @@ export interface RunReviewArgs {
    * being agreed with — those mean opposite things.
    */
   overriddenItemIds?: number[];
+  /**
+   * CI log/artifact reader for deterministic findings ingestion (OGE-1588).
+   * Reuses OGE-1557's client surface. Omitted means no ingestion — prompts
+   * stay byte-identical for repos that don't wire it.
+   */
+  findingsClient?: CiLogClient;
+  /** Severity at/above which analyzer findings fail the Check (OGE-1588). */
+  findingsFailLevel?: FindingsFailLevel;
 }
 
 export interface RunReviewResult {
@@ -223,6 +235,10 @@ export interface RunReviewResult {
    * first review of a PR, when there is nothing to compare against.
    */
   outcomes?: OutcomeSummary;
+  /** Ingested analyzer/test findings, per job (OGE-1588). */
+  findings?: JobFindings[];
+  /** The deterministic findings-gate result (OGE-1588). */
+  findingsGate?: FindingsGateResult;
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -294,6 +310,23 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Ingest structured analyzer/test output as established facts (OGE-1588).
+  // Deterministic, up front — the mechanical items ("lint passes", "no new
+  // type errors") no longer depend on the model reading a log tail well.
+  let findings: JobFindings[] | undefined;
+  if (args.findingsClient) {
+    try {
+      findings = await ingestFindings(args.findingsClient, {
+        owner: pr.owner,
+        repo: pr.repo,
+        headSha: pr.headSha,
+      });
+    } catch {
+      // Ingestion is best-effort context. A failure costs the facts, not the run.
+      findings = undefined;
+    }
+  }
+
   // Pack before prompting: an unbounded diff either overflows the window or
   // crowds out the checklist and tool results (OGE-1581).
   // Per-repo config, read from the DEFAULT BRANCH only (OGE-1585) — loaded
@@ -350,6 +383,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ci,
     skippedFiles: packed.skippedFiles,
     repoGuidance,
+    ...(findings ? { findings } : {}),
   });
   const promptHash = hashPrompt(userPrompt);
 
@@ -435,6 +469,13 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     overriddenItemIds: args.overriddenItemIds,
   });
 
+  // The findings gate is deterministic and independent of the verdict
+  // (OGE-1588): an error-level analyzer finding fails the Check whatever the
+  // model concluded, because "tsc reported 3 errors" is not the model's call.
+  const findingsGate = findings
+    ? gateFindings(findings, args.findingsFailLevel ?? "off")
+    : undefined;
+
   const body = renderStickyComment(adjudicated);
   const retryNote =
     retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
@@ -445,6 +486,8 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     puntsBefore,
     puntsAfter,
     ...(outcomes ? { outcomes } : {}),
+    ...(findings ? { findings } : {}),
+    ...(findingsGate ? { findingsGate } : {}),
     prContext: pr,
     ticket,
     cached: false,

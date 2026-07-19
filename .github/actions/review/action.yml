@@ -74,6 +74,20 @@ inputs:
       @generated are already excluded without configuration.
     required: false
     default: ""
+  findings_fail_level:
+    description: >-
+      Deterministic analyzer/test gate, independent of the LLM verdict
+      (OGE-1588). When set to 'error', 'warning', or 'info', ingested findings
+      at or above that severity fail the Check on their own — "tsc reported 3
+      errors" is not a matter of opinion the model gets to overrule. Default
+      'off': findings still reach the prompt as established facts, but never
+      gate the merge.
+
+      Ingestion PARSES analyzer output; it never EXECUTES a PR-supplied config.
+      That distinction is the whole reason it adds no attack surface — see the
+      Kudelski RCE that came through executing a PR's `.rubocop.yml`.
+    required: false
+    default: "off"
   adjudication:
     description: >-
       When 'true', every UNVERIFIABLE verdict gets one cheap second-pass call
@@ -156,6 +170,7 @@ runs:
         REVIEWER_RESEARCH: ${{ inputs.research }}
         REVIEWER_DIFF_TOKEN_BUDGET: ${{ inputs.diff_token_budget }}
         REVIEWER_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
+        REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
         REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}
         REVIEWER_ADJUDICATION_MODEL: ${{ inputs.adjudication_model }}
         PR_URL: ${{ github.event.pull_request.html_url }}
@@ -170,6 +185,9 @@ runs:
           # reduce inline, which diverged as soon as `[human]` items were
           # excluded from the roll-up (OGE-1559). Read it, don't recompute it.
           overall=$(node -e "console.log(require(process.env.VERDICT_PATH).overall)")
+          # Deterministic findings gate (OGE-1588) — independent of the verdict.
+          findings_failed=$(node -e "console.log(require(process.env.VERDICT_PATH).findingsGateFailed === true ? 'true' : 'false')")
+          echo "findings_failed=$findings_failed" >> "$GITHUB_OUTPUT"
         elif [ $rc -eq 3 ]; then
           overall="SKIPPED"
         else
@@ -186,6 +204,7 @@ runs:
       env:
         GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
         OVERALL: ${{ steps.review.outputs.overall }}
+        FINDINGS_FAILED: ${{ steps.review.outputs.findings_failed }}
         FAIL_ON: ${{ inputs.fail_on }}
         OWNER: ${{ github.repository_owner }}
         REPO: ${{ github.event.repository.name }}
@@ -208,6 +227,11 @@ runs:
             ;;
           ERROR|*) conclusion="neutral" ;;
         esac
+        # The analyzer gate is deterministic and overrules a passing verdict:
+        # an error-level finding fails the Check whatever the model concluded.
+        if [ "$FINDINGS_FAILED" = "true" ]; then
+          conclusion="failure"
+        fi
         # Title needs to be reasonably stable for branch-protection contexts to match.
         gh api -X POST "repos/$OWNER/$REPO/check-runs" \
           -f name='OgenticAI Reviewer / UAT' \

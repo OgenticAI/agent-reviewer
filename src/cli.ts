@@ -34,6 +34,7 @@ import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
+import type { AdjudicatorModel } from "./adjudicate.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { makeRepoTools } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
@@ -284,6 +285,9 @@ async function runReviewCommand(env: {
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
+      ...(process.env.REVIEWER_ADJUDICATION === "true"
+        ? { adjudicator: makeAdjudicatorModel(anthropic) }
+        : {}),
     });
 
     process.stdout.write(result.body + "\n");
@@ -358,6 +362,8 @@ async function runReviewCommand(env: {
             toolCalls: result.transcript.length,
             researchQueries: result.researchTrace.queries.length,
             cached: result.cached,
+            puntsBefore: result.puntsBefore,
+            puntsAfter: result.puntsAfter,
             ...(result.degraded ? { degraded: result.degraded } : {}),
           },
         });
@@ -678,6 +684,35 @@ function makeAnthropicModel(
         transcript: loop.transcript,
         ...(loop.degraded ? { degraded: loop.degraded } : {}),
       };
+    },
+  };
+}
+
+/**
+ * The cheap second-pass model that challenges punts (OGE-1587).
+ *
+ * Deliberately a different, smaller model than the reviewer: per-task routing
+ * is Anthropic's own norm (claude-code-action runs a Haiku classify gate over
+ * inline comments before posting), and the adjudicator's job is one narrow
+ * binary question over evidence that has already been gathered — not a second
+ * full review.
+ *
+ * No tools, low max_tokens: it must not be able to go investigating on its own
+ * and reach a conclusion the main pass never had evidence for.
+ */
+function makeAdjudicatorModel(anthropic: Anthropic): AdjudicatorModel {
+  return {
+    async adjudicate({ systemPrompt, userPrompt }) {
+      const completion = await anthropic.messages.create({
+        model: process.env.REVIEWER_ADJUDICATION_MODEL ?? "claude-haiku-4-5",
+        max_tokens: 512,
+        temperature: 0,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userPrompt }],
+      });
+      return completion.content
+        .map((block) => (block.type === "text" ? block.text : ""))
+        .join("");
     },
   };
 }

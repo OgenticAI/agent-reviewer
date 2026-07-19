@@ -27,6 +27,7 @@ import {
 import { REVIEWER_VERSION } from "./version.js";
 import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
+import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, isCacheHit } from "./cache/verdict-cache.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
@@ -49,6 +50,16 @@ export interface VerdictModelRequest {
 export interface VerdictModelOutput {
   text: string;
   trace: ResearchTrace;
+  /**
+   * Every client-side tool call the model made, in order (OGE-1552). Surfaced
+   * for operator logs; nothing branches on it yet.
+   */
+  transcript?: ToolCallRecord[];
+  /**
+   * Set when the tool loop stopped on a cap rather than because the model was
+   * finished. The verdict is still usable — degraded, not failed.
+   */
+  degraded?: string;
 }
 
 /**
@@ -65,7 +76,7 @@ export interface VerdictModel {
 }
 
 function normalizeModelOutput(out: string | VerdictModelOutput): VerdictModelOutput {
-  return typeof out === "string" ? { text: out, trace: EMPTY_TRACE } : out;
+  return typeof out === "string" ? { text: out, trace: EMPTY_TRACE, transcript: [] } : out;
 }
 
 /** Linear lookup, swappable between the GraphQL HTTP client and the MCP. */
@@ -152,6 +163,14 @@ export interface RunReviewResult {
   researchTrace: ResearchTrace;
   /** Why research was on or off, for operator-facing logs. */
   researchReason: string;
+  /** Client-side tool calls made during the run, in order (OGE-1552). */
+  transcript: ToolCallRecord[];
+  /**
+   * Set when the tool loop hit an iteration or wall-clock cap. The verdict is
+   * usable but was cut short — callers surface this rather than pretending the
+   * run completed normally.
+   */
+  degraded?: string;
 }
 
 /**
@@ -229,6 +248,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
       cached: true,
       researchTrace: EMPTY_TRACE,
       researchReason: "cache hit — prompt unchanged since the last run",
+      transcript: [],
     };
   }
 
@@ -263,6 +283,8 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     cached: false,
     researchTrace: output.trace,
     researchReason: research.reason,
+    transcript: output.transcript ?? [],
+    ...(output.degraded ? { degraded: output.degraded } : {}),
   };
 }
 

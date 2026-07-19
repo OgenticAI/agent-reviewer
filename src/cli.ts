@@ -32,6 +32,8 @@ import { isCiGreen } from "./ci-green.js";
 import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
+import { runToolLoop, type TurnFn } from "./tools/loop.js";
+import { EMPTY_REGISTRY, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -272,6 +274,14 @@ async function runReviewCommand(env: {
         `reviewer=${REVIEWER_VERSION}${result.cached ? "  ·  (cached)" : ""}`,
     );
     console.error(`[research] ${result.researchReason}`);
+    if (result.degraded) {
+      console.error(`[review:degraded] ${result.degraded}`);
+    }
+    for (const call of result.transcript) {
+      console.error(
+        `[tool] ${call.name} (${call.durationMs}ms)${call.isError ? " ERROR" : ""}: ${call.result}`,
+      );
+    }
     // Audit trail. The model composes these and Anthropic dispatches them
     // server-side, so this after-the-fact log is the only record of what
     // actually left the building — see research/policy.ts.
@@ -504,23 +514,24 @@ function makeGithubReader(octokit: Octokit): GithubReader {
 }
 
 /**
- * How many times we'll resume a `pause_turn`.
- *
- * Anthropic's server-side tool loop caps at ~10 internal iterations and then
- * returns `stop_reason: "pause_turn"`, expecting the caller to re-send to
- * continue. Without this the response is silently truncated mid-verdict — no
- * error, just a JSON parse failure or a short answer. The cap keeps a
- * misbehaving loop from billing indefinitely.
+ * Output cap. Raised from 4096 with the tool loop (OGE-1552): tool results
+ * enter the context and the model now narrates its investigation, so the old
+ * ceiling truncated verdicts mid-JSON on anything but a short checklist.
  */
-const MAX_PAUSE_CONTINUATIONS = 3;
+const MAX_OUTPUT_TOKENS = 8192;
 
-function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
+function makeAnthropicModel(
+  anthropic: Anthropic,
+  registry: ToolRegistry = EMPTY_REGISTRY,
+): VerdictModel {
   return {
     async produce({ systemPrompt, userPrompt, research }) {
-      // Only attach `tools` when research is on. An empty array would still
-      // advertise a search capability; omitting the key entirely means there
-      // is no search path at all on the majority of reviews (OGE-1566).
-      const tools: Anthropic.Messages.ToolUnion[] | undefined = research.enabled
+      // Two kinds of tool, deliberately assembled in one array:
+      //   - client-side tools from the registry, which WE execute in the loop
+      //   - Anthropic's server-side web_search, which runs on their side and
+      //     needs no loop iteration at all (OGE-1566)
+      const clientTools = toolDefinitions(registry) ?? [];
+      const serverTools: Anthropic.Messages.ToolUnion[] = research.enabled
         ? [
             {
               type: "web_search_20250305",
@@ -529,37 +540,35 @@ function makeAnthropicModel(anthropic: Anthropic): VerdictModel {
               allowed_domains: [...research.allowedDomains],
             },
           ]
-        : undefined;
+        : [];
+      const tools = [...clientTools, ...serverTools] as Anthropic.Messages.ToolUnion[];
 
-      const messages: Anthropic.MessageParam[] = [{ role: "user", content: userPrompt }];
-      const collected: unknown[] = [];
-
-      for (let attempt = 0; attempt <= MAX_PAUSE_CONTINUATIONS; attempt++) {
+      const turn: TurnFn = async (messages) => {
         const completion = await anthropic.messages.create({
           model: "claude-sonnet-4-5",
-          max_tokens: 4096,
+          max_tokens: MAX_OUTPUT_TOKENS,
           temperature: 0,
           system: systemPrompt,
-          messages,
-          ...(tools ? { tools } : {}),
+          messages: messages as Anthropic.MessageParam[],
+          // Omit the key entirely when there is nothing to offer. An empty
+          // array still advertises a tool-using posture to the model.
+          ...(tools.length > 0 ? { tools } : {}),
         });
-        collected.push(...completion.content);
+        return { content: completion.content, stopReason: completion.stop_reason };
+      };
 
-        if (completion.stop_reason !== "pause_turn") break;
+      const loop = await runToolLoop({ turn, registry, userPrompt });
 
-        // Resume: append the partial assistant turn and re-send as-is. Do NOT
-        // add a "continue" user message — the API detects the trailing
-        // server-tool block and picks up where it left off.
-        messages.push({ role: "assistant", content: completion.content });
-        if (attempt === MAX_PAUSE_CONTINUATIONS) {
-          console.error(
-            `[review] hit the pause_turn continuation cap (${MAX_PAUSE_CONTINUATIONS}); ` +
-              `verdict may be truncated`,
-          );
-        }
+      if (loop.degraded) {
+        console.error(`[review] tool loop degraded: ${loop.degraded}`);
       }
 
-      return { text: extractText(collected), trace: extractResearchTrace(collected) };
+      return {
+        text: extractText(loop.content),
+        trace: extractResearchTrace(loop.content),
+        transcript: loop.transcript,
+        ...(loop.degraded ? { degraded: loop.degraded } : {}),
+      };
     },
   };
 }

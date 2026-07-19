@@ -100,6 +100,16 @@ inputs:
       forbidden by design, matching claude-code-action's own boundary.
     required: false
     default: "false"
+  triage:
+    description: >-
+      When 'true', a cheap haiku-class pass runs before the expensive review
+      (OGE-1595), classifying each checklist item as trivial / untouched /
+      needs_tools over the checklist + changed-file list (not the full diff).
+      needs_tools items get their suggested files prioritized in the diff pack.
+      Fail-open: any triage error falls back to today's uniform behaviour, so it
+      can only make the review cheaper, never wrong. Off by default.
+    required: false
+    default: "false"
   adjudication:
     description: >-
       When 'true', every UNVERIFIABLE verdict gets one cheap second-pass call
@@ -184,6 +194,7 @@ runs:
         REVIEWER_EXCLUDE_GLOBS: ${{ inputs.exclude_globs }}
         REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
         REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
+        REVIEWER_TRIAGE: ${{ inputs.triage }}
         REVIEWER_ADJUDICATION: ${{ inputs.adjudication }}
         REVIEWER_ADJUDICATION_MODEL: ${{ inputs.adjudication_model }}
         PR_URL: ${{ github.event.pull_request.html_url }}

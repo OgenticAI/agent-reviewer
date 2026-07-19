@@ -145,6 +145,19 @@ describe("packDiff — relevance ordering", () => {
     const diff = [patchFor("src/a.ts", 2), patchFor("src/b.ts", 50)].join("\n");
     expect(packDiff(diff).includedFiles[0]).toBe("src/b.ts");
   });
+
+  it("packs a triage-flagged file first, outranking checklist-stem relevance (OGE-1595)", () => {
+    // The cheap model already decided src/plumbing.ts is where the hard item
+    // lives, so it must survive the budget even though the checklist names the
+    // other file.
+    const diff = [patchFor("src/redaction.ts", 400), patchFor("src/plumbing.ts", 5)].join("\n");
+    const result = packDiff(diff, {
+      tokenBudget: 200,
+      checklistTexts: ["`redaction` round-trips"],
+      priorityPaths: ["src/plumbing.ts"],
+    });
+    expect(result.includedFiles[0]).toBe("src/plumbing.ts");
+  });
 });
 
 describe("expandHunkStart — dynamic context (OGE-1591)", () => {

@@ -255,6 +255,13 @@ Mechanical checklist items ("lint passes", "no new type errors", "tests cover th
 - **A deterministic gate.** Set `findings_fail_level` to `error`, `warning`, or `info` and findings at or above that severity fail the Check **independent of the LLM verdict** &mdash; "tsc reported 3 errors" is not a matter of opinion the model gets to overrule. Default `off`: findings inform the prompt but never gate.
 - **Parse, never execute.** Ingestion only ever *parses* output CI already produced. It never runs an analyzer or reads a PR-supplied config &mdash; the Kudelski RCE on CodeRabbit came through executing a PR's `.rubocop.yml`, and this path has no equivalent surface.
 
+## Cheap-model triage &mdash; `triage`
+
+The expensive pass spends its 12-iteration / 5-minute tool-loop cap uniformly across easy and hard items alike &mdash; a trivially-decidable item burns the same budget as one needing deep investigation, and that's where the loop runs dry and punts. With `triage: true`, a haiku-class pre-pass over the checklist + changed-file list (not the full diff) routes each item as **trivial**, **untouched**, or **needs_tools**, and the files a needs_tools item flags are prioritized in the diff pack so they survive the token budget.
+
+- **Fail-open, always.** Any error &mdash; API failure, malformed reply, a dropped item &mdash; falls back to today's uniform "every item needs tools" behaviour. Triage can make the review cheaper; it can never make it wrong.
+- **Measurement first.** Routing is recorded in the sidecar so the eval harness can measure whether triage helps or hurts punt rate. It stays **off by default** until that measurement is in hand.
+
 ## Offline eval harness &mdash; `npm run eval`
 
 Prompt and model changes used to ship on vibes: a `REVIEWER_VERSION` bump invalidated the cache but nothing measured whether verdicts got *better*, and our history holds almost no confirmed-FAIL ground truth. The eval harness is the trust backstop.

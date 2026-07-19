@@ -138,7 +138,11 @@ describe("runToolLoop — tool execution", () => {
       userPrompt: "p",
     });
     const resultMsg = seen[1]!.at(-1) as { content: Array<{ content: string }> };
-    expect(resultMsg.content[0]!.content).toHaveLength(2000);
+    // Assert on the payload, not the total length: results are wrapped in an
+    // untrusted fence (OGE-1579), so the block is longer than the body. What
+    // matters is that the model receives all 2000 characters while the
+    // transcript keeps only its truncated copy.
+    expect(resultMsg.content[0]!.content).toContain("x".repeat(2000));
     expect(result.transcript[0]!.result).toMatch(/… \[truncated\]$/);
   });
 

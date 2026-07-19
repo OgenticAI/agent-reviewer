@@ -29,6 +29,7 @@ import type { GithubReader, VerdictModel } from "./review.js";
 import { LinearGraphqlClient } from "./linear/client.js";
 import { runWriteback } from "./linear/writeback.js";
 import { isCiGreen } from "./ci-green.js";
+import { fetchCiSummary } from "./ci/summary.js";
 import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
@@ -473,6 +474,9 @@ function makeGithubReader(octokit: Octokit): GithubReader {
         mediaType: { format: "diff" },
       });
       return resp.data as unknown as string;
+    },
+    async getCiSummary({ owner, repo, ref }) {
+      return fetchCiSummary(octokit, { owner, repo, ref });
     },
     async getIssueComment({ owner, repo, commentId }) {
       try {

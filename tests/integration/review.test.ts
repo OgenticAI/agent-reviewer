@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { runReview, ReviewSkippedError } from "../../src/review.js";
+import { parseUatChecklist } from "../../src/parser/uat.js";
 import type {
   GithubReader,
   LinearClient,
@@ -26,6 +27,8 @@ import { COMMENT_MARKER, REVIEWER_VERSION } from "../../src/version.js";
 
 const FIXTURES = join(import.meta.dirname, "..", "fixtures");
 const PR1_BODY = readFileSync(join(FIXTURES, "pr-1.md"), "utf8");
+
+const PR1_CHECKLIST_TEXTS = parseUatChecklist(PR1_BODY).items.map((i) => i.text);
 
 const FROZEN_TIME = "2026-04-27T08:30:00.000Z";
 
@@ -360,29 +363,24 @@ describe("runReview (end-to-end)", () => {
       ]);
     });
 
-    it("survives the live-observed drift pattern (the original bug)", async () => {
+    it("still repairs the live-observed drift shape when the item count matches", async () => {
       // Reproduces what the model actually returned on ogentic-shield PR #2's
-      // first run: missing id/itemText AND bare-string evidenceRefs.
+      // first run — missing id/itemText plus bare-string evidenceRefs — but
+      // with one object per checklist item. Those repairs are safe and stay.
       const json = JSON.stringify({
-        items: [
-          {
-            status: "PASS",
-            rationale:
-              "Audit emission wired into Shield.analyze() and Shield.redact() in src/ogentic_shield/audit.py.",
-            evidenceRefs: ["src/ogentic_shield/audit.py", "tests/test_audit.py"],
-          },
-          {
-            status: "PASS",
-            rationale: "AuditBackend Protocol defined; Null/Stderr/File backends shipped.",
-            evidenceRefs: ["src/ogentic_shield/audit.py:1-50"],
-          },
-        ],
+        items: PR1_CHECKLIST_TEXTS.map((_t, i) => ({
+          status: "PASS",
+          rationale: `Audit emission verified (${i + 1}).`,
+          evidenceRefs:
+            i === 0
+              ? ["src/ogentic_shield/audit.py", "tests/test_audit.py"]
+              : ["src/ogentic_shield/audit.py:1-50"],
+        })),
         summary: "Audit emission looks solid.",
       });
       const result = await runReview(buildArgs({ model: makeModel(json) }));
-      expect(result.verdict.items).toHaveLength(2);
-      expect(result.verdict.items[0]?.id).toBe(1);
-      expect(result.verdict.items[1]?.id).toBe(2);
+      expect(result.verdict.items).toHaveLength(PR1_CHECKLIST_TEXTS.length);
+      expect(result.verdict.items.map((it) => it.id)).toEqual([1, 2, 3, 4]);
       expect(result.verdict.items[0]?.evidenceRefs[0]).toEqual({
         kind: "file",
         path: "src/ogentic_shield/audit.py",
@@ -393,6 +391,56 @@ describe("runReview (end-to-end)", () => {
         start: 1,
         end: 50,
       });
+    });
+
+    it("REFUSES to positionally renumber a short item list (OGE-1593)", async () => {
+      // Behaviour change, deliberate. Previously 2 unlabelled items against a
+      // 4-item checklist were mapped to ids 1 and 2 — which silently dropped
+      // criteria 3 and 4 from the verdict table AND from overallStatus, so the
+      // gate decided on two items while the author saw a four-item checklist.
+      // Positional mapping was also only accidentally correct: nothing says the
+      // model was answering the first two.
+      //
+      // Now: re-prompted with the exact error, and if it never complies the run
+      // fails closed to a neutral Check rather than gating on a partial table.
+      const short = JSON.stringify({
+        items: [
+          { status: "PASS", rationale: "a", evidenceRefs: [] },
+          { status: "PASS", rationale: "b", evidenceRefs: [] },
+        ],
+        summary: "x",
+      });
+      await expect(runReview(buildArgs({ model: makeModel(short) }))).rejects.toThrow(
+        /Refusing to renumber by position|failed schema validation/,
+      );
+    });
+
+    it("accepts a corrected response on retry and marks the run degraded", async () => {
+      let call = 0;
+      const model: VerdictModel = {
+        produce: async () => {
+          call += 1;
+          return call === 1
+            ? JSON.stringify({
+                items: [{ status: "PASS", rationale: "a", evidenceRefs: [] }],
+                summary: "x",
+              })
+            : JSON.stringify({
+                items: PR1_CHECKLIST_TEXTS.map((_t, i) => ({
+                  id: i + 1,
+                  status: "PASS",
+                  rationale: "ok",
+                  evidenceRefs: [],
+                })),
+                summary: "x",
+              });
+        },
+      };
+      const result = await runReview(buildArgs({ model }));
+      expect(call).toBe(2);
+      expect(result.verdict.items).toHaveLength(4);
+      // A run that needed a re-prompt is reported, not passed off as clean.
+      expect(result.degraded).toMatch(/re-prompt/);
     });
 
     it("still fails closed on truly malformed output (e.g. invalid status)", async () => {

@@ -277,40 +277,44 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     };
   }
 
-  const output = normalizeModelOutput(
-    await args.model.produce({
-      systemPrompt: SYSTEM_PROMPT,
-      userPrompt,
-      research,
-    }),
-  );
-
   const now = args.now ?? (() => new Date().toISOString());
-  const verdict = parseVerdict(output.text, {
-    ticketId: primaryTicketId,
-    prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
-    headSha: pr.headSha,
-    generatedAt: now(),
-    promptHash,
-    toolOutputHash: hashToolOutputs(output.transcript ?? []),
-    checklist,
-    trace: output.trace,
-    researchEnabled: research.enabled,
-    linkedCommentUrls: linkedComments.map((lc) => lc.sourceUrl),
+  const { output, verdict: finalVerdict, retries } = await produceVerdictWithRetry({
+    model: args.model,
+    userPrompt,
+    research,
+    parse: (text, attemptOutput) =>
+      parseVerdict(text, {
+        ticketId: primaryTicketId,
+        prRef: `${pr.owner}/${pr.repo}#${pr.number}`,
+        headSha: pr.headSha,
+        generatedAt: now(),
+        promptHash,
+        // Hash and citation-filter against the attempt that actually produced
+        // this text — a retry has its own transcript and trace.
+        toolOutputHash: hashToolOutputs(attemptOutput.transcript ?? []),
+        checklist,
+        trace: attemptOutput.trace,
+        researchEnabled: research.enabled,
+        linkedCommentUrls: linkedComments.map((lc) => lc.sourceUrl),
+      }),
   });
 
-  const body = renderStickyComment(verdict);
+  const body = renderStickyComment(finalVerdict);
+  const retryNote =
+    retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
   return {
-    verdict,
+    verdict: finalVerdict,
     body,
-    overall: overallStatus(verdict),
+    overall: overallStatus(finalVerdict),
     prContext: pr,
     ticket,
     cached: false,
     researchTrace: output.trace,
     researchReason: research.reason,
     transcript: output.transcript ?? [],
-    ...(output.degraded ? { degraded: output.degraded } : {}),
+    ...(output.degraded || retryNote
+      ? { degraded: [output.degraded, retryNote].filter(Boolean).join("; ") }
+      : {}),
   };
 }
 
@@ -325,6 +329,94 @@ export class ReviewSkippedError extends Error {
     super(message);
     this.name = "ReviewSkippedError";
   }
+}
+
+/**
+ * The model's output could not be turned into a trustworthy verdict table.
+ *
+ * Distinct from a generic parse failure because the caller acts on it: it
+ * re-prompts with this exact message, which is far more effective than
+ * silently repairing (SWE-agent measured recovery dropping from 90.5% to 57.2%
+ * once a bad action is absorbed rather than corrected at the boundary).
+ */
+export class VerdictShapeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VerdictShapeError";
+  }
+}
+
+/** Validation retries. Cheap relative to a wrong merge-gating verdict. */
+const MAX_VERDICT_RETRIES = 2;
+
+/**
+ * Ask the model for a verdict, re-prompting with the exact validation error
+ * before falling back to repair heuristics (OGE-1593).
+ *
+ * The heuristics are kept — `claude-code-security-review` retains a fallback
+ * tier at production scale for good reason — but they are now the *last*
+ * resort rather than the first, and a run that needs them is marked degraded
+ * instead of passing silently.
+ *
+ * Retries do not consume tool-loop iterations: the loop's caps govern
+ * investigation, this governs output shape.
+ */
+async function produceVerdictWithRetry(args: {
+  model: VerdictModel;
+  userPrompt: string;
+  research: ResearchPolicy;
+  parse: (text: string, output: VerdictModelOutput) => ReviewVerdict;
+}): Promise<{ output: VerdictModelOutput; verdict: ReviewVerdict; retries: number }> {
+  let lastText = "";
+  let lastError = "";
+
+  for (let attempt = 0; attempt <= MAX_VERDICT_RETRIES; attempt++) {
+    const prompt =
+      attempt === 0
+        ? args.userPrompt
+        : [
+            args.userPrompt,
+            ``,
+            `## Your previous response was rejected`,
+            ``,
+            `It did not validate against the ReviewVerdict schema:`,
+            ``,
+            "```",
+            lastError,
+            "```",
+            ``,
+            `Return the corrected JSON only — same checklist, one object per item,`,
+            `each with its 1-based "id". Do not explain the correction.`,
+          ].join("\n");
+
+    const output = normalizeModelOutput(
+      await args.model.produce({ systemPrompt: SYSTEM_PROMPT, userPrompt: prompt, research: args.research }),
+    );
+    lastText = output.text;
+
+    try {
+      return { output, verdict: args.parse(output.text, output), retries: attempt };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[review] verdict validation failed (attempt ${attempt + 1}/${MAX_VERDICT_RETRIES + 1}): ${lastError}`,
+      );
+    }
+  }
+
+  // Retries exhausted. Deliberately NOT falling back to a permissive parse:
+  // the repairs that are safe (backfilling itemText from the checklist,
+  // coercing bare-string evidenceRefs) already ran inside `parse` on every
+  // attempt. The only thing a laxer pass could add is positional renumbering,
+  // which is the mis-mapping hazard this ticket exists to remove.
+  //
+  // Throwing here routes to the caller's failure-safe path — a `neutral`
+  // Check, never a `failure` — so an unparseable response blocks nothing and
+  // is visible, rather than silently gating a merge on a shifted table.
+  throw new VerdictShapeError(
+    `Model output failed schema validation after ${MAX_VERDICT_RETRIES + 1} attempts. ` +
+      `Last error: ${lastError}`,
+  );
 }
 
 /**
@@ -384,6 +476,23 @@ function parseVerdict(
   const checklistById = new Map(
     injected.checklist.items.map((it) => [it.id, it]),
   );
+
+  // Positional id backfill is only safe when the model returned exactly the
+  // checklist it was given (OGE-1593). If it dropped a mid-list item and we
+  // renumber by position, every later verdict silently lands on the WRONG
+  // checklist item — and that mis-mapped table goes straight into a
+  // merge-gating comment with no error anywhere. Refuse instead; the caller
+  // re-prompts with this message.
+  const missingIds = rawItems.some(
+    (raw) => !(raw && typeof raw === "object" && typeof (raw as Record<string, unknown>).id === "number"),
+  );
+  if (missingIds && rawItems.length !== injected.checklist.items.length) {
+    throw new VerdictShapeError(
+      `Model returned ${rawItems.length} item(s) for a ${injected.checklist.items.length}-item ` +
+        `checklist and at least one has no "id". Refusing to renumber by position — return one ` +
+        `object per checklist item, each with its 1-based "id".`,
+    );
+  }
 
   const repairedItems = rawItems.map((raw, idx) => {
     const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;

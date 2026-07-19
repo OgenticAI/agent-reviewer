@@ -36,6 +36,7 @@ import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { runToolLoop, type TurnFn } from "./tools/loop.js";
 import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
 import { makeRepoTools } from "./tools/repo.js";
+import { makeHttpTools } from "./tools/http.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -473,13 +474,21 @@ function resolveRepoRoot(): string | null {
 }
 
 function buildToolRegistry(): ToolRegistry {
+  // HTTP fetch needs no checkout — it is allowlist-scoped and always safe to
+  // offer (OGE-1556).
+  const tools = [...makeHttpTools()];
+
   const root = resolveRepoRoot();
-  if (!root) {
+  if (root) {
+    tools.push(...makeRepoTools(root));
+    console.error(`[tools] repo read access rooted at ${root}`);
+  } else {
     console.error("[tools] no repo checkout found — running without repo read access");
-    return EMPTY_REGISTRY;
   }
-  console.error(`[tools] repo read access rooted at ${root}`);
-  return makeRegistry(makeRepoTools(root));
+
+  if (tools.length === 0) return EMPTY_REGISTRY;
+  console.error(`[tools] registry: ${tools.map((t) => t.definition.name).join(", ")}`);
+  return makeRegistry(tools);
 }
 
 function makeGithubReader(octokit: Octokit): GithubReader {

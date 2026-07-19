@@ -20,6 +20,13 @@
  * `rawPuntRate` keeps the unadjusted figure, because the historical 88% was
  * measured before `[human]` existed and comparing an adjusted number against
  * it would flatter the result.
+ *
+ * CODE_VERIFIED (OGE-1580) counts as a non-punt in BOTH rates. That is a real
+ * discontinuity in the series, not a quiet improvement: a verdict that would
+ * have been UNVERIFIABLE last week is now an affirmative outcome. When
+ * comparing against the 88% baseline, read `counts.CODE_VERIFIED` alongside
+ * the rate — a drop driven entirely by reclassification is a vocabulary win,
+ * which is worth having but is not the same as verifying more.
  */
 
 import type { ReviewVerdict, VerdictStatus } from "../schema/verdict.js";
@@ -61,6 +68,7 @@ export function computeVerdictMetrics(args: {
 }): VerdictMetrics {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
+    CODE_VERIFIED: 0,
     FAIL: 0,
     PARTIAL: 0,
     UNVERIFIABLE: 0,

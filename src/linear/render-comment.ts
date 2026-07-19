@@ -36,6 +36,7 @@ const OVERALL_HEADLINE: Record<OverallStatus, string> = {
 
 const STATUS_BADGE: Record<VerdictStatus, string> = {
   PASS: "✅",
+  CODE_VERIFIED: "🟢",
   FAIL: "❌",
   PARTIAL: "🟡",
   UNVERIFIABLE: "🤔",
@@ -114,6 +115,7 @@ export function renderLinearComment(args: {
 function countByStatus(verdict: ReviewVerdict): Record<VerdictStatus, number> {
   const counts: Record<VerdictStatus, number> = {
     PASS: 0,
+    CODE_VERIFIED: 0,
     FAIL: 0,
     PARTIAL: 0,
     UNVERIFIABLE: 0,

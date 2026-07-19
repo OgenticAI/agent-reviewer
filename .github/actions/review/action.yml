@@ -31,6 +31,13 @@ inputs:
       'failure'. Default: empty — the v1 advisory mode never fails the Check.
       Bumping this is the lever that flips the reviewer from advisory to
       enforcing (see OGE-340).
+
+      Note on CODE_VERIFIED (OGE-1580): items with that verdict never gate a
+      merge. Like `[human]`-marked items they are excluded from the punt
+      roll-up — CODE_VERIFIED means the code demonstrably delivers the item and
+      only runtime validation is outstanding, so it rolls up as
+      PASS_WITH_PARTIALS rather than HUMAN_REVIEW. A checklist of nothing but
+      CODE_VERIFIED items is deliberately NOT reported as a clean PASS.
     required: false
     default: ""
   research:

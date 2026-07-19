@@ -18,6 +18,7 @@ import { overallStatus, type OverallStatus } from "../schema/verdict.js";
 
 const STATUS_BADGE: Record<VerdictStatus, string> = {
   PASS: "✅ PASS",
+  CODE_VERIFIED: "🟢 CODE VERIFIED",
   FAIL: "❌ FAIL",
   PARTIAL: "🟡 PARTIAL",
   UNVERIFIABLE: "🤔 UNVERIFIABLE",

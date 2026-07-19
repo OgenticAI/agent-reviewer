@@ -31,6 +31,7 @@ import type { ToolCallRecord } from "./tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
+import { packDiff, type PackDiffOptions } from "./prompt/diff-pack.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -155,6 +156,11 @@ export interface RunReviewArgs {
    * change behaviour for callers that have not opted in.
    */
   adjudicator?: AdjudicatorModel;
+  /**
+   * Diff packing controls (OGE-1581 / OGE-1591). Omitted uses the defaults;
+   * `readFile` enables function-boundary hunk expansion.
+   */
+  diffPack?: PackDiffOptions;
 }
 
 export interface RunReviewResult {
@@ -252,14 +258,28 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     }
   }
 
+  // Pack before prompting: an unbounded diff either overflows the window or
+  // crowds out the checklist and tool results (OGE-1581).
+  const packed = packDiff(diff, {
+    ...args.diffPack,
+    checklistTexts: checklist.items.map((it) => it.text),
+  });
+  if (packed.truncated) {
+    console.error(
+      `[diff] packed ${packed.includedFiles.length} file(s); skipped ${packed.skippedFiles.length}` +
+        ` (${packed.skippedFiles.map((s) => s.reason).join(", ")})`,
+    );
+  }
+
   const userPrompt = buildReviewPrompt({
     pr,
     ticket,
     checklist,
-    diff,
+    diff: packed.text,
     linkedComments,
     research,
     ci,
+    skippedFiles: packed.skippedFiles,
   });
   const promptHash = hashPrompt(userPrompt);
 

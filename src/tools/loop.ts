@@ -69,8 +69,56 @@ export const DEFAULT_MAX_WALL_CLOCK_MS = 5 * 60_000;
 /** Transcript entries are for humans debugging a run, not for replay. */
 const TRANSCRIPT_RESULT_MAX_CHARS = 500;
 
+/**
+ * How many recent observations stay in full (OGE-1583).
+ *
+ * SWE-agent ablated this directly: keeping the full history scored 15.0% vs
+ * 18.0% with older observations collapsed. Carrying every tool result across
+ * all 12 iterations means one big early read crowds out the evidence gathered
+ * later — and a crowded context late in the loop is exactly where hedged punts
+ * come from. OpenHands ships the same idea as its default condenser.
+ *
+ * The model's own reasoning and tool CALLS are never collapsed; only the bulky
+ * results it has already read.
+ */
+const KEEP_FULL_OBSERVATIONS = 5;
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** A user message carrying tool_result blocks. */
+function isObservationMessage(m: LoopMessage): boolean {
+  return (
+    m.role === "user" &&
+    Array.isArray(m.content) &&
+    (m.content as unknown[]).some((b) => isRecord(b) && b.type === "tool_result")
+  );
+}
+
+/**
+ * Replace all but the most recent observations with one-line placeholders.
+ *
+ * Mutates in place because `messages` is the live conversation. The tool_use_id
+ * is preserved — dropping it would orphan the model's tool call and invalidate
+ * the request.
+ */
+function collapseOldObservations(messages: LoopMessage[]): void {
+  const idxs = messages.flatMap((m, i) => (isObservationMessage(m) ? [i] : []));
+  for (const i of idxs.slice(0, Math.max(0, idxs.length - KEEP_FULL_OBSERVATIONS))) {
+    const message = messages[i]!;
+    const blocks = message.content as Array<Record<string, unknown>>;
+    message.content = blocks.map((b) => {
+      if (!isRecord(b) || b.type !== "tool_result") return b;
+      if (typeof b.content !== "string") return b;
+      if (b.content.startsWith("[earlier observation")) return b; // already collapsed
+      const chars = b.content.length;
+      return {
+        ...b,
+        content: `[earlier observation omitted — ${chars} chars; call the tool again if you need it]`,
+      };
+    });
+  }
 }
 
 interface ToolUseBlock {
@@ -178,6 +226,7 @@ export async function runToolLoop(args: {
       }),
     );
     messages.push({ role: "user", content: results });
+    collapseOldObservations(messages);
 
     if (now() - startedAt > maxWallClockMs) {
       degraded = `wall-clock cap of ${maxWallClockMs}ms reached after ${iterations} iteration(s)`;

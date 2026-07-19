@@ -27,6 +27,7 @@ import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
 import { renderCiSection, type CiSummary } from "../ci/summary.js";
 import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../tools/sanitize.js";
+import type { SkippedFile } from "./diff-pack.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -83,6 +84,11 @@ export interface BuildPromptArgs {
    * the prompt byte-identical to v2 for callers that don't supply it.
    */
   ci?: CiSummary;
+  /**
+   * Files the packer left out of `diff` (OGE-1581). Rendered so the model can
+   * fetch them or punt with a concrete reason — never silently missed.
+   */
+  skippedFiles?: SkippedFile[];
 }
 
 const DISABLED_RESEARCH: ResearchPolicy = {
@@ -207,6 +213,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     // would corrupt the code under review. The fence plus the standing rule is
     // the mitigation here.
     fenceUntrusted(["```diff", diff, "```"].join("\n"), { source: "pr-diff" }),
+    ...renderSkippedFiles(args.skippedFiles),
     ``,
     `## Your task`,
     ``,
@@ -328,6 +335,32 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
  * contract. Order is preserved from `linkedComments` (orchestrator preserves
  * checklist order).
  */
+/**
+ * Name what the packer dropped.
+ *
+ * A file the model is told about produces a targeted read or an honest punt.
+ * A file it is NOT told about produces a confident PASS on a change it never
+ * saw — which is the failure this section exists to prevent.
+ */
+function renderSkippedFiles(skipped: SkippedFile[] | undefined): string[] {
+  if (!skipped || skipped.length === 0) return [];
+  const byReason = {
+    "token-budget": "too large to inline — use read_file if an item depends on it",
+    generated: "machine-generated — excluded deliberately",
+    excluded: "excluded by repo config",
+  } as const;
+  const lines = [`## Files not shown in the diff above`, ``];
+  for (const s of skipped) {
+    lines.push(`- \`${s.path}\` — ${byReason[s.reason]}`);
+  }
+  lines.push(``);
+  lines.push(
+    `If a checklist item depends on one of these, read it or say so — do not`,
+  );
+  lines.push(`assume an unshown file is unchanged.`);
+  return [lines.join("\n"), ``];
+}
+
 function renderLinkedCommentsSection(
   linkedComments: LinkedComment[] | undefined,
 ): string | null {

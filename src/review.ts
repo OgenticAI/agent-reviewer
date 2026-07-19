@@ -38,6 +38,13 @@ import type { JobFindings } from "./findings/schema.js";
 import { gateFindings, type FindingsFailLevel, type FindingsGateResult } from "./findings/gate.js";
 import type { CiLogClient } from "./tools/ci-logs.js";
 import {
+  buildPositionMap,
+  renderFallbackSection,
+  renderInlineFindingBody,
+  splitFindings,
+  type InlineComment,
+} from "./render/inline.js";
+import {
   loadRepoConfig,
   matchingLearnedRules,
   matchingPathInstructions,
@@ -204,6 +211,12 @@ export interface RunReviewArgs {
   findingsClient?: CiLogClient;
   /** Severity at/above which analyzer findings fail the Check (OGE-1588). */
   findingsFailLevel?: FindingsFailLevel;
+  /**
+   * Anchor FAIL/PARTIAL evidence as inline review comments (OGE-1586). Default
+   * off — when off, the sticky body stays byte-identical and no inline comments
+   * are produced.
+   */
+  inlineCommentsEnabled?: boolean;
 }
 
 export interface RunReviewResult {
@@ -239,6 +252,8 @@ export interface RunReviewResult {
   findings?: JobFindings[];
   /** The deterministic findings-gate result (OGE-1588). */
   findingsGate?: FindingsGateResult;
+  /** Inline review comments to post (OGE-1586), when inline mode is on. */
+  inlineComments?: InlineComment[];
   /** Client-side tool calls made during the run, in order (OGE-1552). */
   transcript: ToolCallRecord[];
   /**
@@ -476,7 +491,17 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ? gateFindings(findings, args.findingsFailLevel ?? "off")
     : undefined;
 
-  const body = renderStickyComment(adjudicated);
+  // Anchor FAIL/PARTIAL evidence inline, routing the rest to the sticky
+  // fallback (OGE-1586). Off by default keeps the body byte-identical.
+  let inlineComments: InlineComment[] | undefined;
+  let fallbackSection: string | null | undefined;
+  if (args.inlineCommentsEnabled) {
+    const split = splitFindings(adjudicated.items, buildPositionMap(diff), renderInlineFindingBody);
+    inlineComments = split.inline;
+    fallbackSection = renderFallbackSection(split.unanchored);
+  }
+
+  const body = renderStickyComment(adjudicated, fallbackSection);
   const retryNote =
     retries > 0 ? `verdict JSON required ${retries} re-prompt(s) before validating` : undefined;
   return {
@@ -488,6 +513,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     ...(outcomes ? { outcomes } : {}),
     ...(findings ? { findings } : {}),
     ...(findingsGate ? { findingsGate } : {}),
+    ...(inlineComments ? { inlineComments } : {}),
     prContext: pr,
     ticket,
     cached: false,

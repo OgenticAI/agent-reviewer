@@ -42,6 +42,7 @@ import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
 import { parseFailLevel } from "./findings/gate.js";
+import { reconcileInlineComments, type InlineCommentClient } from "./github/inline-comments.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -290,6 +291,7 @@ async function runReviewCommand(env: {
       // client. The gate is off unless the repo opts in.
       findingsClient: makeCiLogClient(octokit),
       findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
+      inlineCommentsEnabled: process.env.REVIEWER_INLINE_COMMENTS === "true",
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
@@ -399,6 +401,22 @@ async function runReviewCommand(env: {
         body: result.body,
       });
       console.error(`[github:${upsert.action}] ${upsert.url}`);
+
+      // Anchor findings inline (OGE-1586). Never a formal review — the client
+      // surface has no createReview method to call.
+      if (result.inlineComments && result.inlineComments.length > 0) {
+        const rec = await reconcileInlineComments({
+          client: makeInlineCommentClient(octokit),
+          owner: env.owner,
+          repo: env.repo,
+          pullNumber: env.number,
+          commitId: result.prContext.headSha,
+          desired: result.inlineComments,
+        });
+        console.error(
+          `[github:inline] created=${rec.created} updated=${rec.updated} deleted=${rec.deleted}`,
+        );
+      }
 
       if (env.args.linearWriteback) {
         const meta = await linear.getIssueMeta(result.verdict.ticketId);
@@ -660,6 +678,45 @@ function makeRefFileReader(
         // 404 is the common case (repo has no config) and is not an error.
         return null;
       }
+    },
+  };
+}
+
+/**
+ * Octokit-backed inline comment client (OGE-1586).
+ *
+ * Exposes only comment create/update/delete/list. It has no `createReview` and
+ * no approve path — the reviewer physically cannot submit a formal GitHub
+ * review, matching claude-code-action's own security boundary.
+ */
+function makeInlineCommentClient(octokit: Octokit): InlineCommentClient {
+  return {
+    async listReviewComments({ owner, repo, pullNumber }) {
+      const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: 100,
+      });
+      return comments.map((c) => ({ id: c.id, body: c.body ?? "" }));
+    },
+    async createReviewComment({ owner, repo, pullNumber, commitId, path, line, body }) {
+      const resp = await octokit.pulls.createReviewComment({
+        owner,
+        repo,
+        pull_number: pullNumber,
+        commit_id: commitId,
+        path,
+        line,
+        body,
+      });
+      return { id: resp.data.id };
+    },
+    async updateReviewComment({ owner, repo, commentId, body }) {
+      await octokit.pulls.updateReviewComment({ owner, repo, comment_id: commentId, body });
+    },
+    async deleteReviewComment({ owner, repo, commentId }) {
+      await octokit.pulls.deleteReviewComment({ owner, repo, comment_id: commentId });
     },
   };
 }

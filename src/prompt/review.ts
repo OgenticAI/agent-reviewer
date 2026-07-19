@@ -26,6 +26,7 @@ import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
 import { renderCiSection, type CiSummary } from "../ci/summary.js";
+import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../tools/sanitize.js";
 
 /**
  * A PR comment fetched by the orchestrator and attached to the prompt as
@@ -169,7 +170,12 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     : "(No `## UAT checklist` block found in the PR description.)";
 
   const linkedCommentsSection = renderLinkedCommentsSection(linkedComments);
-  const ciSection = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
+  // CI job names and statuses come from workflow files in the PR — a job can
+  // be named to look like an instruction. Fenced like everything else.
+  const rawCi = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
+  const ciSection = rawCi
+    ? fenceUntrusted(sanitizeUntrusted(rawCi), { source: "ci-status" })
+    : null;
 
   return [
     `# Review request`,
@@ -181,21 +187,30 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     ``,
     `## Linear ticket description`,
     ``,
-    ticket.description.trim() || "_(empty)_",
+    fenceUntrusted(sanitizeUntrusted(ticket.description.trim() || "_(empty)_"), {
+      source: "linear-ticket",
+    }),
     ``,
     `## UAT checklist (from PR description)`,
     ``,
-    checklistBlock,
+    // Checklist text is PR-authored prose, so it is both sanitized (hidden
+    // instructions stripped) and fenced.
+    fenceUntrusted(sanitizeUntrusted(checklistBlock), { source: "uat-checklist" }),
     ``,
     ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,
     ``,
-    "```diff",
-    diff,
-    "```",
+    // The diff is written by whoever opened the PR and their merge depends on
+    // this verdict — it is the single most attacker-influenced input we have
+    // (OGE-1579). Fenced, not sanitized: stripping HTML comments out of a diff
+    // would corrupt the code under review. The fence plus the standing rule is
+    // the mitigation here.
+    fenceUntrusted(["```diff", diff, "```"].join("\n"), { source: "pr-diff" }),
     ``,
     `## Your task`,
+    ``,
+    UNTRUSTED_CONTENT_RULE,
     ``,
     `For each numbered UAT item above, decide whether the diff (in the context of`,
     `the existing repo) delivers it. Produce a JSON object exactly matching the`,
@@ -301,9 +316,12 @@ function renderLinkedCommentsSection(
     return [
       `Item ${lc.itemId} → comment by @${lc.author} (${lc.createdAt}) — ${lc.sourceUrl}`,
       ``,
-      "```",
-      `${lc.body}${truncatedNote}`,
-      "```",
+      // A verification comment is written by the PR author to argue their own
+      // item should pass — squarely adversarial input (OGE-1579).
+      fenceUntrusted(sanitizeUntrusted(`${lc.body}${truncatedNote}`), {
+        source: "pr-comment",
+        attrs: { item: String(lc.itemId), author: lc.author },
+      }),
     ].join("\n");
   });
   return [

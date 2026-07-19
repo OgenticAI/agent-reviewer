@@ -28,7 +28,7 @@ import { REVIEWER_VERSION } from "./version.js";
 import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
 import type { ToolCallRecord } from "./tools/loop.js";
-import { hashPrompt, isCacheHit } from "./cache/verdict-cache.js";
+import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
@@ -292,6 +292,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     headSha: pr.headSha,
     generatedAt: now(),
     promptHash,
+    toolOutputHash: hashToolOutputs(output.transcript ?? []),
     checklist,
     trace: output.trace,
     researchEnabled: research.enabled,
@@ -352,6 +353,7 @@ function parseVerdict(
     headSha: string;
     generatedAt: string;
     promptHash: string;
+    toolOutputHash: string;
     checklist: { items: Array<{ id: number; text: string; human?: boolean }> };
     trace: ResearchTrace;
     researchEnabled: boolean;
@@ -418,6 +420,7 @@ function parseVerdict(
     headSha: injected.headSha,
     generatedAt: injected.generatedAt,
     promptHash: injected.promptHash,
+    toolOutputHash: injected.toolOutputHash,
   };
   return ReviewVerdict.parse(candidate);
 }

@@ -26,6 +26,8 @@ import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
 import { renderCiSection, type CiSummary } from "../ci/summary.js";
+import { renderFindingsSection } from "../findings/render.js";
+import type { JobFindings } from "../findings/schema.js";
 import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../tools/sanitize.js";
 import type { SkippedFile } from "./diff-pack.js";
 
@@ -95,6 +97,12 @@ export interface BuildPromptArgs {
    * Omitted keeps the prompt byte-identical for repos with no config.
    */
   repoGuidance?: RepoGuidance;
+  /**
+   * Analyzer/test findings ingested from CI (OGE-1588), rendered as an
+   * established-facts section the model must not re-derive. Omitted keeps the
+   * prompt byte-identical for repos with no recognized CI output.
+   */
+  findings?: JobFindings[];
 }
 
 /** Per-repo guidance, already filtered to what this PR actually triggers. */
@@ -199,6 +207,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
   const linkedCommentsSection = renderLinkedCommentsSection(linkedComments);
   // CI job names and statuses come from workflow files in the PR — a job can
   // be named to look like an instruction. Fenced like everything else.
+  const findingsSection = args.findings ? renderFindingsSection(args.findings) : null;
   const rawCi = args.ci ? renderCiSection(args.ci, pr.headSha) : null;
   const ciSection = rawCi
     ? fenceUntrusted(sanitizeUntrusted(rawCi), { source: "ci-status" })
@@ -225,6 +234,7 @@ export function buildReviewPrompt(args: BuildPromptArgs): string {
     fenceUntrusted(sanitizeUntrusted(checklistBlock), { source: "uat-checklist" }),
     ``,
     ...renderRepoGuidance(args.repoGuidance),
+    ...(findingsSection ? [findingsSection, ``] : []),
     ...(ciSection ? [ciSection, ``] : []),
     ...(linkedCommentsSection ? [linkedCommentsSection, ``] : []),
     `## Diff to review`,

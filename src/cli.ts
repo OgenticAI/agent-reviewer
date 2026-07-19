@@ -41,6 +41,7 @@ import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from
 import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
 import { makeHttpTools } from "./tools/http.js";
 import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
+import { parseFailLevel } from "./findings/gate.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
@@ -285,6 +286,10 @@ async function runReviewCommand(env: {
       github: makeGithubReader(octokit),
       linear,
       configReader: makeRefFileReader(octokit, { owner: env.owner, repo: env.repo }),
+      // Deterministic analyzer/test ingestion (OGE-1588), reusing the CI log
+      // client. The gate is off unless the repo opts in.
+      findingsClient: makeCiLogClient(octokit),
+      findingsFailLevel: parseFailLevel(process.env.REVIEWER_FINDINGS_FAIL_LEVEL),
       model: makeAnthropicModel(anthropic, registry),
       researchEnabled: process.env.REVIEWER_RESEARCH === "true",
       cachedVerdict,
@@ -348,7 +353,24 @@ async function runReviewCommand(env: {
       // being excluded from the roll-up (OGE-1559) — one source of truth now.
       writeFileSync(
         env.args.outputJson,
-        JSON.stringify({ ...result.verdict, overall: result.overall }, null, 2),
+        JSON.stringify(
+          {
+            ...result.verdict,
+            overall: result.overall,
+            // Deterministic findings gate (OGE-1588): the Action reads
+            // `findingsGateFailed` to flip the Check to failure independent of
+            // the verdict, so an error-level analyzer finding blocks merge on
+            // its own.
+            ...(result.findingsGate
+              ? {
+                  findingsGateFailed: result.findingsGate.failed,
+                  findingsGateReason: result.findingsGate.reason,
+                }
+              : {}),
+          },
+          null,
+          2,
+        ),
         "utf8",
       );
     }

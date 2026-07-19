@@ -197,3 +197,60 @@ describe("overallStatus — [human]-marked items", () => {
     expect(overallStatus(verdict([{ status: "FAIL" }]))).toBe("NEEDS_WORK");
   });
 });
+
+describe("CODE_VERIFIED in the roll-up (OGE-1580)", () => {
+  function v(items: Array<{ status: VerdictStatus; human?: boolean }>): ReviewVerdict {
+    return ReviewVerdict.parse({
+      schemaVersion: 1,
+      reviewerVersion: "v4",
+      ticketId: "OGE-1",
+      prRef: "x/y#1",
+      headSha: "abc1234",
+      items: items.map((it, i) => ({
+        id: i + 1,
+        itemText: `item ${i + 1}`,
+        status: it.status,
+        rationale: "r",
+        evidenceRefs: [],
+        ...(it.human === undefined ? {} : { human: it.human }),
+      })),
+      summary: "s",
+      generatedAt: "2026-04-27T08:30:00.000Z",
+    });
+  }
+
+  it("never yields HUMAN_REVIEW — it is an affirmative outcome", () => {
+    expect(overallStatus(v([{ status: "PASS" }, { status: "CODE_VERIFIED" }]))).not.toBe(
+      "HUMAN_REVIEW",
+    );
+  });
+
+  it("rolls up alongside PARTIAL rather than as a clean PASS", () => {
+    // Reporting a checklist of CODE_VERIFIED items as PASS would overclaim:
+    // runtime validation is still outstanding by definition.
+    expect(overallStatus(v([{ status: "CODE_VERIFIED" }]))).toBe("PASS_WITH_PARTIALS");
+  });
+
+  it("does not mask a real FAIL", () => {
+    expect(overallStatus(v([{ status: "CODE_VERIFIED" }, { status: "FAIL" }]))).toBe("NEEDS_WORK");
+  });
+
+  it("accepts confidence and evidence on an item", () => {
+    const parsed = ItemVerdict.parse({
+      id: 1,
+      itemText: "x",
+      status: "CODE_VERIFIED",
+      rationale: "ok",
+      confidence: 0.82,
+      evidence: ["read src/foo.ts:40-58"],
+    });
+    expect(parsed.confidence).toBe(0.82);
+    expect(parsed.evidence).toEqual(["read src/foo.ts:40-58"]);
+  });
+
+  it("rejects a confidence outside 0..1", () => {
+    expect(() =>
+      ItemVerdict.parse({ id: 1, itemText: "x", status: "PASS", rationale: "r", confidence: 1.5 }),
+    ).toThrow();
+  });
+});

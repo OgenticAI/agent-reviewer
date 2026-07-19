@@ -19,7 +19,27 @@
 
 import { z } from "zod";
 
-export const VerdictStatus = z.enum(["PASS", "FAIL", "PARTIAL", "UNVERIFIABLE"]);
+/**
+ * Per-item outcomes.
+ *
+ * `CODE_VERIFIED` exists because UNVERIFIABLE was doing two incompatible jobs
+ * (OGE-1580). "No evidence either way" and "the code plainly does this; only
+ * running it would prove the rest" are not the same answer, and collapsing
+ * them made honest, well-evidenced reviews indistinguishable from blind
+ * punts — which is a large slice of the 88% baseline.
+ *
+ * Qodo Merge reached the same conclusion independently: their ticket-
+ * compliance taxonomy carries "PR Code Verified" as an affirmative outcome
+ * meaning code meets requirements, manual testing still advisable. It is a
+ * *result*, not a shrug, and it does not gate a merge.
+ */
+export const VerdictStatus = z.enum([
+  "PASS",
+  "CODE_VERIFIED",
+  "FAIL",
+  "PARTIAL",
+  "UNVERIFIABLE",
+]);
 export type VerdictStatus = z.infer<typeof VerdictStatus>;
 
 /**
@@ -88,8 +108,39 @@ export const ItemVerdict = z.object({
    * and older sidecar payloads valid. Read as `=== true` everywhere.
    */
   human: z.boolean().optional(),
+  /**
+   * How sure the model is, 0–1 (OGE-1580).
+   *
+   * Load-bearing rather than decorative: the prompt's rubric says a punt above
+   * the confidence floor is illegitimate, so this is the field that makes
+   * "don't punt when you actually know" checkable. It is also the guard
+   * against the failure mode this whole batch risks — a falling punt rate that
+   * means bolder guessing rather than better verification. Without a
+   * confidence trail you cannot tell those apart after the fact.
+   */
+  confidence: z.number().min(0).max(1).optional(),
+  /**
+   * What the model actually looked at, in its own words — "read src/foo.ts:40-58",
+   * "CI job `test` reported success". Distinct from `evidenceRefs`, which is
+   * structured pointers for rendering; this is the observation trail behind
+   * the verdict, and for UNVERIFIABLE items it must name the missing capability.
+   */
+  evidence: z.array(z.string()).optional(),
 });
 export type ItemVerdict = z.infer<typeof ItemVerdict>;
+
+/**
+ * Statuses that do NOT represent a punt to a human.
+ *
+ * Single source of truth — `overallStatus`, the metrics, and the renderers all
+ * read this rather than each re-deciding what counts. Adding a verdict class
+ * later means changing one set.
+ */
+export const NON_PUNT_STATUSES: ReadonlySet<VerdictStatus> = new Set([
+  "PASS",
+  "CODE_VERIFIED",
+  "PARTIAL",
+]);
 
 /** The whole-PR verdict envelope produced by the agent on each run. */
 export const ReviewVerdict = z.object({
@@ -178,7 +229,13 @@ export function overallStatus(verdict: ReviewVerdict): OverallStatus {
 
   const verifiableStatuses = verifiable.map((it) => it.status);
   if (verifiableStatuses.includes("UNVERIFIABLE")) return "HUMAN_REVIEW";
-  if (verifiableStatuses.includes("PARTIAL")) return "PASS_WITH_PARTIALS";
+  // CODE_VERIFIED rolls up alongside PARTIAL rather than PASS: both mean
+  // "nothing is wrong here, and a person may still want to look". Reporting a
+  // checklist of CODE_VERIFIED items as a clean PASS would overclaim — the
+  // whole point of the verdict is that runtime validation is still outstanding.
+  if (verifiableStatuses.includes("PARTIAL") || verifiableStatuses.includes("CODE_VERIFIED")) {
+    return "PASS_WITH_PARTIALS";
+  }
   return "PASS";
 }
 

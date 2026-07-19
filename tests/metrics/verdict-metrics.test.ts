@@ -49,7 +49,7 @@ function metrics(items: Array<{ status: VerdictStatus; human?: boolean }>) {
 describe("computeVerdictMetrics", () => {
   it("counts each status", () => {
     const m = metrics([{ status: "PASS" }, { status: "FAIL" }, { status: "UNVERIFIABLE" }]);
-    expect(m.counts).toEqual({ PASS: 1, FAIL: 1, PARTIAL: 0, UNVERIFIABLE: 1 });
+    expect(m.counts).toEqual({ PASS: 1, CODE_VERIFIED: 0, FAIL: 1, PARTIAL: 0, UNVERIFIABLE: 1 });
     expect(m.totalItems).toBe(3);
   });
 
@@ -135,5 +135,23 @@ describe("metrics block round-trip", () => {
 
   it("returns null on a malformed block rather than throwing", () => {
     expect(parseMetricsBlock("<!-- ogenticai-reviewer-metrics {not json} -->")).toBeNull();
+  });
+});
+
+describe("CODE_VERIFIED counts as a non-punt (OGE-1580)", () => {
+  it("does not count toward either punt rate", () => {
+    // The verdict exists precisely to stop "code is right, running it would
+    // need a human" being recorded as a failure to verify.
+    const m = metrics([{ status: "PASS" }, { status: "CODE_VERIFIED" }]);
+    expect(m.puntRate).toBe(0);
+    expect(m.rawPuntRate).toBe(0);
+  });
+
+  it("is visible in the counts so a reclassification-driven drop is auditable", () => {
+    // A punt rate that falls purely because verdicts were renamed is a
+    // vocabulary win, not a verification win — the counts make that legible.
+    const m = metrics([{ status: "CODE_VERIFIED" }, { status: "UNVERIFIABLE" }]);
+    expect(m.counts.CODE_VERIFIED).toBe(1);
+    expect(m.puntRate).toBe(0.5);
   });
 });

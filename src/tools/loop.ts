@@ -24,6 +24,7 @@
  */
 
 import type { ToolRegistry } from "./registry.js";
+import { collectKnownSecrets, fenceUntrusted, scrubObservation } from "./sanitize.js";
 
 /** Structural stand-in for an Anthropic message param. */
 export interface LoopMessage {
@@ -109,6 +110,9 @@ export async function runToolLoop(args: {
   const now = args.now ?? (() => Date.now());
 
   const startedAt = now();
+  // Resolved once: reading process.env per observation would be wasteful and
+  // would let a mid-run env change produce inconsistent masking.
+  const knownSecrets = collectKnownSecrets();
   const messages: LoopMessage[] = [{ role: "user", content: args.userPrompt }];
   const collected: unknown[] = [];
   const transcript: ToolCallRecord[] = [];
@@ -156,7 +160,7 @@ export async function runToolLoop(args: {
     // calls, which is a slow, hard-to-spot degradation.
     const results = await Promise.all(
       toolUses.map(async (use) => {
-        const { record, content } = await executeTool(args.registry, use, now);
+        const { record, content } = await executeTool(args.registry, use, now, knownSecrets);
         transcript.push(record);
         return {
           type: "tool_result",
@@ -164,7 +168,11 @@ export async function runToolLoop(args: {
           // The model gets the FULL result; only the transcript is truncated.
           // Feeding back the shortened copy would quietly degrade every tool
           // whose output runs long, in a way that looks like a model problem.
-          content,
+          //
+          // Fenced because every tool output is attacker-influenced: a CI log
+          // line or fetched page can address the model directly (OGE-1579).
+          // The fence is inert without the standing rule in the prompt.
+          content: fenceUntrusted(content, { source: use.name }),
           ...(record.isError ? { is_error: true } : {}),
         };
       }),
@@ -192,20 +200,27 @@ async function executeTool(
   registry: ToolRegistry,
   use: ToolUseBlock,
   now: () => number,
+  knownSecrets: string[],
 ): Promise<{ record: ToolCallRecord; content: string }> {
   const startedAt = now();
   const tool = registry.get(use.name);
 
-  const finish = (content: string, isError: boolean) => ({
-    record: {
-      name: use.name,
-      input: use.input,
-      result: truncate(content),
-      isError,
-      durationMs: now() - startedAt,
-    },
-    content,
-  });
+  // Scrub BEFORE anything downstream sees it: the model, the transcript, the
+  // operator log, and — critically — the cache hash computed from the
+  // transcript, which must never embed a secret value (OGE-1579).
+  const finish = (raw: string, isError: boolean) => {
+    const content = scrubObservation(raw, knownSecrets);
+    return {
+      record: {
+        name: use.name,
+        input: use.input,
+        result: truncate(content),
+        isError,
+        durationMs: now() - startedAt,
+      },
+      content,
+    };
+  };
 
   if (!tool) {
     // The model asked for something we never advertised. Tell it plainly so it

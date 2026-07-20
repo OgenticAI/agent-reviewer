@@ -10,13 +10,21 @@
 # notice) on every PR landing here BEFORE the App goes live, and starts
 # producing real verdicts AFTER the App + secrets land.
 #
-# Pinning: this workflow uses `OgenticAI/agent-reviewer@v1` — the same
-# reference shape consumers use, not `./.github/actions/review`. The
-# tradeoff: changes to the action's code in a PR aren't tested by this
-# workflow. They ARE tested by `ci.yml` (typecheck + 118 vitest cases),
-# so the layered safety is: ci.yml proves the code; self-review.yml
-# proves the deployed shape consumers see. To preview a yet-to-be-tagged
-# change end-to-end, force-move the v1 tag locally and trigger by hand.
+# Pinning: this workflow deliberately uses `./.github/actions/review` — the
+# LOCAL action, not a version tag (OGE-1666). Consumers should still crib the
+# tag-pinned shape from docs/INSTALL.md; this repo is the exception on purpose.
+#
+# It used to pin a released tag, which meant self-review only ever proved the
+# TAG worked and never exercised the action on the branch under review. The
+# cost showed up when shipping Reviewer v2: the whole stack reached main —
+# green tests, green typecheck, green eval — having never run once as a real
+# Action, because ci.yml exercises runReview() against mocks and nothing
+# exercised the composite action's actual entry path. The first real execution
+# would have been 22 downstream repos when the v2 tag moved.
+#
+# The old header suggested "force-move the tag locally and trigger by hand" as
+# the workaround. That is exactly the manual step nobody performs under time
+# pressure. Pointing at the working tree makes every PR its own canary.
 
 name: OgenticAI Reviewer
 

@@ -65,7 +65,13 @@ jobs:
         uses: actions/checkout@v5
 
       - if: steps.cfg.outputs.configured == 'true'
-        uses: OgenticAI/agent-reviewer/.github/actions/review@v2
+        # Deliberately the LOCAL action, not @v2 (OGE follow-up).
+        # Self-review pinned to the released tag proved only that the tag
+        # worked — it never exercised the code on this branch. That let the
+        # whole Reviewer v2 stack reach main having never run as an Action,
+        # so the first real execution would have been 22 downstream repos.
+        # Pointing at the working tree makes every PR its own canary.
+        uses: ./.github/actions/review
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}

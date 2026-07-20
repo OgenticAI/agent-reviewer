@@ -1,0 +1,56 @@
+name: Release drift
+
+# Fails when `main` runs too far ahead of the tag consumers actually pin
+# (OGE-1667).
+#
+# OGE-1653 named this the real defect: `main` sat 26 commits and 2.5 months
+# ahead of `v2`, 26 tickets read Done, and none of that code ran anywhere.
+# Nothing surfaced it — it was found by accident. This is the thing that makes
+# not-releasing loud.
+#
+# Measured against the FLOATING major (`v2`), not the newest semver tag:
+# `v2.1.0` existed and pointed at main the whole time `v2` pointed at May, so a
+# check comparing against "the latest tag" would have reported all-clear while
+# every consumer ran three-month-old code.
+
+on:
+  schedule:
+    # Daily. Drift is a slow leak — it needs a clock, not just a push, or a
+    # quiet week produces no signal at all.
+    - cron: "0 9 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Floating tag consumers pin"
+        required: false
+        default: "v2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drift-check
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: main vs the released tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history AND tags. A shallow clone reports zero commits ahead,
+          # which would turn this check into a permanent green light — the
+          # script guards against it explicitly rather than trusting this.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: Check drift
+        run: npx tsx scripts/check-drift.ts --tag "${{ inputs.tag || 'v2' }}"

@@ -1,0 +1,108 @@
+name: Release
+
+# Cut an immutable version tag and (optionally) advance the floating major that
+# every consumer pins (OGE-1667).
+#
+# Why this exists: moving `v2` by hand is `git push -f` on a tag that deploys to
+# ~22 repos at once, with no gates and no record. That is a frightening thing to
+# do casually, so nobody did it at all — and `main` drifted 26 commits and 2.5
+# months from the tag consumers were running. The fix is to make the safe path
+# the easy path.
+#
+# Deliberately manual (`workflow_dispatch`), not automatic on merge. Auto-tagging
+# every merge would remove the last staging opportunity before 22 production
+# repos. The goal is a release that is ROUTINE, not one that is unattended —
+# `drift-check.yml` is what makes skipping it loud.
+#
+#   gh workflow run release.yml -f version=v2.2.0 -f move_major=true
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Immutable version tag to cut, e.g. v2.2.0"
+        required: true
+        type: string
+      move_major:
+        description: "Also advance the floating major (v2) — this deploys to every consumer"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # creates and force-moves tags
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify, then tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate the version string
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Refuse anything that isn't vMAJOR.MINOR.PATCH. A malformed tag here
+          # becomes a broken pin in every consumer workflow.
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$VERSION' is not vMAJOR.MINOR.PATCH (e.g. v2.2.0)."
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag '$VERSION' already exists. Version tags are immutable — pick the next one."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+
+      # The gates. Nothing gets tagged unless all three pass — this is what
+      # makes moving the floating major a routine action instead of a leap.
+      - run: npm run typecheck
+      - run: npm test
+      - name: Eval gate
+        run: npm run eval
+
+      - name: Tag and push
+        env:
+          VERSION: ${{ inputs.version }}
+          MOVE_MAJOR: ${{ inputs.move_major }}
+        run: |
+          set -euo pipefail
+          major="${VERSION%%.*}"          # v2.2.0 -> v2
+          sha="$(git rev-parse HEAD)"
+
+          git config user.name  "OgenticAI Factory Bot"
+          git config user.email "factory-bot@ogenticai.com"
+
+          git tag -a "$VERSION" -m "Release $VERSION" "$sha"
+          git push origin "$VERSION"
+          echo "Cut immutable tag $VERSION at ${sha:0:7}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$MOVE_MAJOR" = "true" ]; then
+            prev="$(git rev-parse "$major^{}" 2>/dev/null || echo none)"
+            git tag -f -a "$major" -m "Floating major -> $VERSION" "$sha"
+            git push -f origin "$major"
+            {
+              echo "Moved floating **$major** -> ${sha:0:7} (was ${prev:0:7})"
+              echo ""
+              echo "Every consumer pinning \`@$major\` picks this up on its next PR."
+              echo ""
+              echo "Rollback: \`git tag -f $major $prev && git push -f origin $major\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Floating $major NOT moved — consumers stay where they are." >> "$GITHUB_STEP_SUMMARY"
+          fi

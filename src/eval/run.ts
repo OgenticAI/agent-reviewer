@@ -18,8 +18,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { parseFixture } from "./fixture.js";
-import { replayFixture, type ReplayResult } from "./replay.js";
+import { parseFixture, type ExpectedTable } from "./fixture.js";
+import { replayFixture, replayFixtureWithTriage, type ReplayResult } from "./replay.js";
 
 /** Punt-rate allowed to rise by this much vs baseline before the gate fails. */
 export const PUNT_RATE_TOLERANCE = 0.02;
@@ -71,6 +71,101 @@ export async function runEval(args: {
     puntRegressed,
     passed: regressions.length === 0 && !puntRegressed,
   };
+}
+
+/**
+ * Punt rate over a set of already-produced label tables.
+ *
+ * Shared by both arms of the triage dimension so the two numbers cannot drift
+ * apart by being computed differently — the whole comparison rests on them
+ * meaning exactly the same thing.
+ */
+function puntRateOfTables(tables: ExpectedTable[]): number {
+  const items = tables.flatMap((t) => t.items);
+  if (items.length === 0) return 0;
+  return items.filter((i) => i.status === "UNVERIFIABLE").length / items.length;
+}
+
+export interface TriageDimensionReport {
+  /** Fixtures carrying a `triageArm`, i.e. the ones actually compared. */
+  compared: string[];
+  /** Fixtures with no `triageArm` — excluded, and named so the gap is visible. */
+  skipped: string[];
+  /** Punt rate on the triage-off arm, over `compared` only. `null` if none. */
+  puntRateOff: number | null;
+  /** Punt rate on the triage-on arm, over `compared` only. `null` if none. */
+  puntRateOn: number | null;
+  /** on − off. Negative means triage reduced punting. `null` if none compared. */
+  delta: number | null;
+}
+
+/**
+ * Does the cheap triage pre-pass change how often we punt? (OGE-1606)
+ *
+ * The gate gets no say here — this reports, it never fails the build. Enabling
+ * triage by default is a judgement about cost and punt rate together, and the
+ * point of this dimension is to put a measured number under that judgement
+ * instead of a guess.
+ *
+ * Both rates are computed over the COMPARED fixtures only. Averaging the
+ * triage-off arm over every fixture while the on arm covers three would
+ * compare two different populations and read as a triage effect.
+ */
+export async function runTriageDimension(args: {
+  dir: string;
+}): Promise<TriageDimensionReport> {
+  const fixtures = loadFixtures(args.dir);
+  const compared: string[] = [];
+  const skipped: string[] = [];
+  const offTables: ExpectedTable[] = [];
+  const onTables: ExpectedTable[] = [];
+
+  for (const fx of fixtures) {
+    const on = await replayFixtureWithTriage(fx);
+    if (!on) {
+      skipped.push(fx.name);
+      continue;
+    }
+    const off = await replayFixture(fx);
+    compared.push(fx.name);
+    offTables.push(off.produced);
+    onTables.push(on);
+  }
+
+  if (compared.length === 0) {
+    return { compared, skipped, puntRateOff: null, puntRateOn: null, delta: null };
+  }
+  const puntRateOff = puntRateOfTables(offTables);
+  const puntRateOn = puntRateOfTables(onTables);
+  return { compared, skipped, puntRateOff, puntRateOn, delta: puntRateOn - puntRateOff };
+}
+
+/** Human-readable dimension summary. Reports coverage, never hides it. */
+export function formatTriageDimension(report: TriageDimensionReport): string {
+  if (report.compared.length === 0) {
+    return [
+      "Triage dimension: NO DATA",
+      `  0 of ${report.skipped.length} fixtures carry a triageArm — nothing was compared.`,
+      "  This is not evidence that triage has no effect. Record a triageArm on a",
+      "  fixture before reading anything into the punt rate.",
+    ].join("\n");
+  }
+  const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
+  const delta = report.delta!;
+  const direction = delta < 0 ? "reduced" : delta > 0 ? "raised" : "did not change";
+  const lines = [
+    `Triage dimension: ${report.compared.length} fixture(s) compared`,
+    `  punt rate off: ${pct(report.puntRateOff!)}`,
+    `  punt rate on:  ${pct(report.puntRateOn!)}`,
+    `  triage ${direction} punting by ${pct(Math.abs(delta))}`,
+  ];
+  if (report.skipped.length > 0) {
+    lines.push(
+      `  NOT compared (no triageArm): ${report.skipped.join(", ")}`,
+      `  Coverage is ${report.compared.length}/${report.compared.length + report.skipped.length} — weigh the delta accordingly.`,
+    );
+  }
+  return lines.join("\n");
 }
 
 /** Human-readable gate summary for CI logs. */

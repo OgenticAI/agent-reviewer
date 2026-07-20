@@ -66,6 +66,34 @@ export async function replayFixture(fixture: EvalFixture): Promise<ReplayResult>
   return compare(fixture.name, produced, fixture.expected);
 }
 
+/**
+ * Replay a fixture's triage-ON arm (OGE-1606).
+ *
+ * Supplying `triageModel` is what turns the pre-pass on in `runReview` — there
+ * is no boolean. Both stubs are served from the fixture's recorded `triageArm`,
+ * so this stays as hermetic as the triage-off path.
+ *
+ * Returns the produced table only; this is a measurement path, not a gate. The
+ * gold gate still runs on the triage-off arm alone, so a fixture cannot be made
+ * to pass CI by recording a friendlier triage arm.
+ */
+export async function replayFixtureWithTriage(
+  fixture: EvalFixture,
+): Promise<ExpectedTable | null> {
+  const arm = fixture.triageArm;
+  if (!arm) return null;
+  const deps = depsFor(fixture);
+  const result = await runReview({
+    pr: { owner: fixture.pr.owner, repo: fixture.pr.repo, number: fixture.pr.number },
+    github: deps.github,
+    linear: deps.linear,
+    model: { produce: async () => arm.modelResponse },
+    triageModel: { triage: async () => arm.triageResponse },
+    now: () => "2026-01-01T00:00:00.000Z",
+  });
+  return tableOf(result.verdict);
+}
+
 export function compare(
   name: string,
   produced: ExpectedTable,

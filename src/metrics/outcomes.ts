@@ -54,6 +54,16 @@ export type OutcomeKind =
   | "unchanged"
   | "new";
 
+/**
+ * Did the one-click fix get taken? (OGE-1605)
+ *
+ * `null` means no suggestion was ever offered on this item — which is the
+ * common case, and is NOT the same as "offered and declined". Collapsing the
+ * two would put every un-suggested item in the denominator and drive the
+ * applied rate toward zero regardless of how good the suggestions are.
+ */
+export type SuggestionOutcome = "applied" | "ignored" | null;
+
 export interface ItemOutcome {
   id: number;
   itemText: string;
@@ -62,6 +72,11 @@ export interface ItemOutcome {
   outcome: OutcomeKind;
   /** Cited files that changed since the previous verdict — the evidence. */
   changedEvidencePaths: string[];
+  /**
+   * Whether the suggestion offered on the PREVIOUS verdict was taken up.
+   * `null` when none was offered.
+   */
+  suggestionOutcome: SuggestionOutcome;
 }
 
 export interface OutcomeSummary {
@@ -74,6 +89,16 @@ export interface OutcomeSummary {
   actedOnRate: number | null;
   /** overridden / total items, 0–1. `null` when there are no items. */
   overrideRate: number | null;
+  /**
+   * applied / (applied + ignored), 0–1. `null` when no suggestion was offered
+   * on the previous verdict — same empty-denominator rule as `actedOnRate`.
+   *
+   * This is the signal that tells us whether committable suggestions (OGE-1596)
+   * are worth their risk. A suggestion is a one-click write to someone's branch;
+   * if authors routinely ignore them, the feature is costing review attention
+   * and buying nothing, and that is only visible as a rate over time.
+   */
+  suggestionAppliedRate: number | null;
 }
 
 /** Paths a verdict item pointed at, from both the structured and prose trails. */
@@ -141,18 +166,59 @@ export function computeOutcomes(args: {
       status: item.status,
       outcome,
       changedEvidencePaths,
+      suggestionOutcome: classifySuggestion({ prev: prev ?? null, outcome }),
     };
   });
 
   const actedOn = items.filter((i) => i.outcome === "acted-on").length;
   const flips = items.filter((i) => i.outcome === "unexplained-flip").length;
   const overrides = items.filter((i) => i.outcome === "overridden").length;
+  const applied = items.filter((i) => i.suggestionOutcome === "applied").length;
+  const ignored = items.filter((i) => i.suggestionOutcome === "ignored").length;
 
   return {
     items,
     actedOnRate: actedOn + flips > 0 ? actedOn / (actedOn + flips) : null,
     overrideRate: items.length > 0 ? overrides / items.length : null,
+    suggestionAppliedRate: applied + ignored > 0 ? applied / (applied + ignored) : null,
   };
+}
+
+/**
+ * Was the previous run's suggestion taken up?
+ *
+ * ── This is INFERRED, and the inference is worth stating plainly ────────────
+ *
+ * GitHub exposes no "this suggestion was committed" flag on a review comment.
+ * Applying one produces an ordinary commit, and the only durable trace is that
+ * the suggested file changed. So we reuse the signal we already compute: an
+ * item that carried a suggestion and then landed as `acted-on` — flipped
+ * positive AND a cited file changed — is the closest observable thing to
+ * "applied".
+ *
+ * That makes two error modes real, and both are deliberate:
+ *
+ * - An author who fixes the finding **by hand**, ignoring the suggestion,
+ *   counts as `applied`. We cannot tell the two apart, and it does not matter
+ *   much: the suggestion named the right line and the right fix either way.
+ * - An author who applies the suggestion but whose fix does not clear the
+ *   criterion counts as `ignored`. That is the honest reading — a suggestion
+ *   that gets clicked and leaves the item failing did not work.
+ *
+ * The metric therefore measures *did the suggested fix resolve the finding*,
+ * not *was the button pressed*. That is the more useful of the two, and it is
+ * the one we can measure without asking GitHub for something it does not have.
+ */
+function classifySuggestion(args: {
+  prev: ItemVerdict | null;
+  outcome: OutcomeKind;
+}): SuggestionOutcome {
+  // No suggestion offered last time → this item is not in either bucket.
+  if (!args.prev?.suggestedFix) return null;
+  // A human force-pass says nothing about the suggestion; keep it out of the
+  // denominator rather than scoring an override as a rejection.
+  if (args.outcome === "overridden") return null;
+  return args.outcome === "acted-on" ? "applied" : "ignored";
 }
 
 function classify(args: {
@@ -190,6 +256,13 @@ export interface OutcomeRow {
   outcome: OutcomeKind;
   confidence?: number;
   changedEvidencePaths: string[];
+  /**
+   * "applied" | "ignored", omitted when no suggestion was offered. Omitted
+   * rather than null so older rows and un-suggested items read identically to
+   * anything already consuming this file — appending a field must not change
+   * how existing rows parse.
+   */
+  suggestionOutcome?: Exclude<SuggestionOutcome, null>;
   generatedAt: string;
 }
 
@@ -213,6 +286,7 @@ export function toOutcomeRows(args: {
     outcome: o.outcome,
     ...(confById.get(o.id) !== undefined ? { confidence: confById.get(o.id) } : {}),
     changedEvidencePaths: o.changedEvidencePaths,
+    ...(o.suggestionOutcome ? { suggestionOutcome: o.suggestionOutcome } : {}),
     generatedAt: args.generatedAt,
   }));
 }

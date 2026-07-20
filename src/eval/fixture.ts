@@ -72,6 +72,28 @@ export const EvalFixture = z.object({
   modelResponse: z.string(),
   /** The archived verdict-label table the pipeline must reproduce. */
   expected: ExpectedTable,
+  /**
+   * The triage-on arm of this fixture (OGE-1606) — optional.
+   *
+   * The triage dimension asks whether the cheap pre-pass changes the punt rate,
+   * and a hermetic replay can only answer that if the fixture recorded BOTH
+   * arms. Replaying the same `modelResponse` with and without a triage model
+   * would return identical verdicts and produce a comparison of zero — a
+   * confident-looking number that measured nothing.
+   *
+   * So the arm is explicit: `triageResponse` drives the pre-pass, and
+   * `modelResponse` is what the verdict model actually returned on the run
+   * where triage had reordered its context. Fixtures without this field are
+   * reported as skipped, never counted as "no difference".
+   */
+  triageArm: z
+    .object({
+      /** Recorded reply from the haiku-class triage model (raw JSON). */
+      triageResponse: z.string(),
+      /** Recorded verdict-model reply from the triage-on run. */
+      modelResponse: z.string(),
+    })
+    .optional(),
 });
 export type EvalFixture = z.infer<typeof EvalFixture>;
 

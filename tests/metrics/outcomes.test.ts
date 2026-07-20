@@ -254,4 +254,105 @@ describe("outcome rows", () => {
     expect(lines).toHaveLength(2);
     expect(() => lines.map((l) => JSON.parse(l))).not.toThrow();
   });
+
+  // ── Suggestion applied/ignored telemetry (OGE-1605) ────────────────────────
+  //
+  // The rate only means something if the denominator is right. Items that were
+  // never offered a suggestion must stay out of it entirely — otherwise every
+  // PR full of un-suggested findings drags the applied rate toward zero and the
+  // number stops tracking suggestion quality at all.
+
+  const withFix = {
+    suggestedFix: { path: "src/a.ts", startLine: 3, endLine: 3, replacement: "fixed" },
+  };
+
+  it("counts a suggestion as applied when the finding was acted on", () => {
+    const previous = verdict([item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] })]);
+    const current = verdict([item(1, "PASS")]);
+    const summary = computeOutcomes({
+      previous,
+      current,
+      changedPaths: ["src/a.ts"],
+    });
+    expect(summary.items[0]!.outcome).toBe("acted-on");
+    expect(summary.items[0]!.suggestionOutcome).toBe("applied");
+    expect(summary.suggestionAppliedRate).toBe(1);
+  });
+
+  it("counts a suggestion as ignored when the item is still failing", () => {
+    const previous = verdict([item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] })]);
+    const current = verdict([item(1, "FAIL")]);
+    const summary = computeOutcomes({ previous, current, changedPaths: [] });
+    expect(summary.items[0]!.outcome).toBe("outstanding");
+    expect(summary.items[0]!.suggestionOutcome).toBe("ignored");
+    expect(summary.suggestionAppliedRate).toBe(0);
+  });
+
+  it("counts a clicked-but-ineffective suggestion as ignored — the fix did not clear the criterion", () => {
+    // The author applied it, the file changed, and the item STILL fails. The
+    // metric measures whether the suggested fix resolved the finding, not
+    // whether the button was pressed. Still failing means it did not work.
+    const previous = verdict([item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] })]);
+    const current = verdict([item(1, "FAIL")]);
+    const summary = computeOutcomes({
+      previous,
+      current,
+      changedPaths: ["src/a.ts"],
+    });
+    expect(summary.items[0]!.suggestionOutcome).toBe("ignored");
+  });
+
+  it("leaves items that were never offered a suggestion out of the rate entirely", () => {
+    const previous = verdict([
+      item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] }),
+      item(2, "FAIL", { evidenceRefs: [{ kind: "file", path: "src/b.ts" }] as ItemVerdict["evidenceRefs"] }),
+      item(3, "FAIL", { evidenceRefs: [{ kind: "file", path: "src/c.ts" }] as ItemVerdict["evidenceRefs"] }),
+    ]);
+    const current = verdict([item(1, "PASS"), item(2, "FAIL"), item(3, "FAIL")]);
+    const summary = computeOutcomes({ previous, current, changedPaths: ["src/a.ts"] });
+
+    expect(summary.items[1]!.suggestionOutcome).toBeNull();
+    expect(summary.items[2]!.suggestionOutcome).toBeNull();
+    // 1 applied, 0 ignored — the two un-suggested failures are not in the ratio.
+    expect(summary.suggestionAppliedRate).toBe(1);
+  });
+
+  it("keeps an overridden item out of the rate — a force-pass says nothing about the suggestion", () => {
+    const previous = verdict([item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] })]);
+    const current = verdict([item(1, "FAIL")]);
+    const summary = computeOutcomes({
+      previous,
+      current,
+      changedPaths: [],
+      overriddenItemIds: [1],
+    });
+    expect(summary.items[0]!.outcome).toBe("overridden");
+    expect(summary.items[0]!.suggestionOutcome).toBeNull();
+    expect(summary.suggestionAppliedRate).toBeNull();
+  });
+
+  it("reports null rather than 0 when no suggestion was ever offered", () => {
+    const previous = verdict([item(1, "FAIL", { evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] })]);
+    const current = verdict([item(1, "PASS")]);
+    const summary = computeOutcomes({ previous, current, changedPaths: ["src/a.ts"] });
+    expect(summary.suggestionAppliedRate).toBeNull();
+  });
+
+  it("carries suggestionOutcome into the JSONL row, omitted when absent", () => {
+    const previous = verdict([
+      item(1, "FAIL", { ...withFix, evidenceRefs: [{ kind: "file", path: "src/a.ts" }] as ItemVerdict["evidenceRefs"] }),
+      item(2, "FAIL", { evidenceRefs: [{ kind: "file", path: "src/b.ts" }] as ItemVerdict["evidenceRefs"] }),
+    ]);
+    const current = verdict([item(1, "PASS"), item(2, "PASS")]);
+    const summary = computeOutcomes({ previous, current, changedPaths: ["src/a.ts", "src/b.ts"] });
+    const rows = toOutcomeRows({
+      verdict: current,
+      summary,
+      repo: "r",
+      pr: 1,
+      generatedAt: "2026-07-19T12:00:00.000Z",
+    });
+    expect(rows[0]!.suggestionOutcome).toBe("applied");
+    expect("suggestionOutcome" in rows[1]!).toBe(false);
+  });
 });

@@ -103,6 +103,26 @@ inputs:
       it, not below. Default 1.
     required: false
     default: "1"
+  require_checklist:
+    description: >-
+      Whether a PR with no `## UAT checklist` FAILS the Check instead of being
+      skipped (OGE-1655).
+
+      This closes a real bypass. A `skipped` conclusion SATISFIES a required
+      status check in GitHub — verified in production — so where the reviewer
+      check is required, omitting a markdown heading merged clean with the check
+      showing as satisfied. Measured skip rate at the time: 56-75% of runs.
+
+        off     (default) skip stays a `skipped` check, advisory as before
+        code    skip FAILS unless every changed file is documentation
+        always  skip always FAILS, documentation included
+
+      Under `code`, "documentation" means .md/.mdx/.txt/.rst, docs/**, images,
+      LICENSE, NOTICE, CODEOWNERS and issue/PR templates. Everything else counts
+      as code — including .github/workflows/**, which can disable this very
+      check. One non-doc file requires a checklist.
+    required: false
+    default: "off"
   findings_fail_level:
     description: >-
       Deterministic analyzer/test gate, independent of the LLM verdict
@@ -279,6 +299,7 @@ runs:
         REVIEWER_PATCH_EXTRA_LINES_BEFORE: ${{ inputs.patch_extra_lines_before }}
         REVIEWER_PATCH_EXTRA_LINES_AFTER: ${{ inputs.patch_extra_lines_after }}
         REVIEWER_FINDINGS_FAIL_LEVEL: ${{ inputs.findings_fail_level }}
+        REVIEWER_REQUIRE_CHECKLIST: ${{ inputs.require_checklist }}
         REVIEWER_INLINE_COMMENTS: ${{ inputs.inline_comments }}
         REVIEWER_TRIAGE: ${{ inputs.triage }}
         REVIEWER_REPO_MAP: ${{ inputs.repo_map }}
@@ -307,6 +328,11 @@ runs:
           # (OGE-1585). Empty means the repo committed none — input stands.
           config_fail_on=$(node -e "const f=require(process.env.VERDICT_PATH).failOn; console.log(Array.isArray(f)?f.join(','):'')")
           echo "config_fail_on=$config_fail_on" >> "$GITHUB_OUTPUT"
+        elif [ $rc -eq 6 ]; then
+          # Skipped, but the repo requires a checklist (OGE-1655). Distinct from
+          # 3 because a `skipped` check satisfies a required one — this must
+          # publish `failure` to actually gate.
+          overall="NEEDS_CHECKLIST"
         elif [ $rc -eq 3 ]; then
           overall="SKIPPED"
         else
@@ -345,6 +371,7 @@ runs:
           PASS|PASS_WITH_PARTIALS) conclusion="success" ;;
           HUMAN_REVIEW) conclusion="neutral" ;;
           SKIPPED) conclusion="skipped" ;;
+          NEEDS_CHECKLIST) conclusion="failure" ;;
           NEEDS_WORK)
             if echo ",$FAIL_ON," | grep -q ",NEEDS_WORK,"; then
               conclusion="failure"

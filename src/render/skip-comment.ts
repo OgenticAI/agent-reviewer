@@ -78,17 +78,35 @@ export function renderSkipComment(args: {
   reason: SkipReason;
   /** The raw error, quoted verbatim so the comment can't drift from the cause. */
   message: string;
+  /**
+   * Whether this skip fails the Check (OGE-1655 option 3). Changes the framing
+   * from "be aware" to "this is blocking you", because those need different
+   * urgency — and a blocking comment that reads as advisory wastes the author's
+   * time working out why they can't merge.
+   */
+  blocking?: boolean;
 }): string {
   const { what, fix } = BODIES[args.reason];
+  const status = args.blocking
+    ? [
+        `## OgenticAI Reviewer — :no_entry: not reviewed, merge blocked`,
+        ``,
+        `**No UAT verdict was produced for this PR, and this repo requires one.** ${what}`,
+        ``,
+        `The \`OgenticAI Reviewer / UAT\` check is **failing** until a checklist exists.`,
+      ]
+    : [
+        `## OgenticAI Reviewer — :warning: not reviewed`,
+        ``,
+        `**No UAT verdict was produced for this PR.** ${what}`,
+        ``,
+        `The \`OgenticAI Reviewer / UAT\` check will show as *skipped*, which looks`,
+        `similar to a pass. It is not one — nothing here has been checked.`,
+      ];
   return [
     COMMENT_MARKER,
     ``,
-    `## OgenticAI Reviewer — :warning: not reviewed`,
-    ``,
-    `**No UAT verdict was produced for this PR.** ${what}`,
-    ``,
-    `The \`OgenticAI Reviewer / UAT\` check will show as *skipped*, which looks`,
-    `similar to a pass. It is not one — nothing here has been checked.`,
+    ...status,
     ``,
     `### To get this reviewed`,
     ``,

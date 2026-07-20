@@ -26,7 +26,7 @@ jobs:
     if: github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v5
-      - uses: OgenticAI/agent-reviewer/.github/actions/review@v1
+      - uses: OgenticAI/agent-reviewer/.github/actions/review@v2
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_app_id: ${{ secrets.OGENTICAI_REVIEWER_APP_ID }}
@@ -61,10 +61,10 @@ GITHUB_TOKEN=ghp_xxx \
 Then flip the Action's `fail_on` input to actually block merges:
 
 ```yaml
-- uses: OgenticAI/agent-reviewer/.github/actions/review@v1
+- uses: OgenticAI/agent-reviewer/.github/actions/review@v2
   with:
     # ... other inputs ...
-    fail_on: NEEDS_WORK     # was empty in v1 advisory mode
+    fail_on: NEEDS_WORK     # empty (the default) is advisory mode
 ```
 
 `fail_on` accepts a comma-separated subset of `NEEDS_WORK,HUMAN_REVIEW`. The reviewer never sets `failure` on internal infra errors — those go to `neutral` so a Linear or Anthropic outage doesn't deadlock your merges.

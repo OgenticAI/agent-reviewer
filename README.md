@@ -41,7 +41,7 @@ The reviewer fetches the linked comment, looks for verification evidence (code-f
 ```
 any OgenticAI repo
    └── .github/workflows/ogenticai-reviewer.yml
-         └── uses: OgenticAI/agent-reviewer/.github/actions/review@v1
+         └── uses: OgenticAI/agent-reviewer/.github/actions/review@v2
                 ├── precheck: skip cleanly if App + secrets aren't configured yet
                 ├── mints a GitHub App token (actions/create-github-app-token@v1)
                 ├── runs the agent CLI exactly once per push:

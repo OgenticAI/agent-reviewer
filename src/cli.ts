@@ -15,6 +15,9 @@
  *   0  success
  *   2  bad CLI args
  *   3  review skipped (no ticket / no checklist) — emit neutral Check upstream
+ *   6  review skipped AND the skip should block (OGE-1655) — emit a FAILING
+ *      Check. A `skipped` conclusion satisfies a required status check, so
+ *      without a distinct code a missing checklist merges clean.
  *   4  required env var missing
  *   5  permission denied (override only)
  *   1  any other failure
@@ -53,6 +56,7 @@ import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
 import { classifySkip, renderSkipComment } from "./render/skip-comment.js";
+import { decideSkipGate, parseChecklistPolicy } from "./protection/skip-gate.js";
 import { LINT_COMMENT_MARKER, REVIEWER_VERSION } from "./version.js";
 import {
   applyOverride,
@@ -557,6 +561,36 @@ async function runReviewCommand(env: {
       //
       // Best-effort: a failure to post must not change the exit code, or a
       // comment outage would turn a clean skip into a red job.
+      // Should this skip block the merge? (OGE-1655 option 3.) Only a missing
+      // checklist is gateable, and only when the PR touches non-docs files.
+      const skipReason = classifySkip(err.message);
+      let gate = { blocked: false, reason: "enforcement off" };
+      const policy = parseChecklistPolicy(process.env.REVIEWER_REQUIRE_CHECKLIST);
+      if (policy !== "off") {
+        let changedPaths: string[] = [];
+        try {
+          const octokit = new Octokit({ auth: requireEnv("GITHUB_TOKEN") });
+          changedPaths = (
+            await octokit.paginate(octokit.pulls.listFiles, {
+              owner: env.owner,
+              repo: env.repo,
+              pull_number: env.number,
+              per_page: 100,
+            })
+          ).map((f) => f.filename);
+        } catch (listErr) {
+          // Fail CLOSED: if we cannot tell what changed, we cannot claim the PR
+          // is docs-only. An empty list is treated as not-docs-only by
+          // isDocsOnly for exactly this reason.
+          console.error(
+            `[skip] could not list changed files; treating as code: ` +
+              `${listErr instanceof Error ? listErr.message : String(listErr)}`,
+          );
+        }
+        gate = decideSkipGate({ reason: skipReason, changedPaths, policy });
+        console.error(`[skip:gate] ${gate.blocked ? "BLOCKING" : "not blocking"} — ${gate.reason}`);
+      }
+
       if (env.args.post) {
         try {
           const octokit = new Octokit({ auth: requireEnv("GITHUB_TOKEN") });
@@ -566,8 +600,9 @@ async function runReviewCommand(env: {
             repo: env.repo,
             issueNumber: env.number,
             body: renderSkipComment({
-              reason: classifySkip(err.message),
+              reason: skipReason,
               message: err.message,
+              blocking: gate.blocked,
             }),
           });
           console.error(`[github:${upsert.action}] skip notice → ${upsert.url}`);
@@ -578,7 +613,10 @@ async function runReviewCommand(env: {
           );
         }
       }
-      process.exit(3);
+      // 6 is distinct from 3 so the Action can publish `failure` rather than
+      // `skipped` — GitHub accepts a skipped check as satisfying a required
+      // one, which is the bypass this closes.
+      process.exit(gate.blocked ? 6 : 3);
     }
     console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
     process.exit(1);

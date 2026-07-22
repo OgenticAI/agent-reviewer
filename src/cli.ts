@@ -52,6 +52,7 @@ import type { TriageModel } from "./triage/triage.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
+import { classifySkip, renderSkipComment } from "./render/skip-comment.js";
 import { LINT_COMMENT_MARKER, REVIEWER_VERSION } from "./version.js";
 import {
   applyOverride,
@@ -548,6 +549,35 @@ async function runReviewCommand(env: {
   } catch (err) {
     if (err instanceof ReviewSkippedError) {
       console.error(`[skip] ${err.message}`);
+      // Say so on the PR (OGE-1655). A skipped review used to be silent: the
+      // Check renders `skipped` in neutral grey next to the green ones, so
+      // omitting a markdown heading quietly bypassed the gate. Measured at
+      // 56-75% of runs on the canary repo, so for most PRs this comment IS the
+      // reviewer's entire output.
+      //
+      // Best-effort: a failure to post must not change the exit code, or a
+      // comment outage would turn a clean skip into a red job.
+      if (env.args.post) {
+        try {
+          const octokit = new Octokit({ auth: requireEnv("GITHUB_TOKEN") });
+          const upsert = await upsertStickyComment({
+            octokit,
+            owner: env.owner,
+            repo: env.repo,
+            issueNumber: env.number,
+            body: renderSkipComment({
+              reason: classifySkip(err.message),
+              message: err.message,
+            }),
+          });
+          console.error(`[github:${upsert.action}] skip notice → ${upsert.url}`);
+        } catch (postErr) {
+          console.error(
+            `[skip] could not post the skip notice: ` +
+              `${postErr instanceof Error ? postErr.message : String(postErr)}`,
+          );
+        }
+      }
       process.exit(3);
     }
     console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));

@@ -84,3 +84,23 @@ describe("renderSkipComment", () => {
     expect(a).toBe(b);
   });
 });
+
+describe("blocking vs advisory framing (OGE-1655 option 3)", () => {
+  it("says merge is blocked when the skip fails the check", () => {
+    const body = renderSkipComment({ reason: "no-checklist", message: NO_CHECKLIST, blocking: true });
+    expect(body).toContain("merge blocked");
+    expect(body).toContain("is **failing**");
+    expect(body).toContain("this repo requires one");
+  });
+
+  it("keeps the softer advisory framing when not blocking", () => {
+    const body = renderSkipComment({ reason: "no-checklist", message: NO_CHECKLIST, blocking: false });
+    expect(body).not.toContain("merge blocked");
+    expect(body).toContain("will show as *skipped*");
+  });
+
+  it("defaults to advisory when blocking is omitted", () => {
+    const body = renderSkipComment({ reason: "no-checklist", message: NO_CHECKLIST });
+    expect(body).not.toContain("merge blocked");
+  });
+});

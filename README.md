@@ -317,6 +317,20 @@ When `inline_comments` is on, a FAIL that carries a small, certain fix gets a Gi
 
 The certainty gate is strict, because a wrong one-click suggestion is worse than none: the item must be `FAIL` + `autoPatchable`, high-confidence (≥0.8), and a contiguous replacement of ≤20 lines whose every replaced line is anchorable in the diff. Anything else falls through to the draft-PR auto-patch path, unchanged. Applied-vs-ignored is a crisp acceptance signal that flows into the outcome telemetry ([docs/OUTCOMES.md](docs/OUTCOMES.md)): an applied suggestion flips the item FAIL→PASS with its file changed, which reads as `acted-on`.
 
+## Releasing (and why drift is the thing to watch)
+
+Consumers pin the **floating major** &mdash; `OgenticAI/agent-reviewer/.github/actions/review@v2`. So a change is not shipped when it merges to `main`; it is shipped when `v2` moves. Those are different events, and conflating them cost this project 2.5 months: `main` sat 26 commits ahead of `v2`, 26 tickets read **Done**, and none of that code ran in any repo.
+
+**To release:** Actions &rarr; *Release* &rarr; Run workflow, with a version like `v2.2.0`.
+
+It refuses to tag unless typecheck, the full suite, and `npm run eval` all pass, rejects a malformed or already-existing version, cuts the immutable `vX.Y.Z`, and then optionally advances `v2`. Moving `v2` deploys to every consumer on their next PR, so the job summary prints the rollback command.
+
+**Releasing is deliberately manual.** Auto-tagging every merge would remove the last staging opportunity before ~22 production repos. The goal is a release that is *routine*, not one that is unattended.
+
+**What stops it drifting again:** `drift-check.yml` runs daily and on every push to `main`, and fails when `main` is more than 10 commits or 14 days ahead of `v2`. Both thresholds matter &mdash; 40 commits in two days is as much unreleased exposure as 3 commits sitting for three months. Run it locally with `npm run drift`.
+
+It measures against the tag consumers *actually pin*, not the newest semver tag. `v2.1.0` existed and pointed at `main` the entire time `v2` pointed at May, so a check comparing against "the latest tag" would have reported all-clear throughout.
+
 ## Determinism contract
 
 - Same PR body + same diff + same SHA = byte-identical sticky comment, every push. Tested via `tests/integration/review.test.ts::renders byte-identical comments across runs on the same SHA`. (As of v2 the input vector also includes the bodies of any same-PR comments linked from ticked UAT items &mdash; editing a verification comment will refresh the next sticky on push, which is the right behavior.)

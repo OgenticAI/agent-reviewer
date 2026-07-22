@@ -2,7 +2,7 @@
   "name": "@ogenticai/agent-reviewer",
   "version": "0.1.0-dev",
   "private": true,
-  "description": "OgenticAI Reviewer — AI engineer that lives in GitHub. Reviews each PR against its linked Linear ticket's UAT checklist, comments per-item like a human reviewer, blocks merge on failure, and files follow-ups.",
+  "description": "OgenticAI Reviewer \u2014 AI engineer that lives in GitHub. Reviews each PR against its linked Linear ticket's UAT checklist, comments per-item like a human reviewer, blocks merge on failure, and files follow-ups.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -20,7 +20,8 @@
     "format": "prettier --write src tests",
     "review-pr": "tsx src/cli.ts",
     "eval": "tsx scripts/run-eval.ts",
-    "eval:gen": "tsx scripts/gen-eval-fixtures.ts"
+    "eval:gen": "tsx scripts/gen-eval-fixtures.ts",
+    "drift": "tsx scripts/check-drift.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.1",

@@ -10,7 +10,8 @@
 #   - Running the *review* on every body edit would burn an LLM call per
 #     typo fix. Splitting them keeps the expensive path on push-only.
 #
-# Consumers mirror this via `templates/workflows/uat-lint.yml`.
+# Not currently mirrored to consumers — there is no template for it under
+# `templates/workflows/`, which holds only the reviewer action and the override.
 
 name: OgenticAI Reviewer — UAT Lint
 
@@ -24,7 +25,11 @@ permissions:
   issues: write
 
 jobs:
-  lint:
+  # Named `uat-checklist`, not `lint` (OGE-2451). This job lints the PR body's
+  # acceptance criteria, never the code, and it is advisory — it cannot fail a
+  # PR. While it was called `lint` it was the only green check by that name,
+  # and `npm run lint` was broken underneath it the whole time.
+  uat-checklist:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5

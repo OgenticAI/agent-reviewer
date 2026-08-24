@@ -26,7 +26,7 @@
  * instead. That difference is the whole of this file.
  */
 
-import type { AuditFinding, ClosurePath, Confidence, EvidenceRef } from "./finding.js";
+import type { AuditFinding, ClosurePath, EvidenceRef } from "./finding.js";
 import { closureAsk } from "./finding.js";
 import type { VerifiedClaim } from "./verify.js";
 import { severityFor } from "./severity.js";

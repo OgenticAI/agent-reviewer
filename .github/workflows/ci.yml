@@ -25,3 +25,22 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  # Separate from `test` so a lint failure and a test failure are two different
+  # red squares. A combined job makes "CI is red" ambiguous, and ambiguity is
+  # what gets a check ignored.
+  #
+  # Named `lint` only after the UAT-checklist workflow gave the name up
+  # (OGE-2451): for months a green check called `lint` came from that workflow,
+  # while `npm run lint` had no config and failed on every branch.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run lint

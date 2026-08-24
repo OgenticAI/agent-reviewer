@@ -19,7 +19,6 @@ import type {
   VerdictModel,
   VerdictModelRequest,
 } from "../../src/review.js";
-import type { ResearchPolicy } from "../../src/research/policy.js";
 import type { ResearchTrace } from "../../src/research/trace.js";
 import type { LinearTicketContext, PrContext } from "../../src/schema/event.js";
 import { ReviewVerdict } from "../../src/schema/verdict.js";

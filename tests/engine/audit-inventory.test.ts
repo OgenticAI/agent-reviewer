@@ -133,6 +133,24 @@ describe("the access log", () => {
     expect(written[0].outcome).toBe("read");
     expect(written[0].at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
+
+  // The render stage recomputes coverage from this file. If it does not
+  // round-trip, coverage silently reads as zero — which the renderer now
+  // refuses, but the cheaper place to catch it is here.
+  it("round-trips, so a later stage sees the same coverage", () => {
+    const log = new FileAccessLog();
+    log.record("src/a.ts", "read");
+    log.record("src/b.ts", "denied");
+    log.writeTo(scratch);
+
+    const reloaded = FileAccessLog.load(scratch);
+    expect([...reloaded.opened()]).toEqual(["src/a.ts"]);
+    expect(reloaded.failed()).toEqual(["src/b.ts"]);
+  });
+
+  it("throws rather than returning an empty log when the file is absent", () => {
+    expect(() => FileAccessLog.load(join(scratch, "nowhere"))).toThrow();
+  });
 });
 
 describe("coverage", () => {

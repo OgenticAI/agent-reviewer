@@ -20,7 +20,7 @@
  * renderer cannot print one without the other.
  */
 
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { SKIP_DIRS, walkTree, type TreeFile } from "./tree.js";
@@ -169,6 +169,19 @@ export class FileAccessLog {
 
   all(): readonly AccessRecord[] {
     return this.records;
+  }
+
+  /**
+   * Re-open a log a previous stage wrote.
+   *
+   * Coverage is computed from this file, so a later stage that cannot find it
+   * has no honest coverage number to print — see the gate in `render.ts`.
+   */
+  static load(outDir: string): FileAccessLog {
+    const log = new FileAccessLog();
+    const records = JSON.parse(readFileSync(join(outDir, "access-log.json"), "utf8")) as AccessRecord[];
+    log.records.push(...records);
+    return log;
   }
 
   writeTo(outDir: string): string {

@@ -1,0 +1,170 @@
+/**
+ * The Anthropic-backed models for the audit chain.
+ *
+ * Kept out of `src/engine/` on purpose. The engine defines `InvestigateModel`
+ * and `VerifierModel` as interfaces and is tested against stubs; this file is
+ * the one place that knows an SDK exists, exactly as `cli.ts` is for the
+ * pull-request path. The boundary test enforces the half of that rule that can
+ * be enforced; this comment is the other half.
+ *
+ * ── Why the two stages get different tools ──────────────────────────────────
+ *
+ * The investigator gets `read_file` and a repo map, and is asked for claims.
+ * The verifier gets `read_file` and one claim, and is asked to destroy it.
+ * Neither is given the other's output beyond that: a verifier that could see
+ * the investigator's reasoning would be checking the argument rather than the
+ * evidence, and would agree with it far too often.
+ */
+
+import Anthropic from "@anthropic-ai/sdk";
+
+import { runToolLoop, type TurnFn } from "./engine/tools/loop.js";
+import { makeRegistry, toolDefinitions, type ReviewTool } from "./engine/tools/registry.js";
+import type { InvestigateModel, InvestigateRequest, InvestigateResponse } from "./engine/audit/investigate.js";
+import type { VerifierModel, VerifyRequest, VerifierVerdict, Outcome } from "./engine/audit/verify.js";
+
+/**
+ * The model for both stages.
+ *
+ * One model, not a cheap investigator and an expensive verifier. The whole
+ * design rests on the verifier being able to overturn the investigator, and a
+ * weaker verifier would rubber-stamp rather than refute — the failure would
+ * look like high confidence, which is the worst shape for it to take.
+ */
+export const AUDIT_MODEL = "claude-sonnet-4-5";
+
+const MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * Iterations per question. Higher than the review path's default because an
+ * audit question is answered by reading around a codebase, not by reading one
+ * diff — the model needs to follow an import chain to reach the answer.
+ */
+export const MAX_TOOL_ITERATIONS = 24;
+
+function extractText(content: unknown[]): string {
+  return content
+    .filter((block): block is { type: "text"; text: string } => {
+      const b = block as { type?: unknown; text?: unknown };
+      return b.type === "text" && typeof b.text === "string";
+    })
+    .map((block) => block.text)
+    .join("\n");
+}
+
+/** Paths the loop actually opened, in order, deduplicated. */
+function openedFrom(transcript: ReadonlyArray<{ name: string; input: unknown }>): string[] {
+  const paths = transcript
+    .filter((call) => call.name === "read_file")
+    .map((call) => (call.input as { path?: unknown })?.path)
+    .filter((path): path is string => typeof path === "string");
+  return [...new Set(paths)];
+}
+
+export interface AuditModelOptions {
+  anthropic: Anthropic;
+  /** The `read_file` tool, already bound to the tree and the access log. */
+  readTool: ReviewTool;
+  model?: string;
+  log?: (message: string) => void;
+}
+
+async function runOnce(options: AuditModelOptions, systemPrompt: string, userPrompt: string) {
+  const registry = makeRegistry([options.readTool]);
+  const tools = toolDefinitions(registry);
+
+  const turn: TurnFn = async (messages) => {
+    const completion = await options.anthropic.messages.create({
+      model: options.model ?? AUDIT_MODEL,
+      max_tokens: MAX_OUTPUT_TOKENS,
+      // Zero, so that two runs over an unchanged tree can be compared. The
+      // report is diffed against the previous audit; sampling noise would show
+      // up there as findings that came and went.
+      temperature: 0,
+      system: systemPrompt,
+      messages: messages as Anthropic.MessageParam[],
+      ...(tools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
+    });
+    return { content: completion.content, stopReason: completion.stop_reason };
+  };
+
+  return runToolLoop({ turn, registry, userPrompt, maxIterations: MAX_TOOL_ITERATIONS });
+}
+
+/** The investigation stage's model. */
+export function makeInvestigateModel(options: AuditModelOptions): InvestigateModel {
+  const log = options.log ?? ((message: string) => console.error(message));
+
+  return {
+    async investigate(request: InvestigateRequest): Promise<InvestigateResponse> {
+      const loop = await runOnce(options, request.systemPrompt, request.userPrompt);
+
+      // A capped loop is reported, never silently accepted. A question the
+      // model ran out of turns on has thinner evidence behind it than one it
+      // finished, and the operator should know which is which.
+      if (loop.degraded) {
+        log(`[audit] ${request.question.id}: tool loop degraded — ${loop.degraded}`);
+      }
+
+      return {
+        text: extractText(loop.content as unknown[]),
+        openedFiles: openedFrom(loop.transcript),
+      };
+    },
+  };
+}
+
+/**
+ * Parse a verifier's reply.
+ *
+ * An unreadable reply becomes `cannot-determine`, never `not-refuted`. The
+ * difference matters: `not-refuted` is what earns a claim its place in the
+ * report, and awarding it because a response failed to parse would let a
+ * malformed answer promote a claim nobody actually checked.
+ */
+export function parseVerdict(text: string, verifier: number): VerifierVerdict {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) {
+    return { verifier, outcome: "cannot-determine", reason: "verifier returned no JSON", vocabulariesTried: [] };
+  }
+
+  try {
+    const raw = JSON.parse(match[0]) as Record<string, unknown>;
+    const outcome = raw["outcome"];
+    const valid: Outcome[] = ["refuted", "not-refuted", "cannot-determine"];
+
+    return {
+      verifier,
+      outcome: valid.includes(outcome as Outcome) ? (outcome as Outcome) : "cannot-determine",
+      reason: typeof raw["reason"] === "string" ? raw["reason"] : "",
+      ...(typeof raw["needsAccess"] === "string" ? { needsAccess: raw["needsAccess"] } : {}),
+      vocabulariesTried: Array.isArray(raw["vocabulariesTried"])
+        ? raw["vocabulariesTried"].filter((v): v is string => typeof v === "string")
+        : [],
+    };
+  } catch {
+    return { verifier, outcome: "cannot-determine", reason: "verifier returned unparseable JSON", vocabulariesTried: [] };
+  }
+}
+
+/** The verification stage's model. */
+export function makeVerifierModel(options: AuditModelOptions): VerifierModel {
+  return {
+    async refute(request: VerifyRequest): Promise<VerifierVerdict> {
+      try {
+        const loop = await runOnce(options, request.systemPrompt, request.userPrompt);
+        return parseVerdict(extractText(loop.content as unknown[]), request.verifier);
+      } catch (error) {
+        // A verifier that crashed did not clear the claim. Same reasoning as
+        // an unparseable reply: failure must never read as agreement.
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          verifier: request.verifier,
+          outcome: "cannot-determine",
+          reason: `verifier failed: ${detail}`,
+          vocabulariesTried: [],
+        };
+      }
+    },
+  };
+}

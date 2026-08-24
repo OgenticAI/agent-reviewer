@@ -11,7 +11,7 @@
  *   acquire → inventory → map → analyze → investigate → verify → closure → render
  */
 
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { acquire, AcquireError, writeSubject, subjectPathFor, type Subject } from "./engine/audit/acquire.js";
@@ -20,6 +20,21 @@ import { runAnalyzers, analyzerLanguageCoverage, skippedAnalyzerNotes } from "./
 import { renderReport, RenderRefused } from "./engine/audit/render.js";
 import type { AuditFinding } from "./engine/audit/finding.js";
 import type { JobFindings } from "./engine/findings/schema.js";
+import { investigate, summariseInvestigation, type Claim } from "./engine/audit/investigate.js";
+import { verifyClaims, summariseVerification, type LineReader } from "./engine/audit/verify.js";
+import { toAuditFindings, assertAllClosuresResolved, consolidateAsk, renderAsk } from "./engine/audit/closure.js";
+import { loadQuestionSet } from "./engine/audit/questions.js";
+import { makeReadTool } from "./engine/audit/read-tool.js";
+import { buildRepoMap, TagCache, type RepoFile } from "./engine/repomap/index.js";
+import { makeInvestigateModel, makeVerifierModel } from "./audit-model.js";
+import Anthropic from "@anthropic-ai/sdk";
+import { fileURLToPath } from "node:url";
+
+/**
+ * The baseline question set, resolved relative to this file rather than the
+ * working directory — the CLI is run from wherever the tree happens to be.
+ */
+const DEFAULT_QUESTIONS = fileURLToPath(new URL("../questions/taxonomy.yml", import.meta.url));
 import { maskSecrets } from "./engine/tools/sanitize.js";
 
 const USAGE = `audit — codebase audit
@@ -27,6 +42,7 @@ const USAGE = `audit — codebase audit
   audit acquire   --from <source> --into <dir> [--replace]
   audit inventory --tree <dir> [--out <dir>]
   audit analyze   --tree <dir> [--out <dir>]
+  audit investigate --tree <dir> [--out <dir>] [--questions <yml>] [--verifiers <n>]
   audit render    --tree <dir> --findings <findings.json> [--out <dir>] [--release-by <email>]
 
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
@@ -34,6 +50,8 @@ const USAGE = `audit — codebase audit
     --replace overwrite an existing directory instead of refusing
     --tree    an acquired tree to enumerate
     --out     where inventory.json / findings land (default: beside the tree)
+    --questions  a question set (default: questions/taxonomy.yml)
+    --verifiers  independent refutation attempts per claim (minimum 2)
     --findings   an AuditFinding[] produced by the verify + closure stages
     --release-by removes the DRAFT watermark, attributed to this person
 
@@ -191,6 +209,137 @@ function readAccessLog(outDir: string): FileAccessLog {
   }
 }
 
+/**
+ * Investigate, verify, price the open questions, and write findings.json.
+ *
+ * The three stages run as one command rather than three because their
+ * intermediate values are not artifacts anyone reviews — a claim that failed
+ * anchor checking is debris, not output. What lands on disk is the access log
+ * (coverage is computed from it) and the findings (the report is rendered from
+ * them).
+ */
+async function runInvestigate(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  if (!tree) {
+    process.stderr.write("investigate needs --tree\n\n" + USAGE);
+    return 2;
+  }
+
+  const out = flag(args, "--out") ?? tree;
+  const apiKey = process.env["ANTHROPIC_API_KEY"];
+  if (!apiKey) throw new CliError("ANTHROPIC_API_KEY is not set. The investigation stage needs a model.");
+
+  const subject = readArtifact<Subject>(subjectPathFor(tree), "audit acquire");
+  const jobs = readArtifact<JobFindings[]>(join(out, "analyzers.json"), "audit analyze");
+  const questionSet = loadQuestionSet(flag(args, "--questions") ?? DEFAULT_QUESTIONS);
+
+  const inventory = buildInventory(tree);
+
+  // The log the model writes into, and the only source of the coverage figure.
+  const accessLog = new FileAccessLog();
+  const readTool = makeReadTool({ root: tree, log: accessLog });
+
+  const anthropic = new Anthropic({ apiKey });
+  const modelOptions = { anthropic, readTool };
+
+  // Building the repo map parses every file for tags. Those reads are
+  // deliberately NOT access-log events: the map shows the model a ranked
+  // outline, not file contents, and counting them would put coverage at 100%
+  // on every run — a number that cannot be wrong is a number that says nothing.
+  const cache = new TagCache();
+  const repoFiles = readRepoFiles(tree, inventory);
+
+  process.stdout.write(
+    `investigating ${subject.name} — ${questionSet.questions.length} question(s), ` +
+      `${inventory.files.length} file(s) in scope\n`,
+  );
+
+  const results = await investigate({
+    questions: questionSet.questions,
+    model: makeInvestigateModel(modelOptions),
+    repoMapFor: (seedTexts) =>
+      buildRepoMap({ files: repoFiles, diffTouchedFiles: [], seedTexts, diffText: "", cache }).text,
+    analyzerJobs: jobs,
+    subjectRev: subject.rev,
+  });
+
+  const investigation = summariseInvestigation(results);
+  const claims: Claim[] = results.flatMap((r) => r.claims);
+  process.stdout.write(
+    `  claims     ${claims.length} kept, ${investigation.dropped} dropped\n` +
+      `  files      ${accessLog.opened().size} opened\n`,
+  );
+
+  const verification = await verifyClaims({
+    claims,
+    model: makeVerifierModel(modelOptions),
+    readLine: lineReaderFor(tree),
+    ...(flag(args, "--verifiers") ? { verifiers: Number(flag(args, "--verifiers")) } : {}),
+  });
+
+  const summary = summariseVerification(verification);
+  process.stdout.write(
+    `  verified   ${summary.verified} · inferred ${summary.inferred} · ` +
+      `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n`,
+  );
+
+  const closure = toAuditFindings({ verified: verification.verified });
+  assertAllClosuresResolved(closure);
+
+  accessLog.writeTo(out);
+  const findingsPath = join(out, "findings.json");
+  writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
+
+  process.stdout.write(
+    `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
+      renderAsk(consolidateAsk(closure.findings)).join("\n") +
+      "\n\n",
+  );
+  return 0;
+}
+
+/**
+ * Every in-scope file, with contents, for the tag parser.
+ *
+ * Unreadable files are skipped rather than fatal — a binary or a permission
+ * error should cost one file's ranking, not the run. They are already counted
+ * in the inventory denominator, so skipping here cannot flatter coverage.
+ */
+function readRepoFiles(tree: string, inventory: ReturnType<typeof buildInventory>): RepoFile[] {
+  const files: RepoFile[] = [];
+  for (const file of inventory.files) {
+    try {
+      const full = join(tree, file.path);
+      files.push({ path: file.path, content: readFileSync(full, "utf8"), mtimeMs: statSync(full).mtimeMs });
+    } catch {
+      continue;
+    }
+  }
+  return files;
+}
+
+/**
+ * Read one line of one file, for the verifier's anchor check.
+ *
+ * Returns null rather than throwing on anything unreadable, because a missing
+ * line is a legitimate verdict — it is how a citation to a file that does not
+ * exist gets caught.
+ */
+function lineReaderFor(tree: string): LineReader {
+  const cache = new Map<string, string[] | null>();
+  return (path: string, line: number): string | null => {
+    if (!cache.has(path)) {
+      try {
+        cache.set(path, readFileSync(join(tree, path), "utf8").split("\n"));
+      } catch {
+        cache.set(path, null);
+      }
+    }
+    const lines = cache.get(path);
+    return lines ? (lines[line - 1] ?? null) : null;
+  };
+}
+
 async function runRender(args: string[]): Promise<number> {
   const tree = flag(args, "--tree");
   const findingsPath = flag(args, "--findings");
@@ -253,6 +402,7 @@ async function main(): Promise<number> {
   if (command === "acquire") return runAcquire(args.slice(1));
   if (command === "inventory") return runInventory(args.slice(1));
   if (command === "analyze") return runAnalyze(args.slice(1));
+  if (command === "investigate") return runInvestigate(args.slice(1));
   if (command === "render") return runRender(args.slice(1));
 
   process.stderr.write(`unknown command "${command}"\n\n${USAGE}`);

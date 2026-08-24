@@ -8,11 +8,11 @@
  *
  * ── Why the archive path is not an afterthought ─────────────────────────────
  *
- * The DrTalk source we hold has no `.git`: it arrived as an export, despite our
- * having had Bitbucket read access the whole time. Our one real client codebase
- * came in by the path that is easy to treat as the edge case. Both paths are
- * first-class here, and the difference is recorded rather than smoothed over —
- * an archive yields `rev: null`, and the report says in Coverage that history
+ * Source arrives as an export more often than you would expect — a zip in a
+ * shared drive, sent by someone who had clone access the whole time. The path
+ * that looks like the edge case is the one real engagements take, so both are
+ * first-class here and the difference is recorded rather than smoothed over: an
+ * archive yields `rev: null`, and the report says in Coverage that history
  * signals were unavailable instead of quietly omitting them.
  */
 
@@ -66,8 +66,9 @@ export function isArchivePath(from: string): boolean {
  * Three things must NOT be rewritten: a URL that already has a scheme, an SCP
  * form (`git@host:owner/repo`), and a local filesystem path. That last one is
  * not hypothetical — cloning a local mirror is how you re-acquire a tree whose
- * history was lost, which is exactly the DrTalk case, and prefixing it with
- * `https://` turns an absolute path into a hostname lookup for `var`.
+ * history was lost, which is the usual state of an exported codebase, and
+ * prefixing it with `https://` turns an absolute path into a hostname lookup
+ * for `var`.
  */
 export function normaliseCloneUrl(from: string): string {
   if (/^(https?|ssh|git|file):\/\//.test(from)) return from;

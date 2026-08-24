@@ -200,8 +200,8 @@ export interface LanguageAnalyzerCoverage {
  * Which languages the deterministic pass actually covered, and which it did not.
  *
  * This exists to stop a report implying parity it does not have. Semgrep's
- * registry rules are far thinner for C# than for TypeScript, and a DrTalk-shaped
- * codebase at ~81% C# leans much harder on the agentic stages as a result.
+ * registry rules are far thinner for C# than for TypeScript, so a codebase that
+ * is mostly C# leans much harder on the agentic stages as a result.
  * Printing analyzers-per-language makes that visible instead of leaving a reader
  * to assume every language got the same treatment.
  *

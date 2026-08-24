@@ -69,18 +69,18 @@ describe("source classification", () => {
     ["repo.zip", true],
     ["export.tar.gz", true],
     ["export.TGZ", true],
-    ["bitbucket.org/drtalk/drtalk-web-react-app-v3", false],
+    ["bitbucket.org/acme/acme-web-app-v3", false],
     ["https://github.com/OgenticAI/agent-reviewer.git", false],
   ])("classifies %s", (from, archive) => {
     expect(isArchivePath(from)).toBe(archive);
   });
 
   it("adds https to a bare host/owner/repo, and leaves real URLs alone", () => {
-    expect(normaliseCloneUrl("bitbucket.org/drtalk/drtalk-web-react-app-v3")).toBe(
-      "https://bitbucket.org/drtalk/drtalk-web-react-app-v3",
+    expect(normaliseCloneUrl("bitbucket.org/acme/acme-web-app-v3")).toBe(
+      "https://bitbucket.org/acme/acme-web-app-v3",
     );
     expect(normaliseCloneUrl("https://x.com/a/b")).toBe("https://x.com/a/b");
-    expect(normaliseCloneUrl("git@bitbucket.org:drtalk/x.git")).toBe("git@bitbucket.org:drtalk/x.git");
+    expect(normaliseCloneUrl("git@bitbucket.org:acme/x.git")).toBe("git@bitbucket.org:acme/x.git");
   });
 });
 
@@ -161,16 +161,16 @@ describe("the tree walk", () => {
 
 describe("acquiring from an archive", () => {
   function makeArchive(kind: "zip" | "tgz"): string {
-    const staging = join(scratch, "staging", "drtalk-web-react-app-v3");
+    const staging = join(scratch, "staging", "acme-web-app-v3");
     plantCodebase(staging);
     const archive = join(scratch, `export.${kind === "zip" ? "zip" : "tar.gz"}`);
 
     if (kind === "zip") {
-      execFileSync("zip", ["-qr", archive, "drtalk-web-react-app-v3"], {
+      execFileSync("zip", ["-qr", archive, "acme-web-app-v3"], {
         cwd: join(scratch, "staging"),
       });
     } else {
-      execFileSync("tar", ["-czf", archive, "drtalk-web-react-app-v3"], {
+      execFileSync("tar", ["-czf", archive, "acme-web-app-v3"], {
         cwd: join(scratch, "staging"),
       });
     }
@@ -195,7 +195,7 @@ describe("acquiring from an archive", () => {
     await acquire({ from: makeArchive("tgz"), into });
 
     expect(existsSync(join(into, "src", "app.ts"))).toBe(true);
-    expect(existsSync(join(into, "drtalk-web-react-app-v3"))).toBe(false);
+    expect(existsSync(join(into, "acme-web-app-v3"))).toBe(false);
   });
 
   it("computes loc and langs from the extracted tree", async () => {
@@ -204,21 +204,22 @@ describe("acquiring from an archive", () => {
     expect(Object.keys(subject.langs).sort()).toEqual(["csharp", "markdown", "typescript"]);
   });
 
-  // The DrTalk repos are the 3.0 rebuild, not the live 4.6.x build. Which
-  // artefact was reviewed has to survive into the report's Targets section, so
-  // `origin` is recorded verbatim rather than tidied into a display name.
+  // A client can hand over a rebuild rather than the build actually in
+  // production, and the two carry the same product name. Which artefact was
+  // reviewed has to survive into the report's Targets section, so `origin` is
+  // recorded verbatim rather than tidied into a display name.
   it("records the origin verbatim, so a -v3 repo is never reported as the live product", async () => {
-    const staging = join(scratch, "staging", "drtalk-web-react-app-v3");
+    const staging = join(scratch, "staging", "acme-web-app-v3");
     plantCodebase(staging);
-    const archive = join(scratch, "drtalk-web-react-app-v3.tar.gz");
-    execFileSync("tar", ["-czf", archive, "drtalk-web-react-app-v3"], {
+    const archive = join(scratch, "acme-web-app-v3.tar.gz");
+    execFileSync("tar", ["-czf", archive, "acme-web-app-v3"], {
       cwd: join(scratch, "staging"),
     });
 
     const subject = await acquire({ from: archive, into: join(scratch, "work") });
 
     expect(subject.origin).toBe(archive);
-    expect(basename(subject.origin)).toBe("drtalk-web-react-app-v3.tar.gz");
+    expect(basename(subject.origin)).toBe("acme-web-app-v3.tar.gz");
   });
 
   it("refuses an archive containing a traversal entry, before writing anything", async () => {
@@ -284,7 +285,7 @@ describe("acquiring by clone", () => {
 });
 
 describe("clone failures read as instructions, not crashes", () => {
-  const url = "https://bitbucket.org/drtalk/drtalk-web-react-app-v3";
+  const url = "https://bitbucket.org/acme/acme-web-app-v3";
 
   // The likeliest failure by far: the host is private, which is the whole
   // reason read access had to be granted. That is a setup step, not a defect.
@@ -323,7 +324,7 @@ describe("acquired client code is never committable", () => {
     // check-ignore exits 0 only when the path is actually ignored, so this
     // tests git's resolution rather than our reading of the file.
     const root = new URL("../../", import.meta.url).pathname;
-    for (const path of ["work/drtalk-web/src/app.ts", "drtalk-web.subject.json"]) {
+    for (const path of ["work/acme-web/src/app.ts", "acme-web.subject.json"]) {
       expect(() => execFileSync("git", ["check-ignore", "-q", path], { cwd: root })).not.toThrow();
     }
   });

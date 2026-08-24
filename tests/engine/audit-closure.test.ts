@@ -1,0 +1,257 @@
+import { describe, it, expect } from "vitest";
+
+import {
+  deriveClosure,
+  toAuditFindings,
+  findingId,
+  consolidateAsk,
+  renderAsk,
+  assertAllClosuresResolved,
+  CLOSURE_CATALOGUE,
+} from "../../src/engine/audit/closure.js";
+import { validateFindings, type AuditFinding } from "../../src/engine/audit/finding.js";
+import type { VerifiedClaim } from "../../src/engine/audit/verify.js";
+import type { Claim } from "../../src/engine/audit/investigate.js";
+
+const REV = "a3f91c2";
+
+function claim(over: Partial<Claim> = {}): Claim {
+  return {
+    questionId: "config-precedence",
+    statement: "Production behaviour cannot be established from the repository.",
+    evidence: [{ path: "src/startup.ts", rev: REV, line: 42 }],
+    absence: false,
+    ...over,
+  };
+}
+
+function verified(over: Partial<VerifiedClaim> = {}): VerifiedClaim {
+  return {
+    claim: claim(),
+    verdicts: [],
+    confidence: "verified",
+    verifiers: 2,
+    refutations: 0,
+    vocabulariesTried: [],
+    ...over,
+  };
+}
+
+describe("drafting a closure path", () => {
+  it("prices a known kind of access", () => {
+    const closure = deriveClosure("the deployed configuration for production");
+    expect(closure).toMatchObject({
+      effortHours: 1,
+      blocker: "Client exports the configuration from the hosting console",
+    });
+    expect(closure?.method).toMatch(/key by key/);
+  });
+
+  // The finding should read as an answer to its own question, not as a
+  // catalogue entry that happened to match.
+  it("keeps the verifier's own words for what it lacked", () => {
+    const closure = deriveClosure("the App Service configuration blade");
+    expect(closure?.access).toContain("the App Service configuration blade");
+  });
+
+  it.each([
+    ["container acl", 0.5],
+    ["a read-only database connection", 2],
+    ["production log sample", 2],
+    ["a runtime instance", 4],
+    ["the deployment pipeline history", 1],
+  ])("prices %s at %s hours", (access, hours) => {
+    expect(deriveClosure(access)?.effortHours).toBe(hours);
+  });
+
+  // An invented estimate is worse than an absent one: someone quotes against
+  // these numbers.
+  it("returns null for an access it cannot price rather than guessing", () => {
+    expect(deriveClosure("a conversation with the original architect")).toBeNull();
+  });
+
+  it("never prices anything at zero or less", () => {
+    for (const template of CLOSURE_CATALOGUE) {
+      expect(template.effortHours).toBeGreaterThan(0);
+    }
+  });
+
+  // The credential entry must not invite anyone to hand over a value.
+  it("asks for a credential by name only, never its value", () => {
+    const closure = deriveClosure("which credential the service uses");
+    expect(closure?.method).toMatch(/no value is requested or handled/);
+  });
+});
+
+describe("turning verified claims into findings", () => {
+  it("attaches a closure path to a not-determinable finding", () => {
+    const result = toAuditFindings({
+      verified: [
+        verified({
+          confidence: "not-determinable",
+          needsAccess: "the deployed configuration for production",
+        }),
+      ],
+    });
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.findings[0]?.closure).toMatchObject({ effortHours: 1 });
+  });
+
+  it("leaves a settled finding without one", () => {
+    const result = toAuditFindings({ verified: [verified()] });
+    expect(result.findings[0]?.closure).toBeUndefined();
+  });
+
+  it("carries verifiers and refutations onto the finding", () => {
+    const result = toAuditFindings({
+      verified: [verified({ verifiers: 3, refutations: 0 })],
+    });
+    expect(result.findings[0]).toMatchObject({ verifiers: 3, refutations: 0 });
+  });
+
+  // The gate. An unpriced open question must not reach a report.
+  it("reports an unpriceable access as unresolved rather than inventing hours", () => {
+    const result = toAuditFindings({
+      verified: [
+        verified({ confidence: "not-determinable", needsAccess: "a conversation with the architect" }),
+      ],
+    });
+
+    expect(result.unresolved).toHaveLength(1);
+    expect(result.findings[0]?.closure).toBeUndefined();
+    expect(() => assertAllClosuresResolved(result)).toThrow(/no closure path/);
+  });
+
+  it("says what to do about an unresolved closure", () => {
+    const result = toAuditFindings({
+      verified: [verified({ confidence: "not-determinable", needsAccess: "something novel" })],
+    });
+    expect(() => assertAllClosuresResolved(result)).toThrow(/Add a template to CLOSURE_CATALOGUE/);
+  });
+
+  it("passes the gate when everything is priced", () => {
+    const result = toAuditFindings({
+      verified: [verified({ confidence: "not-determinable", needsAccess: "runtime instance" })],
+    });
+    expect(() => assertAllClosuresResolved(result)).not.toThrow();
+  });
+
+  // An absence claim downgraded for thin searching needs more work from US, and
+  // must not appear in the client's ask as though it were their job.
+  it("prices a downgraded absence claim as our own runtime confirmation", () => {
+    const result = toAuditFindings({
+      verified: [
+        verified({
+          claim: claim({ absence: true, statement: "No client consumes the event." }),
+          confidence: "not-determinable",
+        }),
+      ],
+    });
+    expect(result.findings[0]?.closure?.access).toMatch(/genuinely absent/);
+  });
+
+  it("produces findings that pass the OGE-2427 invariants", () => {
+    const result = toAuditFindings({
+      verified: [
+        verified({ claim: claim({ evidence: [{ path: "a.ts", rev: REV, line: 1 }] }) }),
+        verified({
+          claim: claim({ questionId: "other", evidence: [{ path: "b.ts", rev: REV }] }),
+          confidence: "not-determinable",
+          needsAccess: "the deployed configuration",
+        }),
+      ],
+    });
+
+    expect(validateFindings(result.findings, REV)).toEqual([]);
+  });
+});
+
+describe("finding ids", () => {
+  it("is stable across runs for the same claim", () => {
+    const a = findingId("q", "a statement", [{ path: "src/a.ts", rev: REV, line: 4 }]);
+    const b = findingId("q", "a statement", [{ path: "src/a.ts", rev: REV, line: 4 }]);
+    expect(a).toBe(b);
+  });
+
+  // A finding that moved down a file is the same finding.
+  it("does not change when the cited line moves", () => {
+    const before = findingId("q", "s", [{ path: "src/a.ts", rev: REV, line: 4 }]);
+    const after = findingId("q", "s", [{ path: "src/a.ts", rev: REV, line: 91 }]);
+    expect(before).toBe(after);
+  });
+
+  it("differs for a different statement, question or file", () => {
+    const base = findingId("q", "s", [{ path: "a.ts", rev: REV }]);
+    expect(findingId("q", "different", [{ path: "a.ts", rev: REV }])).not.toBe(base);
+    expect(findingId("other", "s", [{ path: "a.ts", rev: REV }])).not.toBe(base);
+    expect(findingId("q", "s", [{ path: "b.ts", rev: REV }])).not.toBe(base);
+  });
+
+  it("carries the question id, so an id is readable on sight", () => {
+    expect(findingId("config-precedence", "s", [])).toMatch(/^config-precedence-[0-9a-f]{8}$/);
+  });
+});
+
+describe("the consolidated ask", () => {
+  function open(id: string, blocker: string, hours: number, access: string): AuditFinding {
+    return {
+      id,
+      path: "a.ts",
+      message: "m",
+      severity: "warning",
+      source: "audit",
+      confidence: "not-determinable",
+      evidence: [],
+      verifiers: 2,
+      refutations: 0,
+      closure: { access, method: "m", effortHours: hours, blocker },
+    };
+  }
+
+  // One person exports one thing and several findings close at once — a much
+  // easier conversation than five separate requests.
+  it("groups by blocker, because that is the unit of action", () => {
+    const ask = consolidateAsk([
+      open("a", "Client exports config", 1, "config dump"),
+      open("b", "Client exports config", 0.5, "environment variables"),
+      open("c", "Client provisions read-only credentials", 2, "schema"),
+    ]);
+
+    expect(ask.totalHours).toBe(3.5);
+    expect(ask.openFindings).toBe(3);
+    expect(ask.byBlocker).toHaveLength(2);
+    expect(ask.byBlocker[0]).toMatchObject({ hours: 1.5 });
+    expect(ask.byBlocker[0]?.access).toEqual(["config dump", "environment variables"]);
+  });
+
+  it("ignores settled findings", () => {
+    const settled: AuditFinding = {
+      id: "x",
+      path: "a.ts",
+      message: "m",
+      severity: "info",
+      source: "audit",
+      confidence: "verified",
+      evidence: [{ path: "a.ts", rev: REV }],
+      verifiers: 2,
+      refutations: 0,
+    };
+    expect(consolidateAsk([settled, open("a", "b", 1, "c")]).openFindings).toBe(1);
+  });
+
+  it("says there is no ask rather than printing an empty section", () => {
+    expect(renderAsk(consolidateAsk([]))).toEqual(["No open questions require further access."]);
+  });
+
+  it("renders one priced list, not scattered caveats", () => {
+    const rendered = renderAsk(
+      consolidateAsk([open("a", "Client exports config", 1, "config dump")]),
+    ).join("\n");
+
+    expect(rendered).toMatch(/1 finding\(s\) could not be settled/);
+    expect(rendered).toMatch(/estimated 1 hour\(s\)/);
+    expect(rendered).toMatch(/Client exports config — 1 hour\(s\)/);
+    expect(rendered).toMatch(/· config dump/);
+  });
+});

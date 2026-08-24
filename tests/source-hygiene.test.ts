@@ -29,7 +29,7 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
     if (SKIP.has(entry)) continue;
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) sourceFiles(full, out);
-    else if (/\.(ts|tsx|js|mjs|json|md)$/.test(entry)) out.push(full);
+    else if (/\.(ts|tsx|js|mjs|json|md|ya?ml)$/.test(entry)) out.push(full);
   }
   return out;
 }
@@ -103,11 +103,18 @@ describe("source hygiene", () => {
   it("names no organisation outside the allowlist — this repository is public", () => {
     const offenders: string[] = [];
 
-    // Scoped to the audit engine and its tests: that is the code written
-    // against real client codebases, and the only place a fixture is likely to
-    // be reached for from the engagement on the desk. The pull-request path
-    // legitimately cites documentation URLs.
-    const watched = [join(ROOT, "src", "engine", "audit"), join(ROOT, "tests", "engine")];
+    // Scoped to the audit engine, its tests, and the question sets: that is the
+    // code and configuration written against real client codebases, and the only
+    // place a fixture is likely to be reached for from the engagement on the
+    // desk. `questions/` matters most of the three — a per-engagement set names
+    // a client's product surface, and the temptation is to commit it beside the
+    // baseline taxonomy. The pull-request path legitimately cites documentation
+    // URLs, so it is not watched.
+    const watched = [
+      join(ROOT, "src", "engine", "audit"),
+      join(ROOT, "tests", "engine"),
+      join(ROOT, "questions"),
+    ];
 
     for (const file of watched.flatMap((d) => sourceFiles(d))) {
       for (const org of referencedOrgs(readFileSync(file, "utf8"))) {

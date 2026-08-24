@@ -1,0 +1,340 @@
+/**
+ * The investigate stage (OGE-2429).
+ *
+ * One run per question. Each gets the repo map seeded from its own text, the
+ * deterministic findings as established facts, and a read-only tool loop over
+ * the acquired tree. What comes back is claims — not findings, and not
+ * confidence. Confidence is computed later by the verification stage
+ * (OGE-2430), from what independent verifiers could and could not refute.
+ *
+ * ── This is a first draft, and treating it as one is the point ──────────────
+ *
+ * The WS3 review changed five of nine answers under adversarial challenge. A
+ * pipeline that stopped here would have shipped a report wrong on more than
+ * half its headline questions, reading exactly as confident as the corrected
+ * one. Nothing in this file may present its output as settled.
+ *
+ * ── Evidence, or it did not happen ──────────────────────────────────────────
+ *
+ * A claim with no file-and-line evidence is dropped, and the drop is logged
+ * against the question id. This mirrors `dropUnsourcedCitations` on the
+ * pull-request path, which filters external references down to those a search
+ * actually returned and prints every one it removes. An unsourced claim is not
+ * a weaker finding; it is a sentence the model wrote.
+ */
+
+import type { EvidenceRef } from "./finding.js";
+import type { Question } from "./questions.js";
+import { seedTextsFor } from "./questions.js";
+import { sanitizeUntrusted } from "../tools/sanitize.js";
+import type { JobFindings } from "../findings/schema.js";
+
+/** What one question run produced, before anything has been verified. */
+export interface Claim {
+  questionId: string;
+  /** What the run asserts. One statement, not a paragraph. */
+  statement: string;
+  evidence: EvidenceRef[];
+  /** True when the claim asserts something does NOT exist. */
+  absence: boolean;
+}
+
+export interface QuestionRunResult {
+  questionId: string;
+  claims: Claim[];
+  /** Claims discarded for having no evidence, kept so the count is reportable. */
+  dropped: DroppedClaim[];
+  /** Repo-relative paths this run opened, for the coverage log (OGE-2426). */
+  openedFiles: string[];
+}
+
+export interface DroppedClaim {
+  questionId: string;
+  statement: string;
+  reason: "no-evidence" | "unreadable";
+}
+
+/* ── The model seam ───────────────────────────────────────────────────────── */
+
+export interface InvestigateRequest {
+  question: Question;
+  systemPrompt: string;
+  userPrompt: string;
+}
+
+export interface InvestigateResponse {
+  /** Raw model text. Parsed by `parseClaims`, which never throws. */
+  text: string;
+  /** Paths the tool loop opened during this run. */
+  openedFiles?: string[];
+}
+
+/**
+ * The model dependency, injected exactly as `VerdictModel` is on the
+ * pull-request path. The real implementation drives the Anthropic SDK and the
+ * tool loop; tests pass a stub returning canned JSON, so every rule in this
+ * file is testable without a model.
+ */
+export interface InvestigateModel {
+  investigate(request: InvestigateRequest): Promise<InvestigateResponse>;
+}
+
+/* ── Prompt assembly ──────────────────────────────────────────────────────── */
+
+const SYSTEM_PROMPT = [
+  "You are auditing a codebase you did not write and cannot run.",
+  "",
+  "Answer the question with claims grounded in files you have actually read.",
+  "Every claim carries at least one evidence reference: a repo-relative path,",
+  "and a line number where you have one. A claim you cannot cite is a claim you",
+  "must not make — say you could not establish it instead.",
+  "",
+  "You are producing a FIRST DRAFT. Independent verifiers will try to refute",
+  "every claim from its cited evidence. Write what you can defend, not what",
+  "sounds strongest.",
+  "",
+  "If the answer is that something does not exist, say so explicitly and set",
+  '"absence": true. Absence is re-tested separately before it is reported.',
+  "",
+  "Reply with JSON only:",
+  '{"claims":[{"statement":"...","absence":false,',
+  '"evidence":[{"path":"src/x.ts","line":42,"quote":"..."}]}]}',
+].join("\n");
+
+/**
+ * Established facts from the deterministic pass, handed over so the model
+ * annotates rather than re-derives.
+ *
+ * `parsed: false` is stated as loudly as a finding. A model that reads silence
+ * as "clean" will report a clean bill of health the run never earned, which is
+ * the exact failure `JobFindings.parsed` exists to prevent.
+ */
+export function renderAnalyzerFacts(jobs: JobFindings[]): string {
+  if (jobs.length === 0) return "No deterministic analysis was run.";
+
+  const lines = ["Established by deterministic analysis — do NOT re-derive these:"];
+  for (const job of jobs) {
+    if (!job.parsed) {
+      lines.push(`- ${job.job}: DID NOT RUN (${job.reason ?? "no reason recorded"}).`);
+      lines.push(`  Treat this as unknown, never as clean.`);
+      continue;
+    }
+    if (job.findings.length === 0) {
+      lines.push(`- ${job.job}: ran and reported nothing. This is a positive fact.`);
+      continue;
+    }
+    lines.push(`- ${job.job}: ${job.findings.length} finding(s), including:`);
+    for (const finding of job.findings.slice(0, 20)) {
+      lines.push(`    ${finding.path} [${finding.severity}] ${finding.message}`);
+    }
+    if (job.findings.length > 20) {
+      lines.push(`    … and ${job.findings.length - 20} more`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export interface PromptInput {
+  question: Question;
+  repoMap: string;
+  analyzerFacts: string;
+}
+
+/**
+ * Build the user prompt.
+ *
+ * Every piece of text that came from the tree under audit is sanitised first.
+ * A codebase can carry an instruction addressed to the reviewer — in an HTML
+ * comment, in zero-width characters, in a hidden attribute — and those are
+ * dangerous precisely because a human reading the file sees nothing.
+ */
+export function buildUserPrompt(input: PromptInput): string {
+  return [
+    `QUESTION (${input.question.id})`,
+    input.question.ask,
+    "",
+    "REPOSITORY MAP",
+    sanitizeUntrusted(input.repoMap),
+    "",
+    sanitizeUntrusted(input.analyzerFacts),
+    "",
+    input.question.absenceClaim
+      ? 'This question may legitimately answer "there is none". If so, say which vocabularies you searched.'
+      : "",
+  ]
+    .filter((section) => section !== "")
+    .join("\n");
+}
+
+/* ── Parsing what came back ───────────────────────────────────────────────── */
+
+function coerceEvidence(raw: unknown, subjectRev: string | null): EvidenceRef[] {
+  if (!Array.isArray(raw)) return [];
+
+  return raw.flatMap((entry): EvidenceRef[] => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const ref = entry as Record<string, unknown>;
+    const path = typeof ref.path === "string" ? ref.path.trim() : "";
+    if (!path) return [];
+
+    const line = typeof ref.line === "number" && Number.isFinite(ref.line) ? ref.line : undefined;
+    // The quote came out of the tree under audit; it is untrusted text like any
+    // other, and it ends up in a report.
+    const quote = typeof ref.quote === "string" ? sanitizeUntrusted(ref.quote) : undefined;
+
+    return [
+      {
+        path,
+        rev: subjectRev,
+        ...(line === undefined ? {} : { line }),
+        ...(quote === undefined || quote === "" ? {} : { quote }),
+      },
+    ];
+  });
+}
+
+/** Pull the JSON object out of a reply that may be fenced or prefaced. */
+function extractJson(text: string): unknown {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = (fenced?.[1] ?? text).trim();
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse a reply into claims, dropping every one that cites nothing.
+ *
+ * Never throws. A malformed reply for one question must not take down the
+ * other eight, and it is recorded rather than silently producing zero claims.
+ */
+export function parseClaims(
+  text: string,
+  question: Question,
+  subjectRev: string | null,
+): { claims: Claim[]; dropped: DroppedClaim[] } {
+  const data = extractJson(text);
+  if (typeof data !== "object" || data === null) {
+    return {
+      claims: [],
+      dropped: [{ questionId: question.id, statement: "(unparseable reply)", reason: "unreadable" }],
+    };
+  }
+
+  const rawClaims = (data as { claims?: unknown }).claims;
+  if (!Array.isArray(rawClaims)) {
+    return {
+      claims: [],
+      dropped: [{ questionId: question.id, statement: "(reply had no claims array)", reason: "unreadable" }],
+    };
+  }
+
+  const claims: Claim[] = [];
+  const dropped: DroppedClaim[] = [];
+
+  for (const entry of rawClaims) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const raw = entry as Record<string, unknown>;
+    const statement = typeof raw.statement === "string" ? raw.statement.trim() : "";
+    if (!statement) continue;
+
+    const evidence = coerceEvidence(raw.evidence, subjectRev);
+    if (evidence.length === 0) {
+      // The line that keeps the stage honest.
+      dropped.push({ questionId: question.id, statement, reason: "no-evidence" });
+      continue;
+    }
+
+    claims.push({
+      questionId: question.id,
+      statement,
+      evidence,
+      absence: raw.absence === true,
+    });
+  }
+
+  return { claims, dropped };
+}
+
+/* ── Running the stage ────────────────────────────────────────────────────── */
+
+export interface InvestigateOptions {
+  questions: Question[];
+  model: InvestigateModel;
+  /** Ranked repo map for one question, seeded from that question's own text. */
+  repoMapFor(seedTexts: string[]): string;
+  analyzerJobs: JobFindings[];
+  subjectRev: string | null;
+  /** Where dropped claims are announced. Defaults to stderr. */
+  log?: (message: string) => void;
+}
+
+/**
+ * Investigate every question.
+ *
+ * One question failing is not the run failing: its result comes back with no
+ * claims and a recorded drop, and the other questions are unaffected. An audit
+ * that fell over on question three and reported nothing would be worse than one
+ * that says which question it could not answer.
+ */
+export async function investigate(options: InvestigateOptions): Promise<QuestionRunResult[]> {
+  const log = options.log ?? ((message: string) => console.error(message));
+  const analyzerFacts = renderAnalyzerFacts(options.analyzerJobs);
+
+  const runs = options.questions.map(async (question): Promise<QuestionRunResult> => {
+    const userPrompt = buildUserPrompt({
+      question,
+      repoMap: options.repoMapFor(seedTextsFor(question)),
+      analyzerFacts,
+    });
+
+    let response: InvestigateResponse;
+    try {
+      response = await options.model.investigate({ question, systemPrompt: SYSTEM_PROMPT, userPrompt });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      log(`[investigate] ${question.id} failed: ${detail}`);
+      return {
+        questionId: question.id,
+        claims: [],
+        dropped: [{ questionId: question.id, statement: `(run failed: ${detail})`, reason: "unreadable" }],
+        openedFiles: [],
+      };
+    }
+
+    const { claims, dropped } = parseClaims(response.text, question, options.subjectRev);
+    for (const drop of dropped) {
+      log(`[investigate] dropped claim on ${drop.questionId} (${drop.reason}): ${drop.statement}`);
+    }
+
+    return {
+      questionId: question.id,
+      claims,
+      dropped,
+      openedFiles: response.openedFiles ?? [],
+    };
+  });
+
+  return Promise.all(runs);
+}
+
+/** Totals for the run record and the report's method section. */
+export function summariseInvestigation(results: QuestionRunResult[]): {
+  questions: number;
+  claims: number;
+  dropped: number;
+  filesOpened: number;
+} {
+  const opened = new Set(results.flatMap((result) => result.openedFiles));
+  return {
+    questions: results.length,
+    claims: results.reduce((total, result) => total + result.claims.length, 0),
+    dropped: results.reduce((total, result) => total + result.dropped.length, 0),
+    filesOpened: opened.size,
+  };
+}

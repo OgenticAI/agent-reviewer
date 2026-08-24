@@ -9,7 +9,8 @@
     "node": ">=20"
   },
   "bin": {
-    "ogenticai-reviewer": "./dist/cli.js"
+    "ogenticai-reviewer": "./dist/cli.js",
+    "ogenticai-audit": "./dist/audit-cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -21,7 +22,8 @@
     "review-pr": "tsx src/cli.ts",
     "eval": "tsx scripts/run-eval.ts",
     "eval:gen": "tsx scripts/gen-eval-fixtures.ts",
-    "drift": "tsx scripts/check-drift.ts"
+    "drift": "tsx scripts/check-drift.ts",
+    "audit": "tsx src/audit-cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.1",

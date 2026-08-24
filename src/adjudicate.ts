@@ -36,7 +36,7 @@
 import { lintChecklist, type LintFindingKind } from "./lint/checklist.js";
 import { parseUatChecklist, type UatItem } from "./parser/uat.js";
 import { VerdictStatus, type ItemVerdict, type ReviewVerdict } from "./schema/verdict.js";
-import type { ToolCallRecord } from "./tools/loop.js";
+import type { ToolCallRecord } from "./engine/tools/loop.js";
 
 /**
  * Linter categories whose punts are correct and must never be challenged.

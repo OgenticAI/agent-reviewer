@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CI_UNAVAILABLE, renderCiSection, type CiSummary } from "../../src/ci/summary.js";
+import { CI_UNAVAILABLE, renderCiSection, type CiSummary } from "../../src/pr/ci/summary.js";
 
 const SHA = "f6299112233aabbccdd";
 

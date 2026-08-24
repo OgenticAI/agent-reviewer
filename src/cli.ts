@@ -30,33 +30,33 @@ import Anthropic from "@anthropic-ai/sdk";
 
 import { runReview, ReviewSkippedError } from "./review.js";
 import type { GithubReader, VerdictModel } from "./review.js";
-import { LinearGraphqlClient } from "./linear/client.js";
-import { runWriteback } from "./linear/writeback.js";
-import { isCiGreen } from "./ci-green.js";
-import { fetchCiSummary } from "./ci/summary.js";
-import { readStickyComment, upsertStickyComment } from "./github/sticky.js";
+import { LinearGraphqlClient } from "./pr/linear/client.js";
+import { runWriteback } from "./pr/linear/writeback.js";
+import { isCiGreen } from "./pr/ci-green.js";
+import { fetchCiSummary } from "./pr/ci/summary.js";
+import { readStickyComment, upsertStickyComment } from "./pr/github/sticky.js";
 import { extractResearchTrace, extractText } from "./research/trace.js";
 import { parseVerdictFromStickyBody } from "./cache/verdict-cache.js";
 import { highestReviewedSha } from "./incremental/select.js";
 import { decideIncremental } from "./incremental/thresholds.js";
-import type { RepoFile } from "./repomap/index.js";
-import { runToolLoop, type TurnFn } from "./tools/loop.js";
+import type { RepoFile } from "./engine/repomap/index.js";
+import { runToolLoop, type TurnFn } from "./engine/tools/loop.js";
 import type { AdjudicatorModel } from "./adjudicate.js";
 import type { RefFileReader } from "./config.js";
 import { toOutcomeRows, renderOutcomeRows } from "./metrics/outcomes.js";
-import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./tools/registry.js";
-import { makeRepoTools, resolveWithinRoot } from "./tools/repo.js";
-import { makeHttpTools } from "./tools/http.js";
-import { makeExecTool, assertSecretlessEnv } from "./tools/exec.js";
-import { makeCiLogTools, type CiLogClient } from "./tools/ci-logs.js";
-import { parseFailLevel } from "./findings/gate.js";
-import { reconcileInlineComments, type InlineCommentClient } from "./github/inline-comments.js";
+import { EMPTY_REGISTRY, makeRegistry, toolDefinitions, type ToolRegistry } from "./engine/tools/registry.js";
+import { makeRepoTools, resolveWithinRoot } from "./engine/tools/repo.js";
+import { makeHttpTools } from "./engine/tools/http.js";
+import { makeExecTool, assertSecretlessEnv } from "./engine/tools/exec.js";
+import { makeCiLogTools, type CiLogClient } from "./engine/tools/ci-logs.js";
+import { parseFailLevel } from "./engine/findings/gate.js";
+import { reconcileInlineComments, type InlineCommentClient } from "./pr/github/inline-comments.js";
 import type { TriageModel } from "./triage/triage.js";
 import { parseUatChecklist } from "./parser/uat.js";
 import { lintChecklist } from "./lint/checklist.js";
 import { renderLintComment } from "./render/lint-comment.js";
 import { classifySkip, renderSkipComment } from "./render/skip-comment.js";
-import { decideSkipGate, parseChecklistPolicy } from "./protection/skip-gate.js";
+import { decideSkipGate, parseChecklistPolicy } from "./pr/protection/skip-gate.js";
 import { LINT_COMMENT_MARKER, REVIEWER_VERSION } from "./version.js";
 import {
   applyOverride,
@@ -68,7 +68,7 @@ import {
   type PermissionChecker,
   type PrReplyWriter,
 } from "./override.js";
-import { resolveTickets } from "./linear/resolve.js";
+import { resolveTickets } from "./pr/linear/resolve.js";
 
 const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
 

@@ -14,7 +14,7 @@ import {
   junitAdapter,
   parseAnyFindings,
   tscAdapter,
-} from "../../src/findings/adapters.js";
+} from "../../src/engine/findings/adapters.js";
 
 describe("eslintAdapter", () => {
   const raw = JSON.stringify([

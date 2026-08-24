@@ -14,7 +14,7 @@
  */
 
 import { parseUatChecklist, type UatItem, type UatItemLink } from "./parser/uat.js";
-import { resolveTickets } from "./linear/resolve.js";
+import { resolveTickets } from "./pr/linear/resolve.js";
 import { ReviewVerdict } from "./schema/verdict.js";
 import { overallStatus, type OverallStatus } from "./schema/verdict.js";
 import { renderStickyComment } from "./render/comment.js";
@@ -27,10 +27,10 @@ import {
 import { REVIEWER_VERSION } from "./version.js";
 import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
-import type { ToolCallRecord } from "./tools/loop.js";
+import type { ToolCallRecord } from "./engine/tools/loop.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
-import { CI_UNAVAILABLE, type CiSummary } from "./ci/summary.js";
+import { CI_UNAVAILABLE, type CiSummary } from "./pr/ci/summary.js";
 import {
   estimateTokens,
   packDiff,
@@ -45,10 +45,10 @@ import {
  */
 const DEFAULT_MAX_DIFF_TOKENS = 60_000;
 import { computeOutcomes, type OutcomeSummary } from "./metrics/outcomes.js";
-import { ingestFindings } from "./findings/ingest.js";
-import type { JobFindings } from "./findings/schema.js";
-import { gateFindings, type FindingsFailLevel, type FindingsGateResult } from "./findings/gate.js";
-import type { CiLogClient } from "./tools/ci-logs.js";
+import { ingestFindings } from "./engine/findings/ingest.js";
+import type { JobFindings } from "./engine/findings/schema.js";
+import { gateFindings, type FindingsFailLevel, type FindingsGateResult } from "./engine/findings/gate.js";
+import type { CiLogClient } from "./engine/tools/ci-logs.js";
 import {
   buildPositionMap,
   renderFallbackSection,
@@ -76,7 +76,7 @@ import {
   triggeredRecipes,
   type RefFileReader,
 } from "./config.js";
-import { buildRepoMap, type RepoFile } from "./repomap/index.js";
+import { buildRepoMap, type RepoFile } from "./engine/repomap/index.js";
 import type { LinearTicketContext, PrContext } from "./schema/event.js";
 
 export interface VerdictModelRequest {
@@ -483,7 +483,7 @@ export async function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
     const map = buildRepoMap({
       files: args.repoFiles,
       diffTouchedFiles: changedFiles,
-      checklistTexts: checklist.items.map((it) => it.text),
+      seedTexts: checklist.items.map((it) => it.text),
       diffText: packed.text,
       ...(args.mapTokens !== undefined ? { baseTokens: args.mapTokens } : {}),
     });

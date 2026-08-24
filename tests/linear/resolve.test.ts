@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveTickets } from "../../src/linear/resolve.js";
+import { resolveTickets } from "../../src/pr/linear/resolve.js";
 
 describe("resolveTickets", () => {
   it("extracts the ticket from the canonical branch name", () => {

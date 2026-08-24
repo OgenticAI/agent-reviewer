@@ -18,8 +18,8 @@ import {
   PathDeniedError,
   PathEscapeError,
   resolveWithinRoot,
-} from "../../src/tools/repo.js";
-import type { ReviewTool } from "../../src/tools/registry.js";
+} from "../../src/engine/tools/repo.js";
+import type { ReviewTool } from "../../src/engine/tools/registry.js";
 
 let root: string;
 let outside: string;

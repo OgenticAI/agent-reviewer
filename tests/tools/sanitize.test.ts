@@ -22,7 +22,7 @@ import {
   scrubObservation,
   SECRET_MASK,
   UNTRUSTED_CONTENT_RULE,
-} from "../../src/tools/sanitize.js";
+} from "../../src/engine/tools/sanitize.js";
 
 describe("sanitizeUntrusted — hide-from-human vectors", () => {
   it("strips HTML comments", () => {

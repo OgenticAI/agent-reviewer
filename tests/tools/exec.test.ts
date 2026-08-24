@@ -18,9 +18,9 @@ import {
   makeExecTool,
   renderObservation,
   type ExecObservation,
-} from "../../src/tools/exec.js";
-import { scrubObservation } from "../../src/tools/sanitize.js";
-import { makeRegistry } from "../../src/tools/registry.js";
+} from "../../src/engine/tools/exec.js";
+import { scrubObservation } from "../../src/engine/tools/sanitize.js";
+import { makeRegistry } from "../../src/engine/tools/registry.js";
 
 /** A fake runner so tests never spawn a shell. */
 function fakeRun(obs: ExecObservation) {

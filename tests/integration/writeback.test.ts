@@ -9,15 +9,15 @@
 
 import { describe, expect, it } from "vitest";
 
-import { runWriteback, pickStatusTransition } from "../../src/linear/writeback.js";
+import { runWriteback, pickStatusTransition } from "../../src/pr/linear/writeback.js";
 import type {
   LinearComment,
   LinearIssueLite,
   LinearWorkflowState,
   LinearWriter,
-} from "../../src/linear/writeback.js";
+} from "../../src/pr/linear/writeback.js";
 import type { ReviewVerdict } from "../../src/schema/verdict.js";
-import { LINEAR_COMMENT_MARKER } from "../../src/linear/render-comment.js";
+import { LINEAR_COMMENT_MARKER } from "../../src/pr/linear/render-comment.js";
 import { REVIEWER_VERSION } from "../../src/version.js";
 
 // ─── Mock LinearWriter ───────────────────────────────────────────────────────

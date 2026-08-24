@@ -18,8 +18,8 @@
  */
 
 import { CONFIG_PATH, isOverrideAllowed, type ReviewerConfig } from "./config.js";
-import type { LinearWriter } from "./linear/writeback.js";
-import { LINEAR_COMMENT_MARKER } from "./linear/render-comment.js";
+import type { LinearWriter } from "./pr/linear/writeback.js";
+import { LINEAR_COMMENT_MARKER } from "./pr/linear/render-comment.js";
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 

@@ -14,7 +14,7 @@ import {
   HostNotAllowedError,
   HTTP_MAX_BYTES,
   makeHttpTools,
-} from "../../src/tools/http.js";
+} from "../../src/engine/tools/http.js";
 
 function okFetch(body: string) {
   return vi.fn(async () => ({ ok: true, status: 200, text: async () => body }));

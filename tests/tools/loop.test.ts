@@ -17,8 +17,8 @@ import {
   runToolLoop,
   type LoopTurnResponse,
   type TurnFn,
-} from "../../src/tools/loop.js";
-import { EMPTY_REGISTRY, makeRegistry, type ReviewTool } from "../../src/tools/registry.js";
+} from "../../src/engine/tools/loop.js";
+import { EMPTY_REGISTRY, makeRegistry, type ReviewTool } from "../../src/engine/tools/registry.js";
 
 const FINAL: LoopTurnResponse = {
   content: [{ type: "text", text: '{"items":[]}' }],

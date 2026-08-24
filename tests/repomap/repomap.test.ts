@@ -9,14 +9,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { extractTags, TagCache, type RepoFile } from "../../src/repomap/tags.js";
+import { extractTags, TagCache, type RepoFile } from "../../src/engine/repomap/tags.js";
 import {
-  checklistIdentifiers,
+  seedIdentifiers,
   filesMatchingIdentifiers,
   rankFiles,
-} from "../../src/repomap/rank.js";
-import { renderRepoMap, scaledMapTokens } from "../../src/repomap/render.js";
-import { buildRepoMap } from "../../src/repomap/index.js";
+} from "../../src/engine/repomap/rank.js";
+import { renderRepoMap, scaledMapTokens } from "../../src/engine/repomap/render.js";
+import { buildRepoMap } from "../../src/engine/repomap/index.js";
 import { buildReviewPrompt } from "../../src/prompt/review.js";
 import { estimateTokens } from "../../src/prompt/diff-pack.js";
 import type { LinearTicketContext, PrContext } from "../../src/schema/event.js";
@@ -100,8 +100,8 @@ describe("rankFiles", () => {
 
 describe("checklist identifiers", () => {
   it("extracts >=5-char stems via non-word split", () => {
-    expect(checklistIdentifiers(["redactCategory works; the API returns 200"])).toContain("redactCategory");
-    expect(checklistIdentifiers(["the API works"])).not.toContain("API"); // too short
+    expect(seedIdentifiers(["redactCategory works; the API returns 200"])).toContain("redactCategory");
+    expect(seedIdentifiers(["the API works"])).not.toContain("API"); // too short
   });
 
   it("matches files whose path or symbol contains an identifier", () => {
@@ -116,7 +116,7 @@ describe("checklist identifiers", () => {
       ...extractTags("src/caller.ts", "helper(); helper();"),
     ];
     // Without the checklist seed, unrelated.ts (referenced) would outrank redaction.ts.
-    const identifiers = checklistIdentifiers(["redactCategory handles SSNs"]);
+    const identifiers = seedIdentifiers(["redactCategory handles SSNs"]);
     const seeds = filesMatchingIdentifiers(tags, identifiers);
     const ranked = rankFiles({ tags, seeds });
     const redactionRank = ranked.findIndex((r) => r.path === "src/redaction.ts");
@@ -178,7 +178,7 @@ describe("buildRepoMap + prompt injection", () => {
     const map = buildRepoMap({
       files,
       diffTouchedFiles: ["src/caller.ts"],
-      checklistTexts: ["redact masks input"],
+      seedTexts: ["redact masks input"],
       diffText: "diff --git a/src/caller.ts b/src/caller.ts\n+redact('a');",
     });
     expect(map.text).toContain("src/core.ts");

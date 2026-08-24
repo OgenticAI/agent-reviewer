@@ -1,0 +1,130 @@
+# The reusable audit taxonomy.
+#
+# An audit has no diff and no checklist. What drives it is a question set, and
+# these are the questions that have earned their place by being wrong somewhere
+# before: each one names a class of finding that a codebase can hide from a
+# reader who only looks at the code in front of them.
+#
+# ── Generic on purpose ──────────────────────────────────────────────────────
+#
+# This file is committed to a PUBLIC repository. Nothing here may name a client,
+# a product, or an engagement. A per-engagement set lives with the engagement,
+# never here, and inherits from this one.
+#
+# ── Writing a question ──────────────────────────────────────────────────────
+#
+# `ask` is the question, phrased so a wrong answer is falsifiable. Prefer "how
+# is X enforced" over "is X secure" — the first has an answer in the code, the
+# second invites an opinion.
+#
+# `seeds` are identifiers to rank files by. They are hints, not filters: the
+# ranker boosts files that match and still returns the rest.
+#
+# `absence_claim: true` marks a question whose answer may be "there is none".
+# Those are the easiest to get wrong and the most damaging to retract, so the
+# verification stage re-tests them against several vocabularies before "no" is
+# allowed to stand.
+
+version: 1
+name: baseline
+description: >
+  The default question set. Every engagement starts here and adds its own;
+  nothing engagement-specific belongs in this file.
+
+questions:
+  - id: config-precedence
+    ask: >
+      Which configuration actually applies in production, and can a file
+      committed to the repository override a value set by the deployment?
+    why: >
+      Configuration precedence is invisible in code review and decides real
+      behaviour. When the load order puts a checked-in file after the
+      environment's own, production runs on whatever the repository says.
+    seeds: [appsettings, config, environment, dotenv, ConfigurationBuilder, process.env]
+
+  - id: authn-completeness
+    ask: >
+      For each authentication path the product advertises, is it fully
+      implemented, partially wired, or a stub that returns success?
+    why: >
+      A login button that resolves to a stub is a feature the product claims and
+      does not have. This is about completeness, not correctness.
+    seeds: [login, signin, oauth, sso, token, session, verify, provider]
+
+  - id: unauthenticated-side-effects
+    ask: >
+      Which endpoints are reachable without authentication, and do any of them
+      change state, spend money, or send something to a third party?
+    why: >
+      An anonymous read is a disclosure question. An anonymous WRITE is an
+      availability and integrity question, and the two get filed together far
+      too often. Look for the omission next to neighbours that are guarded —
+      that pattern is an oversight, not a design.
+    seeds: [AllowAnonymous, public, unauthenticated, anonymous, webhook, callback]
+
+  - id: secrets-and-data-at-rest
+    ask: >
+      What protects sensitive data at rest, and does the protection actually
+      cover the fields that carry it?
+    why: >
+      Partial encryption reads as encryption. Record which fields are covered
+      and which are not — never reproduce a value, only its location.
+    seeds: [encrypt, decrypt, cipher, crypto, salt, key, secret, connectionString]
+
+  - id: deployment-provenance
+    ask: >
+      How does code reach production, and can that path be reconstructed from
+      the repository alone?
+    why: >
+      A pipeline that builds but does not deploy means the deployed artefact has
+      no recorded provenance. If nobody can say which commit is running, no
+      finding can be pinned to a version.
+    seeds: [pipeline, workflow, deploy, publish, release, docker, azure-pipelines]
+
+  - id: test-reality
+    ask: >
+      What do the automated tests actually cover, as opposed to what the
+      coverage configuration claims?
+    why: >
+      A coverage threshold scoped to a directory holding only types passes at
+      100% while testing nothing. Count real assertions against the code that
+      carries the risk.
+    seeds: [test, spec, coverage, threshold, jest, vitest, pytest, xunit]
+
+  - id: tenancy-isolation
+    ask: >
+      If the system is multi-tenant, what enforces the boundary, and is it
+      enforced on every read as well as every write?
+    why: >
+      Tenancy holds only if every query is scoped. One predicate that treats an
+      untagged row as belonging to everyone undoes the whole boundary.
+    seeds: [tenant, organization, workspace, account, partition, scope]
+
+  - id: data-model-scale
+    ask: >
+      What shape does the data layer commit the product to, and which of its
+      choices are expensive to reverse?
+    why: >
+      Partition keys, single-container designs and denormalised rosters are
+      cheap to write and costly to change. Name them while they are still a
+      design decision rather than a migration.
+    seeds: [partition, container, index, schema, migration, denormal]
+
+  - id: third-party-surface
+    ask: >
+      Which third parties does the product depend on at runtime, and what
+      happens to the user when one of them fails?
+    why: >
+      A dependency with no failure path is an outage with someone else's name
+      on it.
+    seeds: [client, sdk, api, http, retry, timeout, circuit, fallback]
+
+  - id: observability
+    ask: >
+      If the product misbehaved in production, what would tell anyone?
+    why: >
+      Instrumentation that is mounted but never fires reads exactly like
+      instrumentation that works. Check that events are emitted, not merely that
+      a library is installed.
+    absence_claim: true
+    seeds: [telemetry, analytics, trackEvent, logger, metric, trace, sentry]

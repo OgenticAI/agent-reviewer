@@ -7,3 +7,9 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
+
+# Acquired client codebases and their subject files (OGE-2425).
+# Client code stays on the machine and is NEVER committed. `audit acquire`
+# defaults here; an explicit --into elsewhere is the operator's responsibility.
+work/
+*.subject.json

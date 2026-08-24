@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
   acquire,
@@ -204,11 +204,21 @@ describe("acquiring from an archive", () => {
     expect(Object.keys(subject.langs).sort()).toEqual(["csharp", "markdown", "typescript"]);
   });
 
-  it("records the origin exactly as given, so a -v3 repo is never reported as the live product", async () => {
-    const archive = makeArchive("tgz");
+  // The DrTalk repos are the 3.0 rebuild, not the live 4.6.x build. Which
+  // artefact was reviewed has to survive into the report's Targets section, so
+  // `origin` is recorded verbatim rather than tidied into a display name.
+  it("records the origin verbatim, so a -v3 repo is never reported as the live product", async () => {
+    const staging = join(scratch, "staging", "drtalk-web-react-app-v3");
+    plantCodebase(staging);
+    const archive = join(scratch, "drtalk-web-react-app-v3.tar.gz");
+    execFileSync("tar", ["-czf", archive, "drtalk-web-react-app-v3"], {
+      cwd: join(scratch, "staging"),
+    });
+
     const subject = await acquire({ from: archive, into: join(scratch, "work") });
+
     expect(subject.origin).toBe(archive);
-    expect(subject.origin).toMatch(/v3/);
+    expect(basename(subject.origin)).toBe("drtalk-web-react-app-v3.tar.gz");
   });
 
   it("refuses an archive containing a traversal entry, before writing anything", async () => {

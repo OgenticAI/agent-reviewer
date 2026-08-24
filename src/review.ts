@@ -748,6 +748,32 @@ const MAX_VERDICT_RETRIES = 2;
  * Retries do not consume tool-loop iterations: the loop's caps govern
  * investigation, this governs output shape.
  */
+/**
+ * How much of a rejected response to quote back on retry.
+ *
+ * `VerdictModelRequest` carries no message history — each attempt is a fresh
+ * single-turn call — so the model cannot see what it returned unless we send
+ * it. Quoting the whole thing is the obvious move and the wrong one: a verdict
+ * over a long checklist can run to tens of kilobytes, and we would pay for it
+ * on every retry.
+ *
+ * Head and tail, because the two failure shapes live at opposite ends. A
+ * preamble the model was told not to write ("Here is the JSON:") is at the
+ * front; truncation and an unterminated array are at the back. Sampling one
+ * end would routinely cut away the evidence.
+ */
+const RETRY_EXCERPT_CHARS = 2000;
+
+/** Enough of the tail to see how a response ended, in an operator's log line. */
+const THROW_TAIL_CHARS = 300;
+
+export function excerptForRetry(text: string, limit = RETRY_EXCERPT_CHARS): string {
+  if (text.length <= limit) return text;
+  const half = Math.floor(limit / 2);
+  const cut = text.length - limit;
+  return `${text.slice(0, half)}\n\n... [${cut} characters omitted] ...\n\n${text.slice(-half)}`;
+}
+
 async function produceVerdictWithRetry(args: {
   model: VerdictModel;
   userPrompt: string;
@@ -755,6 +781,7 @@ async function produceVerdictWithRetry(args: {
   parse: (text: string, output: VerdictModelOutput) => ReviewVerdict;
 }): Promise<{ output: VerdictModelOutput; verdict: ReviewVerdict; retries: number }> {
   let lastError = "";
+  let lastText = "";
 
   for (let attempt = 0; attempt <= MAX_VERDICT_RETRIES; attempt++) {
     const prompt =
@@ -771,6 +798,12 @@ async function produceVerdictWithRetry(args: {
             lastError,
             "```",
             ``,
+            `This is what you returned:`,
+            ``,
+            "```",
+            excerptForRetry(lastText),
+            "```",
+            ``,
             `Return the corrected JSON only — same checklist, one object per item,`,
             `each with its 1-based "id". Do not explain the correction.`,
           ].join("\n");
@@ -778,6 +811,8 @@ async function produceVerdictWithRetry(args: {
     const output = normalizeModelOutput(
       await args.model.produce({ systemPrompt: SYSTEM_PROMPT, userPrompt: prompt, research: args.research }),
     );
+
+    lastText = output.text;
 
     try {
       return { output, verdict: args.parse(output.text, output), retries: attempt };
@@ -800,7 +835,8 @@ async function produceVerdictWithRetry(args: {
   // is visible, rather than silently gating a merge on a shifted table.
   throw new VerdictShapeError(
     `Model output failed schema validation after ${MAX_VERDICT_RETRIES + 1} attempts. ` +
-      `Last error: ${lastError}`,
+      `Last error: ${lastError}. ` +
+      `Last output ended: ...${lastText.slice(-THROW_TAIL_CHARS)}`,
   );
 }
 

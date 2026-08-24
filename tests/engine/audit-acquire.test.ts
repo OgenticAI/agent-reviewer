@@ -142,8 +142,8 @@ describe("the tree walk", () => {
 
   it("reports language share, not just a count", () => {
     const summary = summariseTree([
-      { path: "a.cs", language: "csharp", bytes: 10, loc: 80 },
-      { path: "b.ts", language: "typescript", bytes: 10, loc: 20 },
+      { path: "a.cs", language: "csharp", bytes: 10, loc: 80, sha256: "a" },
+      { path: "b.ts", language: "typescript", bytes: 10, loc: 20, sha256: "b" },
     ]);
     expect(summary.langs).toEqual({ csharp: 0.8, typescript: 0.2 });
   });

@@ -443,6 +443,49 @@ describe("runReview (end-to-end)", () => {
       expect(result.degraded).toMatch(/re-prompt/);
     });
 
+    // The model gets a fresh single-turn call each attempt — VerdictModelRequest
+    // carries no history — so it cannot see its own rejected output unless the
+    // retry prompt carries it. Without this it is asked to correct a mistake it
+    // has no record of making.
+    it("shows the model what it actually returned, not only the error", async () => {
+      const rejected = JSON.stringify({
+        items: [{ status: "PASS", rationale: "a", evidenceRefs: [] }],
+        summary: "x",
+      });
+      const prompts: string[] = [];
+      let call = 0;
+      const model: VerdictModel = {
+        produce: async (req: { userPrompt: string }) => {
+          prompts.push(req.userPrompt);
+          call += 1;
+          return call === 1
+            ? rejected
+            : JSON.stringify({
+                items: PR1_CHECKLIST_TEXTS.map((_t, i) => ({
+                  id: i + 1,
+                  status: "PASS",
+                  rationale: "ok",
+                  evidenceRefs: [],
+                })),
+                summary: "x",
+              });
+        },
+      };
+
+      await runReview(buildArgs({ model }));
+
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).not.toContain("Your previous response was rejected");
+      expect(prompts[1]).toContain("This is what you returned:");
+      expect(prompts[1]).toContain(rejected);
+    });
+
+    it("names the last output in the error when every attempt fails", async () => {
+      const bad = JSON.stringify({ items: [{ status: "PASS" }], summary: "SENTINEL_TAIL" });
+      const model: VerdictModel = { produce: async () => bad };
+      await expect(runReview(buildArgs({ model }))).rejects.toThrow(/SENTINEL_TAIL/);
+    });
+
     it("still fails closed on truly malformed output (e.g. invalid status)", async () => {
       const bogus = JSON.stringify({
         items: [{ id: 1, itemText: "x", status: "MAYBE", rationale: "y" }],

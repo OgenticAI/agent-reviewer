@@ -10,7 +10,7 @@
  * that returns a mediocre verdict, and the reviewer never fails the build.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_MAX_ITERATIONS,

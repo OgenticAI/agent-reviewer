@@ -180,6 +180,9 @@ describe("the prompt", () => {
   });
 
   it("sanitises zero-width characters hidden in the tree's text", () => {
+    // Real zero-width characters, not escapes: an escape would test the
+    // escape, and the sanitiser has to strip what actually arrives.
+    // eslint-disable-next-line no-irregular-whitespace
     const zeroWidth = `src/app.ts​​MARK​`;
     const prompt = buildUserPrompt({ question: question(), repoMap: zeroWidth, analyzerFacts: "" });
     expect(prompt).not.toContain("​");

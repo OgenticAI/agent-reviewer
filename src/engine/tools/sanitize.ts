@@ -156,7 +156,12 @@ function safeFromCodePoint(code: number): string {
  * these is invisible in the GitHub UI, which is exactly what makes it worth
  * stripping.
  */
-// eslint-disable-next-line no-misleading-character-class
+// The class below contains the invisible characters themselves — soft hyphen,
+// zero-width space, the bidi overrides, the word joiners, BOM. That is the
+// point: they are the payload being stripped. Replacing them with escapes
+// would be more readable and would also make this the only copy of the list
+// that cannot be checked against a real string by eye.
+// eslint-disable-next-line no-irregular-whitespace
 const INVISIBLE_CHARS = /[­​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
 
 /** Tag attributes that carry prose the reader never sees rendered. */

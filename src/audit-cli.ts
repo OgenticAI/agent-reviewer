@@ -11,16 +11,16 @@
  *   acquire → inventory → map → analyze → investigate → verify → closure → render
  */
 
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { acquire, AcquireError, writeSubject } from "./engine/audit/acquire.js";
+import { acquire, AcquireError, writeSubject, subjectPathFor, type Subject } from "./engine/audit/acquire.js";
 import { buildInventory, writeInventory, computeCoverage, FileAccessLog, COVERAGE_CAVEAT } from "./engine/audit/inventory.js";
 import { runAnalyzers, analyzerLanguageCoverage, skippedAnalyzerNotes } from "./engine/audit/analyze.js";
 import { renderReport, RenderRefused } from "./engine/audit/render.js";
+import type { AuditFinding } from "./engine/audit/finding.js";
+import type { JobFindings } from "./engine/findings/schema.js";
 import { maskSecrets } from "./engine/tools/sanitize.js";
-import { readFileSync } from "node:fs";
-import { subjectPathFor } from "./engine/audit/acquire.js";
 
 const USAGE = `audit — codebase audit
 
@@ -157,8 +157,13 @@ async function runAnalyze(args: string[]): Promise<number> {
  * A missing artifact is an ordering mistake, not a crash: the operator ran the
  * stages out of order or pointed at the wrong directory. Say which stage writes
  * the file rather than printing a Node stack trace at them.
+ *
+ * The type parameter is a claim about what the file holds, not a check on it —
+ * nothing here validates the parsed shape. It is worth stating anyway, because
+ * naming the expected type at each call site is how the next reader learns
+ * which stage writes what.
  */
-function readArtifact(path: string, producedBy: string): any {
+function readArtifact<T>(path: string, producedBy: string): T {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
@@ -195,9 +200,9 @@ async function runRender(args: string[]): Promise<number> {
   }
 
   const out = flag(args, "--out") ?? tree;
-  const subject = readArtifact(subjectPathFor(tree), "audit acquire");
-  const findings = readArtifact(findingsPath, "the verify and closure stages");
-  const jobs = readArtifact(join(out, "analyzers.json"), "audit analyze");
+  const subject = readArtifact<Subject>(subjectPathFor(tree), "audit acquire");
+  const findings = readArtifact<AuditFinding[]>(findingsPath, "the verify and closure stages");
+  const jobs = readArtifact<JobFindings[]>(join(out, "analyzers.json"), "audit analyze");
 
   const inventory = buildInventory(tree);
   const accessLog = readAccessLog(out);

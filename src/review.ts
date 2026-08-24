@@ -754,7 +754,6 @@ async function produceVerdictWithRetry(args: {
   research: ResearchPolicy;
   parse: (text: string, output: VerdictModelOutput) => ReviewVerdict;
 }): Promise<{ output: VerdictModelOutput; verdict: ReviewVerdict; retries: number }> {
-  let lastText = "";
   let lastError = "";
 
   for (let attempt = 0; attempt <= MAX_VERDICT_RETRIES; attempt++) {
@@ -779,7 +778,6 @@ async function produceVerdictWithRetry(args: {
     const output = normalizeModelOutput(
       await args.model.produce({ systemPrompt: SYSTEM_PROMPT, userPrompt: prompt, research: args.research }),
     );
-    lastText = output.text;
 
     try {
       return { output, verdict: args.parse(output.text, output), retries: attempt };

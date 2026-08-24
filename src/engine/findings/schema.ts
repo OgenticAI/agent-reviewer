@@ -62,6 +62,16 @@ export interface JobFindings {
   /** True when we recognized and parsed the output; false when we couldn't. */
   parsed: boolean;
   findings: Finding[];
+  /**
+   * Why `parsed` is false — "not installed", "no lockfile at repository root".
+   *
+   * Required in spirit whenever `parsed` is false (OGE-2428): an audit prints
+   * every one of these in its Coverage section, and "we could not tell what
+   * this analyzer did" is only useful to a reader who is told why. Optional in
+   * the type because the pull-request path predates it and omits jobs it cannot
+   * parse rather than recording them.
+   */
+  reason?: string;
 }
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {

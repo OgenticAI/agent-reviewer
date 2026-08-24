@@ -11,19 +11,24 @@
  *   acquire → inventory → map → analyze → investigate → verify → closure → render
  */
 
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { acquire, AcquireError, writeSubject } from "./engine/audit/acquire.js";
 import { buildInventory, writeInventory, COVERAGE_CAVEAT } from "./engine/audit/inventory.js";
+import { runAnalyzers, analyzerLanguageCoverage, skippedAnalyzerNotes } from "./engine/audit/analyze.js";
 
 const USAGE = `audit — codebase audit
 
   audit acquire   --from <source> --into <dir> [--replace]
   audit inventory --tree <dir> [--out <dir>]
+  audit analyze   --tree <dir> [--out <dir>]
 
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
     --into    where the tree lands; refuses an existing directory
     --replace overwrite an existing directory instead of refusing
     --tree    an acquired tree to enumerate
-    --out     where inventory.json lands (default: beside the tree)
+    --out     where inventory.json / findings land (default: beside the tree)
 
   Writes <dir>/../<name>.subject.json — the audit's identity. Every finding
   cites path@rev, so a re-audit can be diffed against this one.
@@ -102,6 +107,43 @@ async function runInventory(args: string[]): Promise<number> {
   return 0;
 }
 
+async function runAnalyze(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  if (!tree) {
+    process.stderr.write("analyze needs --tree\n\n" + USAGE);
+    return 2;
+  }
+
+  const jobs = await runAnalyzers(tree);
+  const out = flag(args, "--out") ?? tree;
+  writeFileSync(join(out, "analyzers.json"), `${JSON.stringify(jobs, null, 2)}\n`);
+
+  const lines: string[] = [`analyzed ${tree}`];
+  for (const job of jobs) {
+    lines.push(
+      job.parsed
+        ? `  ✓ ${job.job.padEnd(18)} ${job.findings.length} finding(s)`
+        : `  ! ${job.job.padEnd(18)} SKIPPED — ${job.reason ?? "no reason recorded"}`,
+    );
+  }
+
+  const coverage = analyzerLanguageCoverage(buildInventory(tree), jobs);
+  lines.push("", "  deterministic reach by language:");
+  for (const [language, { files, analyzers }] of Object.entries(coverage)) {
+    const ran = analyzers.length > 0 ? analyzers.join(", ") : "NOTHING RAN OVER THIS";
+    lines.push(`    ${language.padEnd(12)} ${String(files).padStart(5)} files  ${ran}`);
+  }
+
+  const skips = skippedAnalyzerNotes(jobs);
+  if (skips.length > 0) {
+    lines.push("", "  for the report's Coverage section:");
+    for (const note of skips) lines.push(`    ${note}`);
+  }
+
+  process.stdout.write(lines.join("\n") + "\n\n");
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -112,6 +154,7 @@ async function main(): Promise<number> {
   }
   if (command === "acquire") return runAcquire(args.slice(1));
   if (command === "inventory") return runInventory(args.slice(1));
+  if (command === "analyze") return runAnalyze(args.slice(1));
 
   process.stderr.write(`unknown command "${command}"\n\n${USAGE}`);
   return 1;

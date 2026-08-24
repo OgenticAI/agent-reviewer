@@ -276,9 +276,20 @@ function prepareTarget(into: string, replace: boolean): void {
   rmSync(into, { recursive: true, force: true });
 }
 
-/** Write `subject.json` beside the tree. The audit's identity, on disk. */
+/**
+ * Where the subject file for a tree lives.
+ *
+ * Exported because every later stage has to find this file, and a stage that
+ * re-derives the formula gets to drift from it. One function, one answer.
+ */
+export function subjectPathFor(treeDir: string): string {
+  const dir = resolve(treeDir);
+  return join(dir, "..", `${basename(dir)}.subject.json`);
+}
+
+/** Write the subject beside the tree. The audit's identity, on disk. */
 export function writeSubject(into: string, subject: Subject): string {
-  const path = join(resolve(into), "..", `${subject.name}.subject.json`);
+  const path = subjectPathFor(into);
   writeFileSync(path, `${JSON.stringify(subject, null, 2)}\n`);
   return path;
 }

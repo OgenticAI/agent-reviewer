@@ -29,6 +29,7 @@
 import type { AuditFinding, ClosurePath, Confidence, EvidenceRef } from "./finding.js";
 import { closureAsk } from "./finding.js";
 import type { VerifiedClaim } from "./verify.js";
+import { severityFor } from "./severity.js";
 import { createHash } from "node:crypto";
 
 /**
@@ -169,7 +170,9 @@ export interface ToFindingsOptions {
  * stand behind.
  */
 export function toAuditFindings(options: ToFindingsOptions): ClosureResult {
-  const severityFor = options.severityFor ?? (() => "warning" as const);
+  // The real ranking rule by default; a caller may still override, e.g. to
+  // feed an analyzer severity in for a finding that came from one.
+  const decideSeverity = options.severityFor ?? ((entry: VerifiedClaim) => severityFor({ entry }));
   const source = options.source ?? "audit";
 
   const findings: AuditFinding[] = [];
@@ -183,7 +186,7 @@ export function toAuditFindings(options: ToFindingsOptions): ClosureResult {
       id,
       path: claim.evidence[0]?.path ?? "(no path)",
       message: claim.statement,
-      severity: severityFor(entry),
+      severity: decideSeverity(entry),
       source,
       confidence,
       evidence: claim.evidence,

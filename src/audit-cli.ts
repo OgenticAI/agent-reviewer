@@ -15,20 +15,27 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { acquire, AcquireError, writeSubject } from "./engine/audit/acquire.js";
-import { buildInventory, writeInventory, COVERAGE_CAVEAT } from "./engine/audit/inventory.js";
+import { buildInventory, writeInventory, computeCoverage, FileAccessLog, COVERAGE_CAVEAT } from "./engine/audit/inventory.js";
 import { runAnalyzers, analyzerLanguageCoverage, skippedAnalyzerNotes } from "./engine/audit/analyze.js";
+import { renderReport, RenderRefused } from "./engine/audit/render.js";
+import { maskSecrets } from "./engine/tools/sanitize.js";
+import { readFileSync } from "node:fs";
+import { subjectPathFor } from "./engine/audit/acquire.js";
 
 const USAGE = `audit — codebase audit
 
   audit acquire   --from <source> --into <dir> [--replace]
   audit inventory --tree <dir> [--out <dir>]
   audit analyze   --tree <dir> [--out <dir>]
+  audit render    --tree <dir> --findings <findings.json> [--out <dir>] [--release-by <email>]
 
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
     --into    where the tree lands; refuses an existing directory
     --replace overwrite an existing directory instead of refusing
     --tree    an acquired tree to enumerate
     --out     where inventory.json / findings land (default: beside the tree)
+    --findings   an AuditFinding[] produced by the verify + closure stages
+    --release-by removes the DRAFT watermark, attributed to this person
 
   Writes <dir>/../<name>.subject.json — the audit's identity. Every finding
   cites path@rev, so a re-audit can be diffed against this one.
@@ -144,6 +151,92 @@ async function runAnalyze(args: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * Read a JSON artifact from an earlier stage.
+ *
+ * A missing artifact is an ordering mistake, not a crash: the operator ran the
+ * stages out of order or pointed at the wrong directory. Say which stage writes
+ * the file rather than printing a Node stack trace at them.
+ */
+function readArtifact(path: string, producedBy: string): any {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    const why = (error as NodeJS.ErrnoException).code === "ENOENT" ? "not found" : "could not be read";
+    throw new CliError(`${path} ${why}.\nIt is written by ${producedBy}. Run that first, or pass the directory it wrote to.`);
+  }
+}
+
+/**
+ * The access log the investigation stage wrote for this run.
+ *
+ * Named separately from `readArtifact` because the remedy differs: a missing
+ * access log is not a wrong --out, it is a run that never opened any files.
+ */
+function readAccessLog(outDir: string): FileAccessLog {
+  try {
+    return FileAccessLog.load(outDir);
+  } catch {
+    throw new CliError(
+      `${join(outDir, "access-log.json")} not found.\n` +
+        `It records which files the run opened, and Coverage is computed from it. ` +
+        `Without it the report would claim 0% coverage, so render refuses. ` +
+        `Run the investigation stage over this tree first.`,
+    );
+  }
+}
+
+async function runRender(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  const findingsPath = flag(args, "--findings");
+  if (!tree || !findingsPath) {
+    process.stderr.write("render needs --tree and --findings\n\n" + USAGE);
+    return 2;
+  }
+
+  const out = flag(args, "--out") ?? tree;
+  const subject = readArtifact(subjectPathFor(tree), "audit acquire");
+  const findings = readArtifact(findingsPath, "the verify and closure stages");
+  const jobs = readArtifact(join(out, "analyzers.json"), "audit analyze");
+
+  const inventory = buildInventory(tree);
+  const accessLog = readAccessLog(out);
+  const releaseBy = flag(args, "--release-by");
+
+  const result = await renderReport({
+    input: {
+      subject,
+      findings,
+      // Coverage is only as real as the access log behind it; a run whose log
+      // is missing is refused by the renderer rather than printed as 0%.
+      coverage: computeCoverage(inventory, accessLog),
+      analyzerJobs: jobs,
+      analyzerReach: analyzerLanguageCoverage(inventory, jobs),
+      questionCount: 10,
+      ...(releaseBy ? { release: { by: releaseBy, at: new Date().toISOString().slice(0, 10) } } : {}),
+    },
+    executiveSummary:
+      "This review read source code only. Every finding below carries the evidence it rests on, " +
+      "and every open question carries what would settle it.",
+    outDir: out,
+    subjectRev: subject.rev ?? null,
+    mask: (text) => maskSecrets(text),
+  });
+
+  const lines = [
+    `rendered ${findings.length} finding(s)`,
+    `  source     ${result.typstPath}`,
+    result.pdfPath ? `  pdf        ${result.pdfPath}` : `  pdf        NOT PRODUCED — ${result.pdfSkipped}`,
+    releaseBy ? `  released   ${releaseBy}` : "  status     DRAFT — watermarked, not for distribution",
+  ];
+  for (const warning of result.warnings) lines.push(`  ! ${warning}`);
+  process.stdout.write(lines.join("\n") + "\n\n");
+  return 0;
+}
+
+/** An operator mistake, printed as a sentence rather than a stack trace. */
+class CliError extends Error {}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -155,6 +248,7 @@ async function main(): Promise<number> {
   if (command === "acquire") return runAcquire(args.slice(1));
   if (command === "inventory") return runInventory(args.slice(1));
   if (command === "analyze") return runAnalyze(args.slice(1));
+  if (command === "render") return runRender(args.slice(1));
 
   process.stderr.write(`unknown command "${command}"\n\n${USAGE}`);
   return 1;
@@ -165,7 +259,7 @@ main()
   .catch((error: unknown) => {
     // An AcquireError is a refusal we chose — say it plainly, without a stack
     // that makes a deliberate safety check look like a crash.
-    if (error instanceof AcquireError) {
+    if (error instanceof AcquireError || error instanceof RenderRefused || error instanceof CliError) {
       process.stderr.write(`\n${error.message}\n`);
       process.exit(1);
     }

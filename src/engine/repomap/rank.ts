@@ -19,7 +19,7 @@ import type { Tag } from "./tags.js";
 const DAMPING = 0.85;
 /** Fixed iterations — plenty for convergence on repo-scale graphs, and stable. */
 const ITERATIONS = 40;
-/** Weight multiplier for an edge into a diff-touched or checklist-named file. */
+/** Weight multiplier for an edge into a seeded file. */
 const SEED_EDGE_MULTIPLIER = 4;
 
 export interface RankedFile {
@@ -37,7 +37,7 @@ export interface RankedFile {
  */
 export function rankFiles(args: {
   tags: Tag[];
-  /** Diff-touched files + files named by checklist identifiers. */
+  /** The files the run starts from — diff-touched, or named by a seed identifier. */
   seeds: string[];
 }): RankedFile[] {
   const defsByName = new Map<string, Set<string>>();
@@ -112,15 +112,15 @@ export function rankFiles(args: {
 }
 
 /**
- * Identifiers lexically extracted from checklist item text (OGE-1582).
+ * Identifiers lexically extracted from the seed text (OGE-1582).
  *
  * Aider's `\W+` split with a ≥5-char stem filter. Matched against the file
  * index to seed the personalization vector, so a claim naming `redactCategory`
  * boosts the file that defines it before any tool call is spent.
  */
-export function checklistIdentifiers(checklistTexts: string[]): string[] {
+export function seedIdentifiers(seedTexts: string[]): string[] {
   const out = new Set<string>();
-  for (const text of checklistTexts) {
+  for (const text of seedTexts) {
     for (const token of text.split(/\W+/)) {
       if (token.length >= 5) out.add(token);
     }
@@ -128,7 +128,7 @@ export function checklistIdentifiers(checklistTexts: string[]): string[] {
   return [...out];
 }
 
-/** Files whose path or a defined symbol matches a checklist identifier. */
+/** Files whose path or a defined symbol matches a seed identifier. */
 export function filesMatchingIdentifiers(tags: Tag[], identifiers: string[]): string[] {
   const idset = identifiers.map((s) => s.toLowerCase());
   const matched = new Set<string>();

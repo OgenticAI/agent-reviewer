@@ -17,7 +17,7 @@ import {
   type AdjudicatorModel,
 } from "../src/adjudicate.js";
 import { ReviewVerdict, type VerdictStatus } from "../src/schema/verdict.js";
-import type { ToolCallRecord } from "../src/tools/loop.js";
+import type { ToolCallRecord } from "../src/engine/tools/loop.js";
 
 const PR_BODY = [
   "Closes [OGE-308](https://linear.app/ogenticai/issue/OGE-308).",

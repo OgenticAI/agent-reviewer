@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   reconcileInlineComments,
   type InlineCommentClient,
-} from "../../src/github/inline-comments.js";
+} from "../../src/pr/github/inline-comments.js";
 import { inlineMarker, type InlineComment } from "../../src/render/inline.js";
 
 interface State {

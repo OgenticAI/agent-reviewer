@@ -14,8 +14,8 @@ import {
   CI_LOG_TAIL_CHARS,
   makeCiLogTools,
   type CiLogClient,
-} from "../../src/tools/ci-logs.js";
-import type { ReviewTool } from "../../src/tools/registry.js";
+} from "../../src/engine/tools/ci-logs.js";
+import type { ReviewTool } from "../../src/engine/tools/registry.js";
 
 const CTX = { owner: "OgenticAI", repo: "ogentic-shield", headSha: "f629911" };
 

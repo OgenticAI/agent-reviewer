@@ -9,8 +9,8 @@
  * (out-of-scope for OGE-339; the abstract interfaces are the seam).
  */
 
-import type { LinearTicketContext } from "../schema/event.js";
-import type { LinearClient as LinearReader } from "../review.js";
+import type { LinearTicketContext } from "../../schema/event.js";
+import type { LinearClient as LinearReader } from "../../review.js";
 import type {
   LinearComment,
   LinearIssueLite,

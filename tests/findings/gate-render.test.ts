@@ -10,9 +10,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import { gateFindings, parseFailLevel } from "../../src/findings/gate.js";
-import { renderFindingsSection } from "../../src/findings/render.js";
-import type { JobFindings } from "../../src/findings/schema.js";
+import { gateFindings, parseFailLevel } from "../../src/engine/findings/gate.js";
+import { renderFindingsSection } from "../../src/engine/findings/render.js";
+import type { JobFindings } from "../../src/engine/findings/schema.js";
 
 const withError: JobFindings = {
   job: "lint",

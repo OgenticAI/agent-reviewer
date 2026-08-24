@@ -25,8 +25,8 @@
  * so the caller (CLI / Action) can decide how to surface partial success.
  */
 
-import type { ReviewVerdict } from "../schema/verdict.js";
-import { overallStatus, type OverallStatus } from "../schema/verdict.js";
+import type { ReviewVerdict } from "../../schema/verdict.js";
+import { overallStatus, type OverallStatus } from "../../schema/verdict.js";
 import { renderLinearComment, LINEAR_COMMENT_MARKER } from "./render-comment.js";
 
 // ─── Linear surface the writer needs ─────────────────────────────────────────

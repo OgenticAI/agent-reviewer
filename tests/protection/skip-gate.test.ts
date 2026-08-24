@@ -18,7 +18,7 @@ import {
   isDocsFile,
   isDocsOnly,
   parseChecklistPolicy,
-} from "../../src/protection/skip-gate.js";
+} from "../../src/pr/protection/skip-gate.js";
 
 describe("isDocsFile", () => {
   it("treats prose, images and boilerplate as documentation", () => {

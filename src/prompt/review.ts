@@ -25,10 +25,10 @@ import { COMMENT_MARKER, REVIEWER_VERSION } from "../version.js";
 import type { LinearTicketContext, PrContext } from "../schema/event.js";
 import type { UatChecklist } from "../parser/uat.js";
 import type { ResearchPolicy } from "../research/policy.js";
-import { renderCiSection, type CiSummary } from "../ci/summary.js";
-import { renderFindingsSection } from "../findings/render.js";
-import type { JobFindings } from "../findings/schema.js";
-import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../tools/sanitize.js";
+import { renderCiSection, type CiSummary } from "../pr/ci/summary.js";
+import { renderFindingsSection } from "../engine/findings/render.js";
+import type { JobFindings } from "../engine/findings/schema.js";
+import { fenceUntrusted, sanitizeUntrusted, UNTRUSTED_CONTENT_RULE } from "../engine/tools/sanitize.js";
 import type { SkippedFile } from "./diff-pack.js";
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Octokit } from "@octokit/rest";
 
-import { isCiGreen } from "../src/ci-green.js";
+import { isCiGreen } from "../src/pr/ci-green.js";
 
 /**
  * Build a minimal Octokit stub that returns the canned `checks` and

@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 
 import { ReviewVerdict } from "../schema/verdict.js";
 import { normalizeToolOutput } from "./normalize.js";
-import type { ToolCallRecord } from "../tools/loop.js";
+import type { ToolCallRecord } from "../engine/tools/loop.js";
 
 /**
  * Fingerprint of what the client-side tools returned, with volatile substrings

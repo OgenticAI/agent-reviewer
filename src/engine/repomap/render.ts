@@ -15,7 +15,7 @@
  * gets a big one.
  */
 
-import { estimateTokens } from "../prompt/diff-pack.js";
+import { estimateTokens } from "../tokens.js";
 import type { RankedFile } from "./rank.js";
 import type { Tag } from "./tags.js";
 

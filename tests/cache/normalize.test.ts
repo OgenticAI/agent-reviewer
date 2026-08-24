@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 
 import { normalizeToolOutput } from "../../src/cache/normalize.js";
 import { hashToolOutputs } from "../../src/cache/verdict-cache.js";
-import type { ToolCallRecord } from "../../src/tools/loop.js";
+import type { ToolCallRecord } from "../../src/engine/tools/loop.js";
 
 function record(name: string, result: string): ToolCallRecord {
   return { name, input: {}, result, isError: false, durationMs: 1 };

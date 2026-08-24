@@ -27,8 +27,12 @@
  * unannounced truncation would cause.
  */
 
-/** Rough token estimate. */
-const CHARS_PER_TOKEN = 4;
+import { estimateTokens } from "../engine/tokens.js";
+
+// Re-exported: this module was the canonical import site before the estimate
+// moved into the engine, and several call sites still read better from here.
+export { estimateTokens };
+
 
 /**
  * Default budget for the diff section.
@@ -126,9 +130,6 @@ export interface PackDiffOptions {
   patchExtraLinesBefore?: number;
 }
 
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
-}
 
 /** Split a unified diff into per-file patches. */
 export function splitDiff(diff: string): FilePatch[] {

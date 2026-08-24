@@ -11,14 +11,14 @@
  * existing comment to update instead of creating a duplicate.
  */
 
-import type { ReviewVerdict, VerdictStatus } from "../schema/verdict.js";
-import type { OverallStatus } from "../schema/verdict.js";
-import { REVIEWER_VERSION } from "../version.js";
+import type { ReviewVerdict, VerdictStatus } from "../../schema/verdict.js";
+import type { OverallStatus } from "../../schema/verdict.js";
+import { REVIEWER_VERSION } from "../../version.js";
 import {
   computeVerdictMetrics,
   renderMetricsBlock,
   type VerdictMetrics,
-} from "../metrics/verdict-metrics.js";
+} from "../../metrics/verdict-metrics.js";
 
 /**
  * Marker used to find the bot's existing comment on a Linear ticket. Linear

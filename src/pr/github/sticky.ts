@@ -14,7 +14,7 @@
 
 import type { Octokit } from "@octokit/rest";
 
-import { COMMENT_MARKER } from "../version.js";
+import { COMMENT_MARKER } from "../../version.js";
 
 export interface UpsertStickyArgs {
   octokit: Octokit;

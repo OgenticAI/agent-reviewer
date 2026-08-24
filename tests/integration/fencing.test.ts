@@ -15,10 +15,10 @@
 
 import { describe, expect, it } from "vitest";
 
-import { runToolLoop } from "../../src/tools/loop.js";
-import { makeRegistry, type ReviewTool } from "../../src/tools/registry.js";
+import { runToolLoop } from "../../src/engine/tools/loop.js";
+import { makeRegistry, type ReviewTool } from "../../src/engine/tools/registry.js";
 import { hashToolOutputs } from "../../src/cache/verdict-cache.js";
-import { SECRET_MASK } from "../../src/tools/sanitize.js";
+import { SECRET_MASK } from "../../src/engine/tools/sanitize.js";
 import { buildReviewPrompt } from "../../src/prompt/review.js";
 import { parseUatChecklist } from "../../src/parser/uat.js";
 import type { LinearTicketContext, PrContext } from "../../src/schema/event.js";

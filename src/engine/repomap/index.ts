@@ -6,9 +6,9 @@
  * being paid for one tool iteration at a time.
  */
 
-import { estimateTokens } from "../prompt/diff-pack.js";
+import { estimateTokens } from "../tokens.js";
 import {
-  checklistIdentifiers,
+  seedIdentifiers,
   filesMatchingIdentifiers,
   rankFiles,
 } from "./rank.js";
@@ -19,8 +19,15 @@ export interface BuildRepoMapArgs {
   files: RepoFile[];
   /** Files the diff touched — the primary personalization seed. */
   diffTouchedFiles: string[];
-  /** UAT checklist item texts — identifiers boost matching files' rank. */
-  checklistTexts: string[];
+  /**
+   * Free text describing what the run is looking for; identifiers found in it
+   * boost matching files' rank.
+   *
+   * On the PR path these are the UAT checklist items. Nothing here knows that
+   * — it extracts identifiers from arbitrary text — which is exactly why an
+   * audit can seed the same ranker from its question set instead.
+   */
+  seedTexts: string[];
   /** The packed diff, sized to scale the map budget inversely. */
   diffText: string;
   baseTokens?: number;
@@ -32,7 +39,7 @@ export function buildRepoMap(args: BuildRepoMapArgs): RenderedMap {
   const cache = args.cache ?? new TagCache();
   const tags = cache.tagsForAll(args.files);
 
-  const ids = checklistIdentifiers(args.checklistTexts);
+  const ids = seedIdentifiers(args.seedTexts);
   const identifierFiles = filesMatchingIdentifiers(tags, ids);
   const seeds = [...new Set([...args.diffTouchedFiles, ...identifierFiles])];
 

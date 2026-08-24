@@ -15,7 +15,7 @@
  * Anthropic forbids claude-code-action from doing. A test asserts the surface.
  */
 
-import { parseInlineMarker, type InlineComment } from "../render/inline.js";
+import { parseInlineMarker, type InlineComment } from "../../render/inline.js";
 
 /**
  * The minimal, deliberately narrow GitHub surface for inline comments.

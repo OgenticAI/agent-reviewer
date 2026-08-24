@@ -4,7 +4,7 @@ import {
   mergeProtection,
   removeFromProtection,
   type BranchProtectionPut,
-} from "../../src/protection/merge.js";
+} from "../../src/pr/protection/merge.js";
 
 const OUR_CHECK = "OgenticAI Reviewer / UAT";
 

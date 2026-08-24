@@ -8,8 +8,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { ingestFindings } from "../../src/findings/ingest.js";
-import type { CiLogClient } from "../../src/tools/ci-logs.js";
+import { ingestFindings } from "../../src/engine/findings/ingest.js";
+import type { CiLogClient } from "../../src/engine/tools/ci-logs.js";
 
 const CTX = { owner: "OgenticAI", repo: "agent-reviewer", headSha: "sha" };
 

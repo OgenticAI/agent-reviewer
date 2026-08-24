@@ -186,11 +186,22 @@ function err(content: string): ToolResult {
  * `root` is the checkout directory — in the Action, the consumer repo's
  * working directory.
  */
-export function makeRepoTools(root: string): ReviewTool[] {
-  return [readFileTool(root), searchRepoTool(root), listFilesTool(root)];
+/**
+ * Records every attempt to open a file, successful or not (OGE-2426).
+ *
+ * Optional, and absent on the pull-request path: a PR review has no coverage
+ * denominator to divide into. An audit does, and the ratio is only honest if
+ * the numerator counts what was actually read rather than what was asked for.
+ */
+export interface RepoAccessRecorder {
+  record(path: string, outcome: "read" | "denied" | "missing" | "too-large" | "escaped"): void;
 }
 
-function readFileTool(root: string): ReviewTool {
+export function makeRepoTools(root: string, recorder?: RepoAccessRecorder): ReviewTool[] {
+  return [readFileTool(root, recorder), searchRepoTool(root), listFilesTool(root)];
+}
+
+function readFileTool(root: string, recorder?: RepoAccessRecorder): ReviewTool {
   return {
     definition: {
       name: "read_file",
@@ -226,6 +237,9 @@ function readFileTool(root: string): ReviewTool {
       try {
         abs = resolveWithinRoot(root, path);
       } catch (e) {
+        // Denied by the deny-list, or resolved outside the root. Both are
+        // attempts on a real path and both belong in the log.
+        recorder?.record(path, e instanceof PathDeniedError ? "denied" : "escaped");
         return err(e instanceof Error ? e.message : String(e));
       }
 
@@ -233,10 +247,14 @@ function readFileTool(root: string): ReviewTool {
       try {
         stat = statSync(abs);
       } catch {
+        recorder?.record(path, "missing");
         return err(`No such file: ${path}`);
       }
+      // A directory is not a failed read of a file — nothing was covered or
+      // missed, so it is not logged either way.
       if (stat.isDirectory()) return err(`${path} is a directory — use list_files.`);
       if (stat.size > MAX_FILE_BYTES) {
+        recorder?.record(path, "too-large");
         return err(
           `${path} is ${stat.size} bytes, over the ${MAX_FILE_BYTES}-byte read limit. ` +
             `Use start_line/end_line to read a range.`,
@@ -268,6 +286,11 @@ function readFileTool(root: string): ReviewTool {
       const notes: string[] = [];
       if (above > 0) notes.push(`${above} line(s) above`);
       if (below > 0) notes.push(`${below} line(s) below — read again with start_line=${end + 1}`);
+
+      // Recorded HERE, not at readFileSync: a read that opened the file and
+      // then errored on an out-of-range window showed the model nothing, and
+      // counting it as covered would overstate the numerator.
+      recorder?.record(path, "read");
       return ok(notes.length > 0 ? `${slice}\n… (${notes.join("; ")})` : slice);
     },
   };

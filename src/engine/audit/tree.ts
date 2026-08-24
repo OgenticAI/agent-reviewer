@@ -8,6 +8,7 @@
  * is.
  */
 
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, relative, sep } from "node:path";
 
@@ -70,23 +71,40 @@ export interface TreeFile {
   bytes: number;
   /** Lines of text. `0` for a file we could not read as text. */
   loc: number;
+  /** SHA-256 of the bytes, so a re-audit can tell a moved file from a changed one. */
+  sha256: string;
 }
 
+/** What one read of a file tells us. Both facts come from the same buffer. */
+interface FileFacts {
+  loc: number;
+  sha256: string;
+}
+
+const EMPTY_FILE: FileFacts = {
+  loc: 0,
+  // SHA-256 of zero bytes. Naming it beats hashing an empty buffer to rediscover it.
+  sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+};
+
 /**
- * Lines in a file, or 0 if it is not text.
+ * Line count and digest, from a single read.
  *
- * A NUL byte is the same signal `grep` uses, and OGE-2450 is why we take it
- * seriously: a binary counted as source would inflate the denominator with
- * lines nobody can review.
+ * A NUL byte means "not text", and OGE-2450 is why we take that seriously: a
+ * binary counted as source would inflate the denominator with lines nobody can
+ * review. It is still hashed and still counted as a file — it exists, it just
+ * has no lines.
  */
-function countLines(absolutePath: string, bytes: number): number {
-  if (bytes === 0) return 0;
+function readFileFacts(absolutePath: string, bytes: number): FileFacts {
+  if (bytes === 0) return EMPTY_FILE;
+
   const buffer = readFileSync(absolutePath);
-  if (buffer.includes(0)) return 0;
+  const sha256 = createHash("sha256").update(buffer).digest("hex");
+  if (buffer.includes(0)) return { loc: 0, sha256 };
 
   const text = buffer.toString("utf8");
   const newlines = text.split("\n").length;
-  return text.endsWith("\n") ? newlines - 1 : newlines;
+  return { loc: text.endsWith("\n") ? newlines - 1 : newlines, sha256 };
 }
 
 /**
@@ -114,7 +132,7 @@ export function walkTree(root: string): TreeFile[] {
         path: relative(root, absolute).split(sep).join("/"),
         language: languageOf(entry.name),
         bytes: size,
-        loc: countLines(absolute, size),
+        ...readFileFacts(absolute, size),
       });
     }
   };

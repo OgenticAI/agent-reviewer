@@ -34,6 +34,7 @@ import {
   skippedAnalyzerNotes,
 } from "./engine/audit/analyze.js";
 import { renderReport, RenderRefused } from "./engine/audit/render.js";
+import type { QuestionOutcome } from "./engine/audit/maturity.js";
 import type { AuditFinding } from "./engine/audit/finding.js";
 import type { JobFindings } from "./engine/findings/schema.js";
 import {
@@ -560,6 +561,22 @@ async function investigateRun(ctx: {
     return result;
   });
 
+  // What the investigation managed to ask, persisted for the maturity table.
+  // A question that ran and found nothing is evidence; a question that never
+  // ran is not — and from findings alone the two are indistinguishable, because
+  // both produce none.
+  writeFileSync(
+    join(out, "questions.json"),
+    `${JSON.stringify(
+      results.map((r) => ({
+        id: r.questionId,
+        answered: r.dropped.length === 0 || r.claims.length > 0,
+      })),
+      null,
+      2,
+    )}\n`,
+  );
+
   accessLog.writeTo(out);
   const findingsPath = join(out, "findings.json");
   writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
@@ -676,6 +693,24 @@ async function uploadArtifacts(
   return lines;
 }
 
+/**
+ * What the investigation asked, if the run left a record.
+ *
+ * Optional rather than required: a render-only invocation over an older run
+ * predates this file, and omitting the maturity table is a better answer than
+ * fabricating one. Unlike the access log, its absence does not make any
+ * PRINTED number wrong — it removes a section rather than falsifying one.
+ */
+function readQuestionOutcomes(outDir: string): QuestionOutcome[] | undefined {
+  try {
+    return JSON.parse(
+      readFileSync(join(outDir, "questions.json"), "utf8"),
+    ) as QuestionOutcome[];
+  } catch {
+    return undefined;
+  }
+}
+
 async function runRender(args: string[]): Promise<number> {
   const tree = flag(args, "--tree");
   const findingsPath = flag(args, "--findings");
@@ -697,6 +732,7 @@ async function runRender(args: string[]): Promise<number> {
 
   const inventory = buildInventory(tree);
   const accessLog = readAccessLog(out);
+  const questionOutcomes = readQuestionOutcomes(out);
   const releaseBy = flag(args, "--release-by");
 
   const { telemetry: renderTelemetry } = resolveRun(out);
@@ -711,6 +747,10 @@ async function runRender(args: string[]): Promise<number> {
         analyzerJobs: jobs,
         analyzerReach: analyzerLanguageCoverage(inventory, jobs),
         questionCount: 10,
+        // Absent when the run record is missing: the renderer omits the maturity
+        // table rather than rating every category on nothing.
+        ...(questionOutcomes ? { questionOutcomes } : {}),
+        excluded: inventory.excluded,
         ...(releaseBy
           ? {
               release: {

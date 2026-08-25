@@ -35,6 +35,14 @@ import {
 } from "./engine/audit/analyze.js";
 import { renderReport, RenderRefused } from "./engine/audit/render.js";
 import type { QuestionOutcome } from "./engine/audit/maturity.js";
+import {
+  appendRecallRun,
+  DEFECT_CATALOGUE,
+  injectIntoTree,
+  matchDefects,
+  recallReport,
+  renderRecall,
+} from "./eval/audit-recall.js";
 import type { AuditFinding } from "./engine/audit/finding.js";
 import type { JobFindings } from "./engine/findings/schema.js";
 import {
@@ -89,6 +97,8 @@ const USAGE = `audit — codebase audit
   audit analyze   --tree <dir> [--out <dir>]
   audit investigate --tree <dir> [--out <dir>] [--questions <yml>] [--verifiers <n>]
   audit render    --tree <dir> --findings <findings.json> [--out <dir>] [--release-by <email>]
+  audit inject    --tree <dir>                       plant known defects, for calibration
+  audit recall    --tree <dir> --findings <f.json> [--out <dir>]   score a run against them
 
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
     --into    where the tree lands; refuses an existing directory
@@ -711,6 +721,95 @@ function readQuestionOutcomes(outDir: string): QuestionOutcome[] | undefined {
   }
 }
 
+/**
+ * Plant known defects in a tree, for recall calibration (OGE-2433).
+ *
+ * Destructive, and deliberately so — it rewrites source files in place. Point
+ * it at a throwaway copy. It refuses nothing and copies nothing: a command that
+ * silently duplicates a tree is one that eventually duplicates the wrong one.
+ */
+async function runInject(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  if (!tree) {
+    process.stderr.write("inject needs --tree\n\n" + USAGE);
+    return 2;
+  }
+
+  const { injected, notApplied } = injectIntoTree(tree);
+  writeFileSync(
+    join(tree, "..", "injected.json"),
+    `${JSON.stringify(injected, null, 2)}\n`,
+  );
+
+  const lines = [
+    `planted ${injected.length} defect(s) of ${DEFECT_CATALOGUE.length} in ${tree}`,
+    ...injected.map(
+      (d) => `  ${d.class.padEnd(22)} ${d.path}:${d.line}  ${d.id}`,
+    ),
+  ];
+  // Named, never silent. A defect that did not apply leaves the denominator,
+  // and an operator who does not know that will read the recall figure as
+  // covering the whole catalogue.
+  if (notApplied.length > 0) {
+    lines.push("", "  not planted (these leave the denominator):");
+    for (const n of notApplied) lines.push(`    ${n.id}: ${n.reason}`);
+  }
+  lines.push(
+    "",
+    "  THIS TREE IS NOW CORRUPT. Run the audit over it, then `audit recall`.",
+  );
+
+  process.stdout.write(lines.join("\n") + "\n\n");
+  return 0;
+}
+
+/** Score an audit run against the defects planted in its tree. */
+async function runRecall(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  const findingsPath = flag(args, "--findings");
+  if (!tree || !findingsPath) {
+    process.stderr.write("recall needs --tree and --findings\n\n" + USAGE);
+    return 2;
+  }
+
+  const out = flag(args, "--out") ?? tree;
+  const injected = readArtifact<
+    Array<Parameters<typeof matchDefects>[0][number]>
+  >(join(tree, "..", "injected.json"), "audit inject");
+  const findings = readArtifact<AuditFinding[]>(
+    findingsPath,
+    "the verify and closure stages",
+  );
+
+  const matches = matchDefects(injected, findings);
+  const report = recallReport(
+    matches,
+    DEFECT_CATALOGUE.length - injected.length,
+  );
+
+  appendRecallRun(out, {
+    ...report,
+    at: new Date().toISOString(),
+    subjectRev: null,
+  });
+
+  const lines = [
+    ...renderRecall(report),
+    "per defect:",
+    "",
+    ...matches.map(
+      (m) =>
+        `  ${m.kind === "found" ? "FOUND " : m.kind === "missed" ? "MISSED" : "vague "} ` +
+        `${m.defect.class.padEnd(22)} ${m.defect.id}` +
+        (m.confidence ? `  (${m.confidence})` : ""),
+    ),
+    "",
+    `  appended to ${join(out, "recall.jsonl")}`,
+  ];
+  process.stdout.write(lines.join("\n") + "\n\n");
+  return 0;
+}
+
 async function runRender(args: string[]): Promise<number> {
   const tree = flag(args, "--tree");
   const findingsPath = flag(args, "--findings");
@@ -829,6 +928,8 @@ async function main(): Promise<number> {
   if (command === "inventory") return runInventory(args.slice(1));
   if (command === "analyze") return runAnalyze(args.slice(1));
   if (command === "investigate") return runInvestigate(args.slice(1));
+  if (command === "inject") return runInject(args.slice(1));
+  if (command === "recall") return runRecall(args.slice(1));
   if (command === "render") return runRender(args.slice(1));
 
   process.stderr.write(`unknown command "${command}"\n\n${USAGE}`);

@@ -67,7 +67,12 @@ describe("the stage model", () => {
   it("carries a count and a denominator when the stage knows one", () => {
     const t = telemetry();
     t.progress("verify", 31, 41);
-    expect(t.events()[0]).toMatchObject({ kind: "progress", stage: "verify", done: 31, total: 41 });
+    expect(t.events()[0]).toMatchObject({
+      kind: "progress",
+      stage: "verify",
+      done: 31,
+      total: 41,
+    });
   });
 
   // A bar with an invented denominator is worse than one without.
@@ -91,13 +96,19 @@ describe("the stage model", () => {
   it("distinguishes a failure from a skip", () => {
     const t = telemetry();
     t.stageFailed("render", "typst exited 1");
-    expect(t.events()[0]).toMatchObject({ status: "failed", detail: "typst exited 1" });
+    expect(t.events()[0]).toMatchObject({
+      status: "failed",
+      detail: "typst exited 1",
+    });
   });
 
   it("carries counts on a finished stage", () => {
     const t = telemetry();
     t.stageFinished("inventory", { files: 4187 });
-    expect(t.events()[0]).toMatchObject({ status: "finished", counts: { files: 4187 } });
+    expect(t.events()[0]).toMatchObject({
+      status: "finished",
+      counts: { files: 4187 },
+    });
   });
 });
 
@@ -106,7 +117,11 @@ describe("the stage model", () => {
 describe("redaction happens before anything is stored", () => {
   it("masks a known secret in a log line", () => {
     const t = telemetry();
-    t.log("acquire", "error", `clone failed for https://x:${SECRET}@host/repo.git`);
+    t.log(
+      "acquire",
+      "error",
+      `clone failed for https://x:${SECRET}@host/repo.git`,
+    );
 
     const event = t.events()[0] as { message: string };
     expect(event.message).not.toContain(SECRET);
@@ -115,8 +130,14 @@ describe("redaction happens before anything is stored", () => {
 
   it("masks a credential-shaped string nobody registered", () => {
     const t = telemetry();
-    t.log("analyze", "warn", "token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 rejected");
-    expect((t.events()[0] as { message: string }).message).not.toContain("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ");
+    t.log(
+      "analyze",
+      "warn",
+      "token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 rejected",
+    );
+    expect((t.events()[0] as { message: string }).message).not.toContain(
+      "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ",
+    );
   });
 
   it("masks the reason on a skip and a failure, not only log lines", () => {
@@ -169,7 +190,8 @@ describe("a log line cannot hold a file", () => {
   });
 
   it("holds a realistic decision line whole", () => {
-    const line = "verify: claim config-precedence-abc12345 not-refuted by 2 of 2 verifiers (3 vocabularies)";
+    const line =
+      "verify: claim config-precedence-abc12345 not-refuted by 2 of 2 verifiers (3 vocabularies)";
     expect(redactLine(line, [])).toBe(line);
   });
 
@@ -263,7 +285,8 @@ describe("delivery is best effort", () => {
 
 describe("progress is reported from work that finished, not work that started", () => {
   it("advances once per question, including one that failed", async () => {
-    const { investigate } = await import("../../src/engine/audit/investigate.js");
+    const { investigate } =
+      await import("../../src/engine/audit/investigate.js");
     const seen: Array<[number, number]> = [];
     let call = 0;
 
@@ -299,12 +322,27 @@ describe("progress is reported from work that finished, not work that started", 
     await verifyClaims({
       claims: [
         // Cited line does not exist — rejected before any verifier runs.
-        { questionId: "q", statement: "s", absence: false, evidence: [{ path: "gone.ts", rev: REV, line: 9 }] },
-        { questionId: "q", statement: "t", absence: false, evidence: [{ path: "a.ts", rev: REV, line: 1 }] },
+        {
+          questionId: "q",
+          statement: "s",
+          absence: false,
+          evidence: [{ path: "gone.ts", rev: REV, line: 9 }],
+        },
+        {
+          questionId: "q",
+          statement: "t",
+          absence: false,
+          evidence: [{ path: "a.ts", rev: REV, line: 1 }],
+        },
       ],
       model: {
         async refute({ verifier }) {
-          return { verifier, outcome: "not-refuted", reason: "stands", vocabulariesTried: ["a", "b", "c"] };
+          return {
+            verifier,
+            outcome: "not-refuted",
+            reason: "stands",
+            vocabulariesTried: ["a", "b", "c"],
+          };
         },
       },
       readLine: (path) => (path === "a.ts" ? "const a = 1;" : null),
@@ -419,7 +457,12 @@ describe("verification stops between claims", () => {
       })),
       model: {
         async refute({ verifier }) {
-          return { verifier, outcome: "not-refuted", reason: "stands", vocabulariesTried: ["a", "b", "c"] };
+          return {
+            verifier,
+            outcome: "not-refuted",
+            reason: "stands",
+            vocabulariesTried: ["a", "b", "c"],
+          };
         },
       },
       readLine: () => "const a = 1;",
@@ -448,7 +491,12 @@ describe("verification stops between claims", () => {
       })),
       model: {
         async refute({ verifier }) {
-          return { verifier, outcome: "not-refuted", reason: "stands", vocabulariesTried: ["a", "b", "c"] };
+          return {
+            verifier,
+            outcome: "not-refuted",
+            reason: "stands",
+            vocabulariesTried: ["a", "b", "c"],
+          };
         },
       },
       readLine: () => "const a = 1;",
@@ -456,5 +504,32 @@ describe("verification stops between claims", () => {
       shouldStop: () => false,
     });
     expect(result.verified).toHaveLength(3);
+  });
+});
+
+/* ── A secret that reached the report ─────────────────────────────────────── */
+
+describe("reporting that masking altered the rendered text", () => {
+  // The dashboard never sees the unmasked report — that is the point of masking
+  // at the engine — so only the engine can say this happened.
+  it("records it as a run-level fact, distinct from a stage failing", () => {
+    const t = telemetry();
+    t.recordMaskFired();
+
+    const event = t.events()[0];
+    expect(event).toMatchObject({ kind: "run", status: "mask-fired" });
+    expect(event).not.toHaveProperty("stage");
+  });
+
+  it("is not confused with a cancellation", () => {
+    const t = telemetry();
+    t.recordMaskFired();
+    t.recordCancelled();
+
+    const statuses = t
+      .events()
+      .filter((e) => e.kind === "run")
+      .map((e) => (e as { status: string }).status);
+    expect(statuses).toEqual(["mask-fired", "cancelled"]);
   });
 });

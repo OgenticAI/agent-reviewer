@@ -395,6 +395,11 @@ export class AuditTelemetry {
     });
   }
 
+  /** The run this recorder belongs to, for callers that need to address it. */
+  runIdValue(): string {
+    return this.runId;
+  }
+
   /** Every event recorded this run, delivered or not. */
   events(): readonly AuditEvent[] {
     return this.all;

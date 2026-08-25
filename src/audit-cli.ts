@@ -70,6 +70,7 @@ import {
   type AuditStage,
 } from "./engine/audit/telemetry.js";
 import { sinkFromEnv } from "./audit-telemetry-http.js";
+import { uploaderFromEnv } from "./audit-artifacts.js";
 
 /**
  * The baseline question set, resolved relative to this file rather than the
@@ -627,6 +628,54 @@ function lineReaderFor(tree: string): LineReader {
   };
 }
 
+/**
+ * Send the rendered artifacts to Mission Control, if it is configured.
+ *
+ * Returns lines for the operator rather than throwing. A failed upload is not a
+ * failed audit: the report is on disk, which is where the real artifact has
+ * always been, and this is the copy that lets somebody who is not at this
+ * machine read it.
+ */
+async function uploadArtifacts(
+  telemetry: AuditTelemetry,
+  result: { typstPath: string; pdfPath: string | null },
+  released: boolean,
+): Promise<string[]> {
+  const uploader = uploaderFromEnv(telemetry.runIdValue());
+  if (!uploader)
+    return ["  artifacts  local only — Mission Control is not configured"];
+
+  const targets: Array<{ path: string; kind: "pdf" | "typ" }> = [
+    ...(result.pdfPath ? [{ path: result.pdfPath, kind: "pdf" as const }] : []),
+    { path: result.typstPath, kind: "typ" as const },
+  ];
+
+  const lines: string[] = [];
+  for (const target of targets) {
+    const outcome = await uploader.upload(target.path, target.kind, released);
+    if (outcome.uploaded) {
+      telemetry.log(
+        "render",
+        "info",
+        `uploaded ${target.kind} (${outcome.bytes} bytes)`,
+      );
+      lines.push(`  uploaded   ${target.kind} — ${outcome.bytes} bytes`);
+    } else {
+      // Warn, not error: the audit succeeded. But it is said out loud, because
+      // an operator who thinks the report is in Mission Control and finds it is
+      // not has been misled by silence.
+      telemetry.log(
+        "render",
+        "warn",
+        `${target.kind} not uploaded — ${outcome.reason}`,
+      );
+      lines.push(`  ! ${target.kind} not uploaded — ${outcome.reason}`);
+    }
+  }
+  await telemetry.flush();
+  return lines;
+}
+
 async function runRender(args: string[]): Promise<number> {
   const tree = flag(args, "--tree");
   const findingsPath = flag(args, "--findings");
@@ -686,6 +735,16 @@ async function runRender(args: string[]): Promise<number> {
     return rendered;
   });
 
+  // Upload after the render, never before: there is nothing to send until the
+  // file exists, and a cancelled run never reaches here at all — verification
+  // stops mid-list on a cancel, so any report built from it would look complete
+  // and not be.
+  const uploads = await uploadArtifacts(
+    renderTelemetry,
+    result,
+    releaseBy !== undefined,
+  );
+
   const lines = [
     `rendered ${findings.length} finding(s)`,
     `  source     ${result.typstPath}`,
@@ -697,6 +756,7 @@ async function runRender(args: string[]): Promise<number> {
       : "  status     DRAFT — watermarked, not for distribution",
   ];
   for (const warning of result.warnings) lines.push(`  ! ${warning}`);
+  for (const line of uploads) lines.push(line);
   process.stdout.write(lines.join("\n") + "\n\n");
   return 0;
 }

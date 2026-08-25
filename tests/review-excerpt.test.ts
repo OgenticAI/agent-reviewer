@@ -24,3 +24,33 @@ describe("quoting a rejected response back to the model", () => {
     expect(excerptForRetry(exact, 100)).toBe(exact);
   });
 });
+
+describe("the excerpt is bounded at both ends", () => {
+  // slice(-0) returns the whole string, not the empty one. At headRatio 0 the
+  // naive arithmetic silently returned the entire input — the opposite of
+  // what a character budget is for.
+  it("returns a tail-only excerpt at headRatio 0, not the whole input", () => {
+    const long = `HEAD${"x".repeat(500)}TAIL`;
+    const out = excerptForRetry(long, 20, 0);
+
+    expect(out).toContain("TAIL");
+    expect(out).not.toContain("HEAD");
+    expect(out.length).toBeLessThan(long.length);
+  });
+
+  it("returns a head-only excerpt at headRatio 1", () => {
+    const long = `HEAD${"x".repeat(500)}TAIL`;
+    const out = excerptForRetry(long, 20, 1);
+
+    expect(out).toContain("HEAD");
+    expect(out).not.toContain("TAIL");
+  });
+
+  it("keeps the quoted text within the budget, elision aside", () => {
+    const long = "y".repeat(5000);
+    for (const limit of [10, 100, 2000]) {
+      const quoted = excerptForRetry(long, limit).replace(/\n\n\.\.\. \[\d+ characters omitted\] \.\.\.\n\n/, "");
+      expect(quoted.length).toBeLessThanOrEqual(limit);
+    }
+  });
+});

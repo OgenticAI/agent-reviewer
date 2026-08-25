@@ -761,17 +761,35 @@ const MAX_VERDICT_RETRIES = 2;
  * preamble the model was told not to write ("Here is the JSON:") is at the
  * front; truncation and an unterminated array are at the back. Sampling one
  * end would routinely cut away the evidence.
+ *
+ * `headRatio` is what lets the same function serve the thrown error, which
+ * wants the tail alone — the failure there is almost always "it stopped
+ * mid-JSON", and only the end shows where.
  */
 const RETRY_EXCERPT_CHARS = 2000;
 
 /** Enough of the tail to see how a response ended, in an operator's log line. */
 const THROW_TAIL_CHARS = 300;
 
-export function excerptForRetry(text: string, limit = RETRY_EXCERPT_CHARS): string {
+export function excerptForRetry(
+  text: string,
+  limit = RETRY_EXCERPT_CHARS,
+  headRatio = 0.5,
+): string {
   if (text.length <= limit) return text;
-  const half = Math.floor(limit / 2);
-  const cut = text.length - limit;
-  return `${text.slice(0, half)}\n\n... [${cut} characters omitted] ...\n\n${text.slice(-half)}`;
+
+  const head = Math.round(limit * headRatio);
+  const tail = limit - head;
+  const elision = `\n\n... [${text.length - limit} characters omitted] ...\n\n`;
+
+  // `slice(-0)` returns the WHOLE string, not the empty one, so a zero-length
+  // end has to be spelled out rather than left to the arithmetic. Found by the
+  // OGE-2459 session reviewing this function; at head=0 the tail-only excerpt
+  // was silently returning the entire input.
+  return [
+    ...(head > 0 ? [text.slice(0, head)] : []),
+    ...(tail > 0 ? [text.slice(text.length - tail)] : []),
+  ].join(elision);
 }
 
 async function produceVerdictWithRetry(args: {
@@ -836,7 +854,7 @@ async function produceVerdictWithRetry(args: {
   throw new VerdictShapeError(
     `Model output failed schema validation after ${MAX_VERDICT_RETRIES + 1} attempts. ` +
       `Last error: ${lastError}. ` +
-      `Last output ended: ...${lastText.slice(-THROW_TAIL_CHARS)}`,
+      `Last output ended: ...${excerptForRetry(lastText, THROW_TAIL_CHARS, 0)}`,
   );
 }
 

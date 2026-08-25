@@ -30,6 +30,25 @@ import { maskSecrets, collectKnownSecrets } from "../tools/sanitize.js";
 import type { AuditFinding } from "./finding.js";
 
 /**
+ * A run an operator stopped.
+ *
+ * Thrown rather than returned so it unwinds through whatever stage was running
+ * without every call site having to check a flag. It is not a failure: the
+ * artifacts written before the stop are valid, and the run is reported
+ * `cancelled` rather than `failed`.
+ */
+export class RunCancelled extends Error {
+  constructor(stage?: string) {
+    super(
+      stage
+        ? `Run stopped at the operator's request, before ${stage}.`
+        : `Run stopped at the operator's request.`,
+    );
+    this.name = "RunCancelled";
+  }
+}
+
+/**
  * The eight stages, fixed and named.
  *
  * A progress bar over unnamed work is decoration. Naming them means the UI can
@@ -95,7 +114,26 @@ export interface FindingEvent {
   at: string;
 }
 
-export type AuditEvent = StageEvent | ProgressEvent | LogEvent | FindingEvent;
+/**
+ * The run itself stopping, as opposed to a stage finishing.
+ *
+ * Kept distinct from a stage status so "the run was cancelled" can never be
+ * confused with "a stage failed" — a cancelled run is a partial audit someone
+ * chose to stop, and a failed one is an audit that broke.
+ */
+export interface RunEvent {
+  kind: "run";
+  runId: string;
+  status: "cancelled";
+  at: string;
+}
+
+export type AuditEvent =
+  | StageEvent
+  | ProgressEvent
+  | LogEvent
+  | FindingEvent
+  | RunEvent;
 
 /**
  * Where events go. Implemented by the HTTP poster outside the engine, and by a
@@ -104,8 +142,20 @@ export type AuditEvent = StageEvent | ProgressEvent | LogEvent | FindingEvent;
  * `send` may reject; the recorder treats that as "not delivered yet", never as
  * a run failure.
  */
+export interface SinkAck {
+  /**
+   * The observer asking the run to stop.
+   *
+   * Carried on the acknowledgement of a post the engine was making anyway,
+   * because nothing can reach into this process from outside — an operator
+   * clicking "stop" in Mission Control writes a row, and this is how the row
+   * gets here. No polling loop, no inbound port, no second protocol.
+   */
+  cancelRequested?: boolean;
+}
+
 export interface TelemetrySink {
-  send(events: AuditEvent[]): Promise<void>;
+  send(events: AuditEvent[]): Promise<SinkAck | void>;
 }
 
 /**
@@ -142,7 +192,10 @@ export interface TelemetryOptions {
 export function redactLine(text: string, knownSecrets: string[]): string {
   const masked = maskSecrets(text, knownSecrets);
   if (masked.length <= MAX_LOG_CHARS) return masked;
-  return masked.slice(0, MAX_LOG_CHARS - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
+  return (
+    masked.slice(0, MAX_LOG_CHARS - TRUNCATION_MARKER.length) +
+    TRUNCATION_MARKER
+  );
 }
 
 /**
@@ -165,6 +218,9 @@ export class AuditTelemetry {
   private readonly all: AuditEvent[] = [];
   /** Flushes that failed. Surfaced at the end rather than swallowed silently. */
   private undelivered = 0;
+  /** Sticky once seen: a stop is not withdrawn by a later quiet acknowledgement. */
+  private cancelSeen = false;
+  private cancelRecorded = false;
 
   constructor(options: TelemetryOptions) {
     this.runId = options.runId;
@@ -183,7 +239,13 @@ export class AuditTelemetry {
   }
 
   stageStarted(stage: AuditStage): void {
-    this.record({ kind: "stage", runId: this.runId, stage, status: "started", at: this.at() });
+    this.record({
+      kind: "stage",
+      runId: this.runId,
+      stage,
+      status: "started",
+      at: this.at(),
+    });
   }
 
   stageFinished(stage: AuditStage, counts?: Record<string, number>): void {
@@ -283,11 +345,54 @@ export class AuditTelemetry {
     this.pending = [];
 
     try {
-      await this.sink.send(batch);
+      const ack = await this.sink.send(batch);
+      if (ack && ack.cancelRequested) this.cancelSeen = true;
     } catch {
       this.pending = [...batch, ...this.pending];
       this.undelivered += 1;
     }
+  }
+
+  /**
+   * Has an operator asked this run to stop?
+   *
+   * Sticky. Once a stop has been seen it stays seen, even if a later
+   * acknowledgement omits the flag — a dashboard that briefly forgets, or a
+   * response that loses the field, must not un-cancel a run someone deliberately
+   * stopped.
+   */
+  cancelRequested(): boolean {
+    return this.cancelSeen;
+  }
+
+  /**
+   * Stop here if an operator has asked the run to stop.
+   *
+   * Called at checkpoints — stage boundaries, and the per-question and
+   * per-claim progress points inside the two long stages. Investigate can run
+   * for ninety minutes; a stop that only took effect between stages would leave
+   * an operator watching a run they had already cancelled.
+   */
+  throwIfCancelled(stage?: string): void {
+    if (!this.cancelSeen) return;
+    // Recorded here so every call site confirms the stop without having to
+    // remember to. Once only — a run is cancelled once, however many
+    // checkpoints it passes on the way out.
+    if (!this.cancelRecorded) {
+      this.cancelRecorded = true;
+      this.recordCancelled();
+    }
+    throw new RunCancelled(stage);
+  }
+
+  /** The engine confirming it acted. Distinct from the request. */
+  recordCancelled(): void {
+    this.record({
+      kind: "run",
+      runId: this.runId,
+      status: "cancelled",
+      at: this.at(),
+    });
   }
 
   /** Every event recorded this run, delivered or not. */

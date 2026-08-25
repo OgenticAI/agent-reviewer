@@ -64,7 +64,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { AuditTelemetry, type AuditStage } from "./engine/audit/telemetry.js";
+import {
+  AuditTelemetry,
+  RunCancelled,
+  type AuditStage,
+} from "./engine/audit/telemetry.js";
 import { sinkFromEnv } from "./audit-telemetry-http.js";
 
 /**
@@ -148,6 +152,10 @@ async function withStage<T>(
   stage: AuditStage,
   fn: () => Promise<T> | T,
 ): Promise<T> {
+  // A stage boundary is the cheapest honest checkpoint: nothing is half-done,
+  // and the artifacts written so far stay valid. Stages that take an hour check
+  // again at their own progress points.
+  telemetry.throwIfCancelled();
   telemetry.stageStarted(stage);
   try {
     return await fn();
@@ -404,6 +412,49 @@ async function runInvestigate(args: string[]): Promise<number> {
   );
 
   const { telemetry, note: telemetryNote } = resolveRun(out);
+  try {
+    return await investigateRun({
+      args,
+      tree,
+      out,
+      telemetry,
+      telemetryNote,
+      apiKey,
+      subject,
+      jobs,
+      questionSet,
+    });
+  } catch (error) {
+    // The confirmation is already recorded; this is the flush that delivers it,
+    // so the dashboard shows "cancelled" rather than a run stuck at "stop
+    // requested" forever.
+    if (error instanceof RunCancelled) await telemetry.flush();
+    throw error;
+  }
+}
+
+async function investigateRun(ctx: {
+  args: string[];
+  tree: string;
+  out: string;
+  telemetry: AuditTelemetry;
+  telemetryNote: string;
+  apiKey: string;
+  subject: Subject;
+  jobs: JobFindings[];
+  questionSet: ReturnType<typeof loadQuestionSet>;
+}): Promise<number> {
+  const {
+    args,
+    tree,
+    out,
+    telemetry,
+    telemetryNote,
+    apiKey,
+    subject,
+    jobs,
+    questionSet,
+  } = ctx;
   const inventory = buildInventory(tree);
 
   // The log the model writes into, and the only source of the coverage figure.
@@ -471,7 +522,11 @@ async function runInvestigate(args: string[]): Promise<number> {
       model: makeVerifierModel(modelOptions),
       readLine: lineReaderFor(tree),
       log: (message) => telemetry.log("verify", "info", message),
-      onProgress: (done, total) => telemetry.progress("verify", done, total),
+      onProgress: (done, total) => {
+        telemetry.progress("verify", done, total);
+        void telemetry.flush();
+      },
+      shouldStop: () => telemetry.cancelRequested(),
       ...(flag(args, "--verifiers")
         ? { verifiers: Number(flag(args, "--verifiers")) }
         : {}),
@@ -488,6 +543,11 @@ async function runInvestigate(args: string[]): Promise<number> {
     `  verified   ${summary.verified} · inferred ${summary.inferred} · ` +
       `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n`,
   );
+
+  // Verification stops mid-list on a cancel, so the claim set here is partial.
+  // Rendering a report from it would produce a document that looks complete and
+  // is not — the one output this engine must never produce.
+  telemetry.throwIfCancelled("closure");
 
   const closure = await withStage(telemetry, "closure", () => {
     const result = toAuditFindings({ verified: verification.verified });
@@ -665,6 +725,12 @@ async function main(): Promise<number> {
 main()
   .then((code) => process.exit(code))
   .catch((error: unknown) => {
+    // A run someone stopped is not a failure. Its own exit code, so a script
+    // wrapping this can tell "the operator stopped it" from "it broke".
+    if (error instanceof RunCancelled) {
+      process.stderr.write(`\n${error.message}\n`);
+      process.exit(130);
+    }
     // An AcquireError is a refusal we chose — say it plainly, without a stack
     // that makes a deliberate safety check look like a crash.
     if (

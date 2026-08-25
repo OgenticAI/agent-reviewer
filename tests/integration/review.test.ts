@@ -571,6 +571,46 @@ describe("runReview (end-to-end)", () => {
       expect(prompts[1]).toMatch(/characters omitted/);
     });
 
+    it("names an empty response plainly instead of fencing nothing", async () => {
+      // `extractText` returns "" when the model's final turn was all tool-use
+      // blocks. Fencing that yields an empty <untrusted> block, which reads as
+      // "you returned an empty string" rather than "you wrote no text at all" —
+      // and the schema error cannot say it either, since zod only ever sees
+      // JSON.parse("") (OGE-2462).
+      const prompts: string[] = [];
+      let call = 0;
+      const model: VerdictModel = {
+        produce: async (req: { userPrompt: string }) => {
+          prompts.push(req.userPrompt);
+          call += 1;
+          return call === 1
+            ? ""
+            : JSON.stringify({
+                items: PR1_CHECKLIST_TEXTS.map((_t, i) => ({
+                  id: i + 1,
+                  status: "PASS",
+                  rationale: "ok",
+                  evidenceRefs: [],
+                })),
+                summary: "x",
+              });
+        },
+      };
+
+      await runReview(buildArgs({ model }));
+
+      expect(prompts[1]).toContain("Your previous response contained no text at all");
+      expect(prompts[1]).not.toContain("This is what you returned:");
+      expect(prompts[1]).not.toContain(`<untrusted source="rejected-verdict">`);
+    });
+
+    it("names an empty last output in the error when every attempt fails", async () => {
+      const model: VerdictModel = { produce: async () => "" };
+      await expect(runReview(buildArgs({ model }))).rejects.toThrow(
+        /Last output contained no text at all/,
+      );
+    });
+
     it("names the last output in the error when every attempt fails", async () => {
       const bad = JSON.stringify({ items: [{ status: "PASS" }], summary: "SENTINEL_TAIL" });
       const model: VerdictModel = { produce: async () => bad };

@@ -825,12 +825,22 @@ async function produceVerdictWithRetry(args: {
             // `<untrusted>` tag is the one the standing rule already in this
             // prompt (UNTRUSTED_CONTENT_RULE, carried in args.userPrompt)
             // refers to, so no new instruction is needed here.
-            `This is what you returned:`,
-            ``,
-            fenceUntrusted(sanitizeUntrusted(excerptForRetry(lastText)), {
-              source: "rejected-verdict",
-            }),
-            ``,
+            // `extractText` returns "" when the final turn was all tool-use
+            // blocks — the model stopped asking for tools but never wrote a
+            // text block. Fencing that gives an empty <untrusted> block, which
+            // reads as "you returned an empty string". Naming the real failure
+            // is the more useful re-prompt, and it is one the schema error
+            // cannot describe: zod only sees JSON.parse("") (OGE-2462).
+            ...(lastText.length > 0
+              ? [
+                  `This is what you returned:`,
+                  ``,
+                  fenceUntrusted(sanitizeUntrusted(excerptForRetry(lastText)), {
+                    source: "rejected-verdict",
+                  }),
+                  ``,
+                ]
+              : [`Your previous response contained no text at all.`, ``]),
             `Return the corrected JSON only — same checklist, one object per item,`,
             `each with its 1-based "id". Do not explain the correction.`,
           ].join("\n");
@@ -863,7 +873,9 @@ async function produceVerdictWithRetry(args: {
   throw new VerdictShapeError(
     `Model output failed schema validation after ${MAX_VERDICT_RETRIES + 1} attempts. ` +
       `Last error: ${lastError}. ` +
-      `Last output ended: ...${excerptForRetry(lastText, THROW_TAIL_CHARS, 0)}`,
+      (lastText.length > 0
+        ? `Last output ended: ...${excerptForRetry(lastText, THROW_TAIL_CHARS, 0)}`
+        : `Last output contained no text at all.`),
   );
 }
 

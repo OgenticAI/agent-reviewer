@@ -5,6 +5,7 @@ import {
   AUDIT_STAGES,
   MAX_LOG_CHARS,
   redactLine,
+  RunCancelled,
   type AuditEvent,
   type TelemetrySink,
 } from "../../src/engine/audit/telemetry.js";
@@ -315,5 +316,145 @@ describe("progress is reported from work that finished, not work that started", 
       [1, 2],
       [2, 2],
     ]);
+  });
+});
+
+/* ── Cancellation ─────────────────────────────────────────────────────────── */
+
+describe("stopping a run someone asked to stop", () => {
+  class Acking implements TelemetrySink {
+    constructor(private readonly cancel: boolean) {}
+    calls = 0;
+    async send() {
+      this.calls += 1;
+      return { cancelRequested: this.cancel };
+    }
+  }
+
+  it("does not stop a run nobody asked to stop", async () => {
+    const t = telemetry(new Acking(false));
+    t.stageStarted("verify");
+    await t.flush();
+
+    expect(t.cancelRequested()).toBe(false);
+    expect(() => t.throwIfCancelled()).not.toThrow();
+  });
+
+  // The signal rides back on a post the engine was making anyway — nothing can
+  // reach into this process from outside.
+  it("learns of a stop from the acknowledgement of its own post", async () => {
+    const t = telemetry(new Acking(true));
+    t.stageStarted("verify");
+    await t.flush();
+
+    expect(t.cancelRequested()).toBe(true);
+    expect(() => t.throwIfCancelled("closure")).toThrow(RunCancelled);
+  });
+
+  it("names where it stopped", async () => {
+    const t = telemetry(new Acking(true));
+    t.stageStarted("verify");
+    await t.flush();
+    expect(() => t.throwIfCancelled("closure")).toThrow(/before closure/);
+  });
+
+  // A dashboard that briefly forgets, or a response that loses the field, must
+  // not un-cancel a run someone deliberately stopped.
+  it("stays cancelled once seen, even if a later acknowledgement is quiet", async () => {
+    let cancel = true;
+    const flaky: TelemetrySink = {
+      async send() {
+        const ack = { cancelRequested: cancel };
+        cancel = false;
+        return ack;
+      },
+    };
+
+    const t = telemetry(flaky);
+    t.stageStarted("verify");
+    await t.flush();
+    t.progress("verify", 1, 2);
+    await t.flush();
+
+    expect(t.cancelRequested()).toBe(true);
+  });
+
+  // A response we cannot read means the batch was delivered, which is all the
+  // caller needed. Inventing a stop from a malformed body would kill a run over
+  // a JSON error.
+  it("treats a sink that acknowledges nothing as no cancellation", async () => {
+    const silent: TelemetrySink = { async send() {} };
+    const t = telemetry(silent);
+    t.stageStarted("verify");
+    await t.flush();
+    expect(t.cancelRequested()).toBe(false);
+  });
+
+  it("records the confirmation exactly once, however many checkpoints it passes", async () => {
+    const t = telemetry(new Acking(true));
+    t.stageStarted("verify");
+    await t.flush();
+
+    for (const stage of ["closure", "render", "render"]) {
+      expect(() => t.throwIfCancelled(stage)).toThrow(RunCancelled);
+    }
+
+    const confirmations = t.events().filter((e) => e.kind === "run");
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0]).toMatchObject({ status: "cancelled" });
+  });
+});
+
+describe("verification stops between claims", () => {
+  it("settles the claims it reached and stops, rather than running to the end", async () => {
+    const { verifyClaims } = await import("../../src/engine/audit/verify.js");
+    let settled = 0;
+
+    const result = await verifyClaims({
+      claims: [1, 2, 3, 4].map((n) => ({
+        questionId: "q",
+        statement: `s${n}`,
+        absence: false,
+        evidence: [{ path: "a.ts", rev: REV, line: 1 }],
+      })),
+      model: {
+        async refute({ verifier }) {
+          return { verifier, outcome: "not-refuted", reason: "stands", vocabulariesTried: ["a", "b", "c"] };
+        },
+      },
+      readLine: () => "const a = 1;",
+      log: () => {},
+      onProgress: () => {
+        settled += 1;
+      },
+      // Stop once two claims are done.
+      shouldStop: () => settled >= 2,
+    });
+
+    // The two it settled are complete and keep their verdicts; the rest are
+    // simply not there. A partial verification is honest; a rushed one is not.
+    expect(result.verified).toHaveLength(2);
+    expect(settled).toBe(2);
+  });
+
+  it("verifies everything when nothing asked it to stop", async () => {
+    const { verifyClaims } = await import("../../src/engine/audit/verify.js");
+    const result = await verifyClaims({
+      claims: [1, 2, 3].map((n) => ({
+        questionId: "q",
+        statement: `s${n}`,
+        absence: false,
+        evidence: [{ path: "a.ts", rev: REV, line: 1 }],
+      })),
+      model: {
+        async refute({ verifier }) {
+          return { verifier, outcome: "not-refuted", reason: "stands", vocabulariesTried: ["a", "b", "c"] };
+        },
+      },
+      readLine: () => "const a = 1;",
+      log: () => {},
+      shouldStop: () => false,
+    });
+    expect(result.verified).toHaveLength(3);
   });
 });

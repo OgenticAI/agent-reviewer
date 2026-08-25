@@ -302,6 +302,17 @@ export interface VerifyOptions {
   log?: (message: string) => void;
   /** Called as each claim is settled. Claims are verified in input order. */
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Checked before each claim. Returning true stops the loop and returns what
+   * has been settled so far.
+   *
+   * Per-claim rather than per-stage because verification is the long tail — two
+   * model calls for every claim, sequentially — and a stop that only took effect
+   * at the end of the stage would leave an operator watching a run they had
+   * already cancelled. Investigation cannot offer the same: its questions all
+   * start at once, so there is nothing left to not-start.
+   */
+  shouldStop?: () => boolean;
 }
 
 /**
@@ -322,6 +333,15 @@ export async function verifyClaims(
   const rejected: RejectedClaim[] = [];
 
   for (const [index, claim] of options.claims.entries()) {
+    // Between claims, where nothing is half-done: the claims settled so far are
+    // complete and their verdicts stand.
+    if (options.shouldStop?.()) {
+      log(
+        `[verify] stopping at the operator's request after ${index} of ${options.claims.length} claim(s)`,
+      );
+      break;
+    }
+
     // `finally`, so a claim rejected at an early gate still advances the
     // count. Two of the exits below are `continue`, and a progress bar that
     // silently skips them stalls on any run with a bad citation.

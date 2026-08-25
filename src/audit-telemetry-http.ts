@@ -17,7 +17,11 @@
  * logging a failed POST every few seconds.
  */
 
-import type { AuditEvent, TelemetrySink } from "./engine/audit/telemetry.js";
+import type {
+  AuditEvent,
+  SinkAck,
+  TelemetrySink,
+} from "./engine/audit/telemetry.js";
 
 /**
  * How long to wait for the dashboard before giving up on a batch.
@@ -60,7 +64,7 @@ export class HttpTelemetrySink implements TelemetrySink {
    * silently would look delivered and be lost — the failure has to be loud
    * here so it can be quiet upstream.
    */
-  async send(events: AuditEvent[]): Promise<void> {
+  async send(events: AuditEvent[]): Promise<SinkAck> {
     const response = await this.fetchImpl(this.url, {
       method: "POST",
       headers: {
@@ -73,6 +77,17 @@ export class HttpTelemetrySink implements TelemetrySink {
 
     if (!response.ok) {
       throw new Error(`telemetry POST ${this.url} returned ${response.status}`);
+    }
+
+    // The stop signal rides back on this acknowledgement. A body we cannot
+    // parse is not a cancellation — the batch was delivered, which is what the
+    // caller needed to know, and inventing a stop from a malformed response
+    // would kill a run over a JSON error.
+    try {
+      const body = (await response.json()) as { cancelRequested?: unknown };
+      return { cancelRequested: body?.cancelRequested === true };
+    } catch {
+      return {};
     }
   }
 }
@@ -93,11 +108,15 @@ export function sinkFromEnv(
   const token = env["AUDIT_TELEMETRY_TOKEN"];
 
   if (!baseUrl && !token) {
-    return { note: "telemetry off — AUDIT_TELEMETRY_URL is not set; this run is local only" };
+    return {
+      note: "telemetry off — AUDIT_TELEMETRY_URL is not set; this run is local only",
+    };
   }
   if (!baseUrl || !token) {
     const missing = baseUrl ? "AUDIT_TELEMETRY_TOKEN" : "AUDIT_TELEMETRY_URL";
-    return { note: `telemetry off — ${missing} is missing; set both or neither` };
+    return {
+      note: `telemetry off — ${missing} is missing; set both or neither`,
+    };
   }
 
   return {

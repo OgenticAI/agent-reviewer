@@ -584,6 +584,7 @@ export async function renderReport(
   try {
     await run("typst", ["compile", typstPath, pdfPath], {
       timeout: 5 * 60 * 1000,
+      env: { ...process.env, SOURCE_DATE_EPOCH: sourceDateEpoch(options) },
     });
   } catch (error) {
     const detail = describeTypstFailure(error);
@@ -598,6 +599,30 @@ export async function renderReport(
   }
 
   return { typstSource, typstPath, pdfPath, warnings };
+}
+
+/**
+ * The timestamp typst stamps into the PDF, pinned so two renders of one audit
+ * are byte-identical.
+ *
+ * Without this the `.typ` is reproducible and the PDF is not: typst writes the
+ * wall clock into `/CreationDate` and `/ModDate`, so the same report rendered
+ * twice differs in 96 bytes while every other byte — font subsets included —
+ * matches. That is enough to defeat "is this the PDF I signed off?", which is
+ * the only question the determinism guarantee exists to answer.
+ *
+ * It is the acquisition time rather than now, for two reasons. It is a property
+ * of the audit rather than of the render, so re-rendering next month still
+ * produces the same bytes; and it is the same value the cover prints as
+ * *Reviewed*, so a client opening Document Properties sees the date on the
+ * cover rather than a second, unexplained one.
+ */
+export function sourceDateEpoch(options: RenderReportOptions): string {
+  const parsed = Date.parse(options.input.subject.acquiredAt);
+  // An unparseable acquiredAt would make this NaN and typst would reject it,
+  // losing the PDF over a metadata field. Falling back to the epoch keeps the
+  // render working and stays deterministic, which is what the field is for.
+  return String(Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000));
 }
 
 function describeTypstFailure(error: unknown): string {

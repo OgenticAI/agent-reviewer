@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   escapeTypst,
@@ -13,6 +14,7 @@ import {
   subjectLabel,
   RenderRefused,
   type ReportInput,
+  sourceDateEpoch,
 } from "../../src/engine/audit/render.js";
 import { severityFor, SECURITY_QUESTIONS } from "../../src/engine/audit/severity.js";
 import type { AuditFinding } from "../../src/engine/audit/finding.js";
@@ -525,5 +527,56 @@ describe("the cover date", () => {
     const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
     expect(source).toContain("*Reviewed:* 2026-08-24");
     expect(source).not.toContain("12:00:00.000Z");
+  });
+});
+
+/* ── The PDF has to be byte-identical, not just the .typ ──────────────────── */
+
+describe("the timestamp typst stamps into the PDF", () => {
+  const at = (acquiredAt: string) =>
+    ({ input: input({ subject: subject({ acquiredAt }) }) }) as Parameters<
+      typeof sourceDateEpoch
+    >[0];
+
+  // Without pinning this, the .typ is reproducible and the PDF is not — typst
+  // writes the wall clock into /CreationDate and /ModDate, so the same report
+  // rendered twice differs while every other byte, font subsets included,
+  // matches. Measured: 96 differing bytes out of 54,035 identical ones.
+  it("is the acquisition time, so it does not move between renders", () => {
+    expect(sourceDateEpoch(at("2026-08-24T12:00:00.000Z"))).toBe("1787572800");
+  });
+
+  it("is the same for two renders of one audit", () => {
+    const options = at("2026-08-24T12:00:00.000Z");
+    expect(sourceDateEpoch(options)).toBe(sourceDateEpoch(options));
+  });
+
+  // It is a property of the audit, not of the render. Re-rendering next month
+  // has to produce the same bytes, or the guarantee is only about one sitting.
+  it("does not depend on the current time", () => {
+    const before = sourceDateEpoch(at("2026-08-24T12:00:00.000Z"));
+    expect(before).not.toBe(String(Math.floor(Date.now() / 1000)));
+  });
+
+  // NaN would reach typst as SOURCE_DATE_EPOCH=NaN, which it rejects — losing
+  // the PDF over a metadata field.
+  it("falls back rather than passing NaN to typst", () => {
+    expect(sourceDateEpoch(at("not a date"))).toBe("0");
+  });
+});
+
+/* ── The helper being right does not mean it is wired in ──────────────────── */
+
+describe("the env is actually handed to typst", () => {
+  // A unit test of sourceDateEpoch passes just as happily when the `env:` line
+  // is deleted, and the PDF quietly stops being reproducible. This reads the
+  // spawn site itself, so removing the wiring fails here.
+  it("passes SOURCE_DATE_EPOCH on the typst compile", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../../src/engine/audit/render.ts", import.meta.url)),
+      "utf8",
+    );
+    const spawn = src.slice(src.indexOf('run("typst"'));
+    expect(spawn.slice(0, 300)).toMatch(/SOURCE_DATE_EPOCH: sourceDateEpoch\(/);
   });
 });

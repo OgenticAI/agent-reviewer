@@ -37,7 +37,17 @@ import type { AuditFinding, Confidence } from "./finding.js";
 import { validateFindings, countByConfidence } from "./finding.js";
 import { consolidateAsk, renderAsk } from "./closure.js";
 import { COVERAGE_CAVEAT, type Coverage } from "./inventory.js";
-import { skippedAnalyzerNotes, type LanguageAnalyzerCoverage } from "./analyze.js";
+import {
+  skippedAnalyzerNotes,
+  type LanguageAnalyzerCoverage,
+} from "./analyze.js";
+import {
+  assessMaturity,
+  isJudgement,
+  maturityCaveat,
+  renderTargets,
+  type QuestionOutcome,
+} from "./maturity.js";
 import type { JobFindings } from "../findings/schema.js";
 import type { Subject } from "./acquire.js";
 
@@ -56,7 +66,9 @@ const run = promisify(execFile);
  * boundary and never trust the interpolation.
  */
 export function escapeTypst(text: string): string {
-  return text.replace(/[\\#$*_@<>`"]/g, (char) => `\\${char}`).replace(/\r?\n/g, " ");
+  return text
+    .replace(/[\\#$*_@<>`"]/g, (char) => `\\${char}`)
+    .replace(/\r?\n/g, " ");
 }
 
 /* ── The report model ─────────────────────────────────────────────────────── */
@@ -68,6 +80,17 @@ export interface ReportInput {
   analyzerJobs: JobFindings[];
   analyzerReach: Record<string, LanguageAnalyzerCoverage>;
   questionCount: number;
+  /**
+   * What the investigation managed to ask, for the maturity table.
+   *
+   * Absent on a render that has no run record, in which case the maturity
+   * section is omitted rather than rated on nothing — a table of `Not Assessed`
+   * produced because the renderer lacked its input, rather than because the
+   * questions did not run, would be a different lie in the same place.
+   */
+  questionOutcomes?: QuestionOutcome[];
+  /** Directory names the walk skipped, for Targets. */
+  excluded?: string[];
   /** Present only once a named person has released it. Absent means DRAFT. */
   release?: { by: string; at: string };
 }
@@ -85,12 +108,73 @@ export interface ReportInput {
  * directory name, so acquire into something named after the subject.
  */
 export function subjectLabel(subject: Subject): string {
-  const remote = /^(https?:\/\/|git@|ssh:\/\/)/.test(subject.origin) || subject.origin.includes(".org/") || subject.origin.includes(".com/");
+  const remote =
+    /^(https?:\/\/|git@|ssh:\/\/)/.test(subject.origin) ||
+    subject.origin.includes(".org/") ||
+    subject.origin.includes(".com/");
   return remote ? subject.origin : subject.name;
 }
 
-export const SEVERITY_ORDER: readonly AuditFinding["severity"][] = ["error", "warning", "info", "unknown"];
-export const CONFIDENCE_ORDER: readonly Confidence[] = ["verified", "inferred", "not-determinable"];
+/**
+ * Codebase Maturity, or nothing.
+ *
+ * Omitted entirely when the run record is absent. A table rated on missing
+ * input would read exactly like a table rated on unanswered questions, and the
+ * reader has no way to tell those apart — so the honest output is no table.
+ */
+function maturitySection(input: ReportInput): string[] {
+  // No run record, or a record naming no questions. Both mean the table would
+  // be rated on nothing — and a table of "Not Applicable" produced because the
+  // renderer lacked its input reads exactly like one produced because the
+  // questions genuinely do not apply. The reader cannot tell those apart, so
+  // the honest output is no table.
+  if (!input.questionOutcomes || input.questionOutcomes.length === 0) return [];
+
+  const assessments = assessMaturity(input.findings, input.questionOutcomes);
+
+  const rows = assessments.flatMap((a) => [
+    `[${escapeTypst(a.name)}], [${a.rating}], [${a.answered}/${a.asked}], [${a.findings}],`,
+  ]);
+
+  return [
+    "= Codebase Maturity",
+    "",
+    "#table(",
+    "  columns: 4,",
+    "  [*Category*], [*Rating*], [*Questions answered*], [*Findings*],",
+    ...rows.map((r) => `  ${r}`),
+    ")",
+    "",
+    // The answered column beside the rating is the whole design: a rating that
+    // rests on one of three questions is visibly thin rather than quietly thin.
+    `#emph[${escapeTypst(maturityCaveat(assessments))}]`,
+    "",
+    ...(assessments.some((a) => !isJudgement(a.rating))
+      ? [
+          "#emph[" +
+            escapeTypst(
+              "Not Assessed and Not Applicable are not ratings. The first means no question in " +
+                "this review reached that category; the second means it does not apply to this " +
+                "codebase. Neither is a statement that the category is sound.",
+            ) +
+            "]",
+          "",
+        ]
+      : []),
+  ];
+}
+
+export const SEVERITY_ORDER: readonly AuditFinding["severity"][] = [
+  "error",
+  "warning",
+  "info",
+  "unknown",
+];
+export const CONFIDENCE_ORDER: readonly Confidence[] = [
+  "verified",
+  "inferred",
+  "not-determinable",
+];
 
 /**
  * Findings in reading order: worst first, and within a severity the ones we can
@@ -102,9 +186,12 @@ export const CONFIDENCE_ORDER: readonly Confidence[] = ["verified", "inferred", 
  */
 export function orderFindings(findings: AuditFinding[]): AuditFinding[] {
   return [...findings].sort((a, b) => {
-    const bySeverity = SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity);
+    const bySeverity =
+      SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity);
     if (bySeverity !== 0) return bySeverity;
-    const byConfidence = CONFIDENCE_ORDER.indexOf(a.confidence) - CONFIDENCE_ORDER.indexOf(b.confidence);
+    const byConfidence =
+      CONFIDENCE_ORDER.indexOf(a.confidence) -
+      CONFIDENCE_ORDER.indexOf(b.confidence);
     if (byConfidence !== 0) return byConfidence;
     return a.id.localeCompare(b.id);
   });
@@ -130,7 +217,9 @@ function coverageSection(input: ReportInput): string[] {
   ];
 
   for (const [area, slice] of Object.entries(coverage.byArea)) {
-    lines.push(`  [${escapeTypst(area)}], [${slice.total}], [${slice.opened}],`);
+    lines.push(
+      `  [${escapeTypst(area)}], [${slice.total}], [${slice.opened}],`,
+    );
   }
   lines.push(")", "");
 
@@ -141,7 +230,8 @@ function coverageSection(input: ReportInput): string[] {
       "These were attempted and could not be opened. They are counted as not covered.",
       "",
     );
-    for (const path of coverage.unreadable) lines.push(`- ${escapeTypst(path)}`);
+    for (const path of coverage.unreadable)
+      lines.push(`- ${escapeTypst(path)}`);
     lines.push("");
   }
 
@@ -202,7 +292,10 @@ function automatedTestingSection(input: ReportInput): string[] {
 
   const skips = skippedAnalyzerNotes(input.analyzerJobs);
   if (skips.length === 0 && untouched.length === 0) {
-    lines.push("Every configured analyzer ran over every language present.", "");
+    lines.push(
+      "Every configured analyzer ran over every language present.",
+      "",
+    );
   }
 
   return lines;
@@ -244,7 +337,8 @@ function findingsSection(findings: AuditFinding[]): string[] {
     if (finding.evidence.length > 0) {
       lines.push("*Evidence*", "");
       for (const ref of finding.evidence) {
-        const where = ref.line === undefined ? ref.path : `${ref.path}:${ref.line}`;
+        const where =
+          ref.line === undefined ? ref.path : `${ref.path}:${ref.line}`;
         lines.push(`- ${escapeTypst(where)}`);
       }
       lines.push("");
@@ -341,6 +435,20 @@ export function renderTypst(options: RenderOptions): string {
     `This review answered ${input.questionCount} questions agreed in advance. Anything`,
     "outside that set is out of scope by agreement rather than by omission.",
     "",
+
+    "= Targets",
+    "",
+    ...renderTargets({
+      origin: escapeTypst(input.subject.origin),
+      name: escapeTypst(subjectLabel(input.subject)),
+      rev: input.subject.rev,
+      revProvenance: escapeTypst(input.subject.revProvenance),
+      files: input.subject.files,
+      loc: input.subject.loc,
+      excluded: (input.excluded ?? []).map(escapeTypst),
+    }),
+
+    ...maturitySection(input),
   ];
 
   const ask = consolidateAsk(input.findings);
@@ -403,9 +511,13 @@ export interface MaskCheck {
  * copy is safe to read and unsafe to ship, because the next value might not be
  * one we know to mask — so a draft warns and a release refuses.
  */
-export function checkMask(rendered: string, mask: (text: string) => string): MaskCheck {
+export function checkMask(
+  rendered: string,
+  mask: (text: string) => string,
+): MaskCheck {
   const masked = mask(rendered);
-  if (masked === rendered) return { clean: true, detail: "no secret material in the rendered output" };
+  if (masked === rendered)
+    return { clean: true, detail: "no secret material in the rendered output" };
   return {
     clean: false,
     detail:
@@ -436,11 +548,20 @@ export interface RenderReportOptions extends RenderOptions {
  * release; a draft warns, so an operator can see what leaked and fix its source
  * rather than being locked out of their own working copy.
  */
-export async function renderReport(options: RenderReportOptions): Promise<RenderResult> {
-  const violations = validateFindings(options.input.findings, options.subjectRev);
+export async function renderReport(
+  options: RenderReportOptions,
+): Promise<RenderResult> {
+  const violations = validateFindings(
+    options.input.findings,
+    options.subjectRev,
+  );
   if (violations.length > 0) {
-    const detail = violations.map((v) => `  ${v.findingId}: ${v.code} — ${v.detail}`).join("\n");
-    throw new RenderRefused(`${violations.length} finding(s) break a report invariant:\n${detail}`);
+    const detail = violations
+      .map((v) => `  ${v.findingId}: ${v.code} — ${v.detail}`)
+      .join("\n");
+    throw new RenderRefused(
+      `${violations.length} finding(s) break a report invariant:\n${detail}`,
+    );
   }
 
   const unreal = checkCoverageIsReal(options.input.coverage);
@@ -461,11 +582,19 @@ export async function renderReport(options: RenderReportOptions): Promise<Render
 
   const pdfPath = join(options.outDir, "report.pdf");
   try {
-    await run("typst", ["compile", typstPath, pdfPath], { timeout: 5 * 60 * 1000 });
+    await run("typst", ["compile", typstPath, pdfPath], {
+      timeout: 5 * 60 * 1000,
+    });
   } catch (error) {
     const detail = describeTypstFailure(error);
     // The .typ is the artifact that matters; a missing binary must not lose it.
-    return { typstSource, typstPath, pdfPath: null, pdfSkipped: detail, warnings };
+    return {
+      typstSource,
+      typstPath,
+      pdfPath: null,
+      pdfSkipped: detail,
+      warnings,
+    };
   }
 
   return { typstSource, typstPath, pdfPath, warnings };

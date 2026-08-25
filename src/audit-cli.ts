@@ -12,29 +12,68 @@
  */
 
 import { writeFileSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname, resolve } from "node:path";
 
-import { acquire, AcquireError, writeSubject, subjectPathFor, type Subject } from "./engine/audit/acquire.js";
-import { buildInventory, writeInventory, computeCoverage, FileAccessLog, COVERAGE_CAVEAT } from "./engine/audit/inventory.js";
-import { runAnalyzers, analyzerLanguageCoverage, skippedAnalyzerNotes } from "./engine/audit/analyze.js";
+import {
+  acquire,
+  AcquireError,
+  writeSubject,
+  subjectPathFor,
+  type Subject,
+} from "./engine/audit/acquire.js";
+import {
+  buildInventory,
+  writeInventory,
+  computeCoverage,
+  FileAccessLog,
+  COVERAGE_CAVEAT,
+} from "./engine/audit/inventory.js";
+import {
+  runAnalyzers,
+  analyzerLanguageCoverage,
+  skippedAnalyzerNotes,
+} from "./engine/audit/analyze.js";
 import { renderReport, RenderRefused } from "./engine/audit/render.js";
 import type { AuditFinding } from "./engine/audit/finding.js";
 import type { JobFindings } from "./engine/findings/schema.js";
-import { investigate, summariseInvestigation, type Claim } from "./engine/audit/investigate.js";
-import { verifyClaims, summariseVerification, type LineReader } from "./engine/audit/verify.js";
-import { toAuditFindings, assertAllClosuresResolved, consolidateAsk, renderAsk } from "./engine/audit/closure.js";
+import {
+  investigate,
+  summariseInvestigation,
+  type Claim,
+} from "./engine/audit/investigate.js";
+import {
+  verifyClaims,
+  summariseVerification,
+  type LineReader,
+} from "./engine/audit/verify.js";
+import {
+  toAuditFindings,
+  assertAllClosuresResolved,
+  consolidateAsk,
+  renderAsk,
+} from "./engine/audit/closure.js";
 import { loadQuestionSet } from "./engine/audit/questions.js";
 import { makeReadTool } from "./engine/audit/read-tool.js";
-import { buildRepoMap, TagCache, type RepoFile } from "./engine/repomap/index.js";
+import {
+  buildRepoMap,
+  TagCache,
+  type RepoFile,
+} from "./engine/repomap/index.js";
 import { makeInvestigateModel, makeVerifierModel } from "./audit-model.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { AuditTelemetry, type AuditStage } from "./engine/audit/telemetry.js";
+import { sinkFromEnv } from "./audit-telemetry-http.js";
 
 /**
  * The baseline question set, resolved relative to this file rather than the
  * working directory — the CLI is run from wherever the tree happens to be.
  */
-const DEFAULT_QUESTIONS = fileURLToPath(new URL("../questions/taxonomy.yml", import.meta.url));
+const DEFAULT_QUESTIONS = fileURLToPath(
+  new URL("../questions/taxonomy.yml", import.meta.url),
+);
 import { maskSecrets } from "./engine/tools/sanitize.js";
 
 const USAGE = `audit — codebase audit
@@ -64,6 +103,65 @@ function flag(args: string[], name: string): string | undefined {
   return index === -1 ? undefined : args[index + 1];
 }
 
+/**
+ * The run this invocation belongs to.
+ *
+ * Each subcommand is a separate process, so the id has to live on disk or the
+ * dashboard sees five unrelated runs instead of one audit with five stages.
+ * Written by whichever stage runs first; every later stage joins it.
+ */
+function resolveRun(outDir: string): {
+  runId: string;
+  telemetry: AuditTelemetry;
+  note: string;
+} {
+  const path = join(outDir, "run.json");
+
+  let runId: string;
+  if (existsSync(path)) {
+    runId = (JSON.parse(readFileSync(path, "utf8")) as { runId: string }).runId;
+  } else {
+    runId = randomUUID();
+    writeFileSync(
+      path,
+      `${JSON.stringify({ runId, startedAt: new Date().toISOString() }, null, 2)}\n`,
+    );
+  }
+
+  const { sink, note } = sinkFromEnv(runId);
+  return {
+    runId,
+    telemetry: new AuditTelemetry({ runId, ...(sink ? { sink } : {}) }),
+    note,
+  };
+}
+
+/**
+ * Run one stage, reporting what happened to it.
+ *
+ * The flush is in a `finally` because a failed stage is the one the dashboard
+ * most needs to hear about, and the throw still propagates — telemetry
+ * observes the run, it does not catch for it.
+ */
+async function withStage<T>(
+  telemetry: AuditTelemetry,
+  stage: AuditStage,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  telemetry.stageStarted(stage);
+  try {
+    return await fn();
+  } catch (error) {
+    telemetry.stageFailed(
+      stage,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw error;
+  } finally {
+    await telemetry.flush();
+  }
+}
+
 async function runAcquire(args: string[]): Promise<number> {
   const from = flag(args, "--from");
   const into = flag(args, "--into");
@@ -72,7 +170,20 @@ async function runAcquire(args: string[]): Promise<number> {
     return 2;
   }
 
-  const subject = await acquire({ from, into, replace: args.includes("--replace") });
+  const { telemetry: acquireTelemetry } = resolveRun(dirname(resolve(into)));
+  const subject = await withStage(acquireTelemetry, "acquire", () =>
+    acquire({
+      from,
+      into,
+      replace: args.includes("--replace"),
+    }).then((acquired) => {
+      acquireTelemetry.stageFinished("acquire", {
+        files: acquired.files,
+        lines: acquired.loc,
+      });
+      return acquired;
+    }),
+  );
   const subjectPath = writeSubject(into, subject);
 
   const revLine = subject.rev ?? `none (${subject.revProvenance})`;
@@ -103,8 +214,18 @@ async function runInventory(args: string[]): Promise<number> {
     return 2;
   }
 
-  const inventory = buildInventory(tree);
-  const path = writeInventory(flag(args, "--out") ?? tree, inventory);
+  const out = flag(args, "--out") ?? tree;
+  const { telemetry, note: telemetryNote } = resolveRun(out);
+
+  const inventory = await withStage(telemetry, "inventory", () => {
+    const built = buildInventory(tree);
+    telemetry.stageFinished("inventory", {
+      files: built.files.length,
+      lines: built.files.reduce((n, f) => n + f.loc, 0),
+    });
+    return built;
+  });
+  const path = writeInventory(out, inventory);
 
   const byLanguage = new Map<string, number>();
   for (const file of inventory.files) {
@@ -127,6 +248,8 @@ async function runInventory(args: string[]): Promise<number> {
       "",
       `  ${COVERAGE_CAVEAT}`,
       "",
+      `  ${telemetryNote}`,
+      "",
     ].join("\n"),
   );
   return 0;
@@ -139,9 +262,39 @@ async function runAnalyze(args: string[]): Promise<number> {
     return 2;
   }
 
-  const jobs = await runAnalyzers(tree);
   const out = flag(args, "--out") ?? tree;
-  writeFileSync(join(out, "analyzers.json"), `${JSON.stringify(jobs, null, 2)}\n`);
+  const { telemetry, note: telemetryNote } = resolveRun(out);
+
+  const jobs = await withStage(telemetry, "analyze", async () => {
+    const result = await runAnalyzers(tree);
+    for (const job of result) {
+      // An analyzer that did not run is reported at warn, so it is visible in
+      // the UI hours before the PDF exists rather than only in its Coverage
+      // section.
+      if (job.parsed)
+        telemetry.log(
+          "analyze",
+          "info",
+          `${job.job}: ${job.findings.length} finding(s)`,
+        );
+      else
+        telemetry.log(
+          "analyze",
+          "warn",
+          `${job.job} did not run — ${job.reason ?? "no reason recorded"}`,
+        );
+    }
+    telemetry.stageFinished("analyze", {
+      analyzers: result.length,
+      ran: result.filter((j) => j.parsed).length,
+    });
+    return result;
+  });
+
+  writeFileSync(
+    join(out, "analyzers.json"),
+    `${JSON.stringify(jobs, null, 2)}\n`,
+  );
 
   const lines: string[] = [`analyzed ${tree}`];
   for (const job of jobs) {
@@ -155,8 +308,11 @@ async function runAnalyze(args: string[]): Promise<number> {
   const coverage = analyzerLanguageCoverage(buildInventory(tree), jobs);
   lines.push("", "  deterministic reach by language:");
   for (const [language, { files, analyzers }] of Object.entries(coverage)) {
-    const ran = analyzers.length > 0 ? analyzers.join(", ") : "NOTHING RAN OVER THIS";
-    lines.push(`    ${language.padEnd(12)} ${String(files).padStart(5)} files  ${ran}`);
+    const ran =
+      analyzers.length > 0 ? analyzers.join(", ") : "NOTHING RAN OVER THIS";
+    lines.push(
+      `    ${language.padEnd(12)} ${String(files).padStart(5)} files  ${ran}`,
+    );
   }
 
   const skips = skippedAnalyzerNotes(jobs);
@@ -165,6 +321,7 @@ async function runAnalyze(args: string[]): Promise<number> {
     for (const note of skips) lines.push(`    ${note}`);
   }
 
+  lines.push("", `  ${telemetryNote}`);
   process.stdout.write(lines.join("\n") + "\n\n");
   return 0;
 }
@@ -185,8 +342,13 @@ function readArtifact<T>(path: string, producedBy: string): T {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch (error) {
-    const why = (error as NodeJS.ErrnoException).code === "ENOENT" ? "not found" : "could not be read";
-    throw new CliError(`${path} ${why}.\nIt is written by ${producedBy}. Run that first, or pass the directory it wrote to.`);
+    const why =
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+        ? "not found"
+        : "could not be read";
+    throw new CliError(
+      `${path} ${why}.\nIt is written by ${producedBy}. Run that first, or pass the directory it wrote to.`,
+    );
   }
 }
 
@@ -227,12 +389,21 @@ async function runInvestigate(args: string[]): Promise<number> {
 
   const out = flag(args, "--out") ?? tree;
   const apiKey = process.env["ANTHROPIC_API_KEY"];
-  if (!apiKey) throw new CliError("ANTHROPIC_API_KEY is not set. The investigation stage needs a model.");
+  if (!apiKey)
+    throw new CliError(
+      "ANTHROPIC_API_KEY is not set. The investigation stage needs a model.",
+    );
 
   const subject = readArtifact<Subject>(subjectPathFor(tree), "audit acquire");
-  const jobs = readArtifact<JobFindings[]>(join(out, "analyzers.json"), "audit analyze");
-  const questionSet = loadQuestionSet(flag(args, "--questions") ?? DEFAULT_QUESTIONS);
+  const jobs = readArtifact<JobFindings[]>(
+    join(out, "analyzers.json"),
+    "audit analyze",
+  );
+  const questionSet = loadQuestionSet(
+    flag(args, "--questions") ?? DEFAULT_QUESTIONS,
+  );
 
+  const { telemetry, note: telemetryNote } = resolveRun(out);
   const inventory = buildInventory(tree);
 
   // The log the model writes into, and the only source of the coverage figure.
@@ -247,20 +418,44 @@ async function runInvestigate(args: string[]): Promise<number> {
   // outline, not file contents, and counting them would put coverage at 100%
   // on every run — a number that cannot be wrong is a number that says nothing.
   const cache = new TagCache();
-  const repoFiles = readRepoFiles(tree, inventory);
+  const repoFiles = await withStage(telemetry, "map", () => {
+    const files = readRepoFiles(tree, inventory);
+    telemetry.stageFinished("map", {
+      parsed: files.length,
+      inScope: inventory.files.length,
+    });
+    return files;
+  });
 
   process.stdout.write(
     `investigating ${subject.name} — ${questionSet.questions.length} question(s), ` +
       `${inventory.files.length} file(s) in scope\n`,
   );
 
-  const results = await investigate({
-    questions: questionSet.questions,
-    model: makeInvestigateModel(modelOptions),
-    repoMapFor: (seedTexts) =>
-      buildRepoMap({ files: repoFiles, diffTouchedFiles: [], seedTexts, diffText: "", cache }).text,
-    analyzerJobs: jobs,
-    subjectRev: subject.rev,
+  const results = await withStage(telemetry, "investigate", async () => {
+    const runs = await investigate({
+      questions: questionSet.questions,
+      model: makeInvestigateModel(modelOptions),
+      repoMapFor: (seedTexts) =>
+        buildRepoMap({
+          files: repoFiles,
+          diffTouchedFiles: [],
+          seedTexts,
+          diffText: "",
+          cache,
+        }).text,
+      analyzerJobs: jobs,
+      subjectRev: subject.rev,
+      log: (message) => telemetry.log("investigate", "info", message),
+      onProgress: (done, total) =>
+        telemetry.progress("investigate", done, total),
+    });
+    telemetry.stageFinished("investigate", {
+      questions: runs.length,
+      claims: runs.reduce((n, r) => n + r.claims.length, 0),
+      filesOpened: accessLog.opened().size,
+    });
+    return runs;
   });
 
   const investigation = summariseInvestigation(results);
@@ -270,11 +465,22 @@ async function runInvestigate(args: string[]): Promise<number> {
       `  files      ${accessLog.opened().size} opened\n`,
   );
 
-  const verification = await verifyClaims({
-    claims,
-    model: makeVerifierModel(modelOptions),
-    readLine: lineReaderFor(tree),
-    ...(flag(args, "--verifiers") ? { verifiers: Number(flag(args, "--verifiers")) } : {}),
+  const verification = await withStage(telemetry, "verify", async () => {
+    const result = await verifyClaims({
+      claims,
+      model: makeVerifierModel(modelOptions),
+      readLine: lineReaderFor(tree),
+      log: (message) => telemetry.log("verify", "info", message),
+      onProgress: (done, total) => telemetry.progress("verify", done, total),
+      ...(flag(args, "--verifiers")
+        ? { verifiers: Number(flag(args, "--verifiers")) }
+        : {}),
+    });
+    telemetry.stageFinished("verify", {
+      verified: result.verified.length,
+      rejected: result.rejected.length,
+    });
+    return result;
   });
 
   const summary = summariseVerification(verification);
@@ -283,15 +489,29 @@ async function runInvestigate(args: string[]): Promise<number> {
       `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n`,
   );
 
-  const closure = toAuditFindings({ verified: verification.verified });
-  assertAllClosuresResolved(closure);
+  const closure = await withStage(telemetry, "closure", () => {
+    const result = toAuditFindings({ verified: verification.verified });
+    assertAllClosuresResolved(result);
+    // Findings go up as they are settled, so the UI can show them long before
+    // the PDF exists.
+    for (const found of result.findings) telemetry.finding(found);
+    telemetry.stageFinished("closure", { findings: result.findings.length });
+    return result;
+  });
 
   accessLog.writeTo(out);
   const findingsPath = join(out, "findings.json");
   writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
 
+  await telemetry.flush();
+  const outstanding = telemetry.outstanding();
+
   process.stdout.write(
-    `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
+    `  ${telemetryNote}\n` +
+      (outstanding.events > 0
+        ? `  ! ${outstanding.events} telemetry event(s) undelivered after ${outstanding.failedFlushes} failed flush(es)\n`
+        : "") +
+      `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
       renderAsk(consolidateAsk(closure.findings)).join("\n") +
       "\n\n",
   );
@@ -305,12 +525,19 @@ async function runInvestigate(args: string[]): Promise<number> {
  * error should cost one file's ranking, not the run. They are already counted
  * in the inventory denominator, so skipping here cannot flatter coverage.
  */
-function readRepoFiles(tree: string, inventory: ReturnType<typeof buildInventory>): RepoFile[] {
+function readRepoFiles(
+  tree: string,
+  inventory: ReturnType<typeof buildInventory>,
+): RepoFile[] {
   const files: RepoFile[] = [];
   for (const file of inventory.files) {
     try {
       const full = join(tree, file.path);
-      files.push({ path: file.path, content: readFileSync(full, "utf8"), mtimeMs: statSync(full).mtimeMs });
+      files.push({
+        path: file.path,
+        content: readFileSync(full, "utf8"),
+        mtimeMs: statSync(full).mtimeMs,
+      });
     } catch {
       continue;
     }
@@ -350,38 +577,64 @@ async function runRender(args: string[]): Promise<number> {
 
   const out = flag(args, "--out") ?? tree;
   const subject = readArtifact<Subject>(subjectPathFor(tree), "audit acquire");
-  const findings = readArtifact<AuditFinding[]>(findingsPath, "the verify and closure stages");
-  const jobs = readArtifact<JobFindings[]>(join(out, "analyzers.json"), "audit analyze");
+  const findings = readArtifact<AuditFinding[]>(
+    findingsPath,
+    "the verify and closure stages",
+  );
+  const jobs = readArtifact<JobFindings[]>(
+    join(out, "analyzers.json"),
+    "audit analyze",
+  );
 
   const inventory = buildInventory(tree);
   const accessLog = readAccessLog(out);
   const releaseBy = flag(args, "--release-by");
 
-  const result = await renderReport({
-    input: {
-      subject,
-      findings,
-      // Coverage is only as real as the access log behind it; a run whose log
-      // is missing is refused by the renderer rather than printed as 0%.
-      coverage: computeCoverage(inventory, accessLog),
-      analyzerJobs: jobs,
-      analyzerReach: analyzerLanguageCoverage(inventory, jobs),
-      questionCount: 10,
-      ...(releaseBy ? { release: { by: releaseBy, at: new Date().toISOString().slice(0, 10) } } : {}),
-    },
-    executiveSummary:
-      "This review read source code only. Every finding below carries the evidence it rests on, " +
-      "and every open question carries what would settle it.",
-    outDir: out,
-    subjectRev: subject.rev ?? null,
-    mask: (text) => maskSecrets(text),
+  const { telemetry: renderTelemetry } = resolveRun(out);
+  const result = await withStage(renderTelemetry, "render", async () => {
+    const rendered = await renderReport({
+      input: {
+        subject,
+        findings,
+        // Coverage is only as real as the access log behind it; a run whose log
+        // is missing is refused by the renderer rather than printed as 0%.
+        coverage: computeCoverage(inventory, accessLog),
+        analyzerJobs: jobs,
+        analyzerReach: analyzerLanguageCoverage(inventory, jobs),
+        questionCount: 10,
+        ...(releaseBy
+          ? {
+              release: {
+                by: releaseBy,
+                at: new Date().toISOString().slice(0, 10),
+              },
+            }
+          : {}),
+      },
+      executiveSummary:
+        "This review read source code only. Every finding below carries the evidence it rests on, " +
+        "and every open question carries what would settle it.",
+      outDir: out,
+      subjectRev: subject.rev ?? null,
+      mask: (text) => maskSecrets(text),
+    });
+
+    // A skipped PDF is a skipped stage with a reason, not a silent success.
+    if (rendered.pdfSkipped)
+      renderTelemetry.stageSkipped("render", rendered.pdfSkipped);
+    else renderTelemetry.stageFinished("render", { findings: findings.length });
+    return rendered;
   });
 
   const lines = [
     `rendered ${findings.length} finding(s)`,
     `  source     ${result.typstPath}`,
-    result.pdfPath ? `  pdf        ${result.pdfPath}` : `  pdf        NOT PRODUCED — ${result.pdfSkipped}`,
-    releaseBy ? `  released   ${releaseBy}` : "  status     DRAFT — watermarked, not for distribution",
+    result.pdfPath
+      ? `  pdf        ${result.pdfPath}`
+      : `  pdf        NOT PRODUCED — ${result.pdfSkipped}`,
+    releaseBy
+      ? `  released   ${releaseBy}`
+      : "  status     DRAFT — watermarked, not for distribution",
   ];
   for (const warning of result.warnings) lines.push(`  ! ${warning}`);
   process.stdout.write(lines.join("\n") + "\n\n");
@@ -414,10 +667,16 @@ main()
   .catch((error: unknown) => {
     // An AcquireError is a refusal we chose — say it plainly, without a stack
     // that makes a deliberate safety check look like a crash.
-    if (error instanceof AcquireError || error instanceof RenderRefused || error instanceof CliError) {
+    if (
+      error instanceof AcquireError ||
+      error instanceof RenderRefused ||
+      error instanceof CliError
+    ) {
       process.stderr.write(`\n${error.message}\n`);
       process.exit(1);
     }
-    process.stderr.write(`\n${error instanceof Error ? error.stack : String(error)}\n`);
+    process.stderr.write(
+      `\n${error instanceof Error ? error.stack : String(error)}\n`,
+    );
     process.exit(1);
   });

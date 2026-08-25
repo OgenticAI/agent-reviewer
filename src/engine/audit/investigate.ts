@@ -112,20 +112,28 @@ const SYSTEM_PROMPT = [
 export function renderAnalyzerFacts(jobs: JobFindings[]): string {
   if (jobs.length === 0) return "No deterministic analysis was run.";
 
-  const lines = ["Established by deterministic analysis — do NOT re-derive these:"];
+  const lines = [
+    "Established by deterministic analysis — do NOT re-derive these:",
+  ];
   for (const job of jobs) {
     if (!job.parsed) {
-      lines.push(`- ${job.job}: DID NOT RUN (${job.reason ?? "no reason recorded"}).`);
+      lines.push(
+        `- ${job.job}: DID NOT RUN (${job.reason ?? "no reason recorded"}).`,
+      );
       lines.push(`  Treat this as unknown, never as clean.`);
       continue;
     }
     if (job.findings.length === 0) {
-      lines.push(`- ${job.job}: ran and reported nothing. This is a positive fact.`);
+      lines.push(
+        `- ${job.job}: ran and reported nothing. This is a positive fact.`,
+      );
       continue;
     }
     lines.push(`- ${job.job}: ${job.findings.length} finding(s), including:`);
     for (const finding of job.findings.slice(0, 20)) {
-      lines.push(`    ${finding.path} [${finding.severity}] ${finding.message}`);
+      lines.push(
+        `    ${finding.path} [${finding.severity}] ${finding.message}`,
+      );
     }
     if (job.findings.length > 20) {
       lines.push(`    … and ${job.findings.length - 20} more`);
@@ -168,7 +176,10 @@ export function buildUserPrompt(input: PromptInput): string {
 
 /* ── Parsing what came back ───────────────────────────────────────────────── */
 
-function coerceEvidence(raw: unknown, subjectRev: string | null): EvidenceRef[] {
+function coerceEvidence(
+  raw: unknown,
+  subjectRev: string | null,
+): EvidenceRef[] {
   if (!Array.isArray(raw)) return [];
 
   return raw.flatMap((entry): EvidenceRef[] => {
@@ -177,10 +188,14 @@ function coerceEvidence(raw: unknown, subjectRev: string | null): EvidenceRef[] 
     const path = typeof ref.path === "string" ? ref.path.trim() : "";
     if (!path) return [];
 
-    const line = typeof ref.line === "number" && Number.isFinite(ref.line) ? ref.line : undefined;
+    const line =
+      typeof ref.line === "number" && Number.isFinite(ref.line)
+        ? ref.line
+        : undefined;
     // The quote came out of the tree under audit; it is untrusted text like any
     // other, and it ends up in a report.
-    const quote = typeof ref.quote === "string" ? sanitizeUntrusted(ref.quote) : undefined;
+    const quote =
+      typeof ref.quote === "string" ? sanitizeUntrusted(ref.quote) : undefined;
 
     return [
       {
@@ -222,7 +237,13 @@ export function parseClaims(
   if (typeof data !== "object" || data === null) {
     return {
       claims: [],
-      dropped: [{ questionId: question.id, statement: "(unparseable reply)", reason: "unreadable" }],
+      dropped: [
+        {
+          questionId: question.id,
+          statement: "(unparseable reply)",
+          reason: "unreadable",
+        },
+      ],
     };
   }
 
@@ -230,7 +251,13 @@ export function parseClaims(
   if (!Array.isArray(rawClaims)) {
     return {
       claims: [],
-      dropped: [{ questionId: question.id, statement: "(reply had no claims array)", reason: "unreadable" }],
+      dropped: [
+        {
+          questionId: question.id,
+          statement: "(reply had no claims array)",
+          reason: "unreadable",
+        },
+      ],
     };
   }
 
@@ -240,13 +267,18 @@ export function parseClaims(
   for (const entry of rawClaims) {
     if (typeof entry !== "object" || entry === null) continue;
     const raw = entry as Record<string, unknown>;
-    const statement = typeof raw.statement === "string" ? raw.statement.trim() : "";
+    const statement =
+      typeof raw.statement === "string" ? raw.statement.trim() : "";
     if (!statement) continue;
 
     const evidence = coerceEvidence(raw.evidence, subjectRev);
     if (evidence.length === 0) {
       // The line that keeps the stage honest.
-      dropped.push({ questionId: question.id, statement, reason: "no-evidence" });
+      dropped.push({
+        questionId: question.id,
+        statement,
+        reason: "no-evidence",
+      });
       continue;
     }
 
@@ -272,6 +304,14 @@ export interface InvestigateOptions {
   subjectRev: string | null;
   /** Where dropped claims are announced. Defaults to stderr. */
   log?: (message: string) => void;
+  /**
+   * Called as each question finishes, in completion order.
+   *
+   * Questions run concurrently, so this is the only honest source of progress
+   * — a caller counting its own loop would report work that has been started
+   * rather than work that is done.
+   */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -282,43 +322,70 @@ export interface InvestigateOptions {
  * that fell over on question three and reported nothing would be worse than one
  * that says which question it could not answer.
  */
-export async function investigate(options: InvestigateOptions): Promise<QuestionRunResult[]> {
+export async function investigate(
+  options: InvestigateOptions,
+): Promise<QuestionRunResult[]> {
   const log = options.log ?? ((message: string) => console.error(message));
   const analyzerFacts = renderAnalyzerFacts(options.analyzerJobs);
 
-  const runs = options.questions.map(async (question): Promise<QuestionRunResult> => {
-    const userPrompt = buildUserPrompt({
-      question,
-      repoMap: options.repoMapFor(seedTextsFor(question)),
-      analyzerFacts,
-    });
+  let done = 0;
+  const total = options.questions.length;
+  const advance = () => options.onProgress?.(++done, total);
 
-    let response: InvestigateResponse;
-    try {
-      response = await options.model.investigate({ question, systemPrompt: SYSTEM_PROMPT, userPrompt });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      log(`[investigate] ${question.id} failed: ${detail}`);
+  const runs = options.questions.map((question) =>
+    // `finally`, so a question that failed still counts as finished. Advancing
+    // only on the success path would leave a progress bar permanently short of
+    // its denominator on any run with a failed question.
+    (async (): Promise<QuestionRunResult> => {
+      const userPrompt = buildUserPrompt({
+        question,
+        repoMap: options.repoMapFor(seedTextsFor(question)),
+        analyzerFacts,
+      });
+
+      let response: InvestigateResponse;
+      try {
+        response = await options.model.investigate({
+          question,
+          systemPrompt: SYSTEM_PROMPT,
+          userPrompt,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        log(`[investigate] ${question.id} failed: ${detail}`);
+        return {
+          questionId: question.id,
+          claims: [],
+          dropped: [
+            {
+              questionId: question.id,
+              statement: `(run failed: ${detail})`,
+              reason: "unreadable",
+            },
+          ],
+          openedFiles: [],
+        };
+      }
+
+      const { claims, dropped } = parseClaims(
+        response.text,
+        question,
+        options.subjectRev,
+      );
+      for (const drop of dropped) {
+        log(
+          `[investigate] dropped claim on ${drop.questionId} (${drop.reason}): ${drop.statement}`,
+        );
+      }
+
       return {
         questionId: question.id,
-        claims: [],
-        dropped: [{ questionId: question.id, statement: `(run failed: ${detail})`, reason: "unreadable" }],
-        openedFiles: [],
+        claims,
+        dropped,
+        openedFiles: response.openedFiles ?? [],
       };
-    }
-
-    const { claims, dropped } = parseClaims(response.text, question, options.subjectRev);
-    for (const drop of dropped) {
-      log(`[investigate] dropped claim on ${drop.questionId} (${drop.reason}): ${drop.statement}`);
-    }
-
-    return {
-      questionId: question.id,
-      claims,
-      dropped,
-      openedFiles: response.openedFiles ?? [],
-    };
-  });
+    })().finally(advance),
+  );
 
   return Promise.all(runs);
 }
@@ -334,7 +401,10 @@ export function summariseInvestigation(results: QuestionRunResult[]): {
   return {
     questions: results.length,
     claims: results.reduce((total, result) => total + result.claims.length, 0),
-    dropped: results.reduce((total, result) => total + result.dropped.length, 0),
+    dropped: results.reduce(
+      (total, result) => total + result.dropped.length,
+      0,
+    ),
     filesOpened: opened.size,
   };
 }

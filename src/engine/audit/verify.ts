@@ -124,7 +124,10 @@ function significantWords(text: string): string[] {
  * Refs with no quote are not checked here: a path-and-line reference is a
  * pointer, not an assertion about content, and the verifiers judge it.
  */
-export function checkAnchors(claim: Claim, readLine: LineReader): AnchorProblem[] {
+export function checkAnchors(
+  claim: Claim,
+  readLine: LineReader,
+): AnchorProblem[] {
   const problems: AnchorProblem[] = [];
 
   for (const ref of claim.evidence) {
@@ -205,17 +208,25 @@ const ABSENCE_INSTRUCTION = [
   "Finding nothing under one name is not absence.",
 ].join("\n");
 
-export function buildVerifyPrompt(claim: Claim): { systemPrompt: string; userPrompt: string } {
+export function buildVerifyPrompt(claim: Claim): {
+  systemPrompt: string;
+  userPrompt: string;
+} {
   return {
-    systemPrompt: claim.absence ? SYSTEM_PROMPT + ABSENCE_INSTRUCTION : SYSTEM_PROMPT,
+    systemPrompt: claim.absence
+      ? SYSTEM_PROMPT + ABSENCE_INSTRUCTION
+      : SYSTEM_PROMPT,
     userPrompt: [
       `CLAIM (from question ${claim.questionId})`,
       sanitizeUntrusted(claim.statement),
       "",
       "CITED EVIDENCE",
       ...claim.evidence.map((ref) => {
-        const where = ref.line === undefined ? ref.path : `${ref.path}:${ref.line}`;
-        const quote = ref.quote ? ` — quoted: ${sanitizeUntrusted(ref.quote)}` : "";
+        const where =
+          ref.line === undefined ? ref.path : `${ref.path}:${ref.line}`;
+        const quote = ref.quote
+          ? ` — quoted: ${sanitizeUntrusted(ref.quote)}`
+          : "";
         return `  ${where}${quote}`;
       }),
     ].join("\n"),
@@ -250,9 +261,16 @@ export function decideConfidence(verdicts: VerifierVerdict[]): {
     return { confidence: "not-determinable", rejected: true, refutations };
   }
 
-  const blocked = verdicts.find((v) => v.outcome === "cannot-determine" && v.needsAccess);
+  const blocked = verdicts.find(
+    (v) => v.outcome === "cannot-determine" && v.needsAccess,
+  );
   if (blocked?.needsAccess) {
-    return { confidence: "not-determinable", rejected: false, refutations: 0, needsAccess: blocked.needsAccess };
+    return {
+      confidence: "not-determinable",
+      rejected: false,
+      refutations: 0,
+      needsAccess: blocked.needsAccess,
+    };
   }
 
   const survived = verdicts.filter((v) => v.outcome === "not-refuted").length;
@@ -266,7 +284,11 @@ export function decideConfidence(verdicts: VerifierVerdict[]): {
 /** Every distinct vocabulary any verifier reported trying, in a stable order. */
 export function vocabulariesFrom(verdicts: VerifierVerdict[]): string[] {
   const all = verdicts.flatMap((v) => v.vocabulariesTried ?? []);
-  return [...new Set(all.map((entry) => entry.trim()).filter((entry) => entry !== ""))].sort();
+  return [
+    ...new Set(
+      all.map((entry) => entry.trim()).filter((entry) => entry !== ""),
+    ),
+  ].sort();
 }
 
 /* ── Running the stage ────────────────────────────────────────────────────── */
@@ -278,6 +300,8 @@ export interface VerifyOptions {
   /** How many independent attempts per claim. Never below MIN_VERIFIERS. */
   verifiers?: number;
   log?: (message: string) => void;
+  /** Called as each claim is settled. Claims are verified in input order. */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -288,62 +312,86 @@ export interface VerifyOptions {
  * unchanged tree must produce the same output, because a report that shifts
  * between runs cannot be diffed against the next audit.
  */
-export async function verifyClaims(options: VerifyOptions): Promise<VerificationResult> {
+export async function verifyClaims(
+  options: VerifyOptions,
+): Promise<VerificationResult> {
   const log = options.log ?? ((message: string) => console.error(message));
   const attempts = Math.max(options.verifiers ?? MIN_VERIFIERS, MIN_VERIFIERS);
 
   const verified: VerifiedClaim[] = [];
   const rejected: RejectedClaim[] = [];
 
-  for (const claim of options.claims) {
-    // Gate one, free and deterministic: does the citation exist?
-    const anchorProblems = checkAnchors(claim, options.readLine);
-    if (anchorProblems.length > 0) {
-      const detail = anchorProblems
-        .map((problem) => `${problem.ref.path}:${problem.ref.line} ${problem.reason}`)
-        .join("; ");
-      log(`[verify] ${claim.questionId}: citation does not hold — ${detail}`);
-      rejected.push({
+  for (const [index, claim] of options.claims.entries()) {
+    // `finally`, so a claim rejected at an early gate still advances the
+    // count. Two of the exits below are `continue`, and a progress bar that
+    // silently skips them stalls on any run with a bad citation.
+    try {
+      // Gate one, free and deterministic: does the citation exist?
+      const anchorProblems = checkAnchors(claim, options.readLine);
+      if (anchorProblems.length > 0) {
+        const detail = anchorProblems
+          .map(
+            (problem) =>
+              `${problem.ref.path}:${problem.ref.line} ${problem.reason}`,
+          )
+          .join("; ");
+        log(`[verify] ${claim.questionId}: citation does not hold — ${detail}`);
+        rejected.push({
+          claim,
+          reason: `fabricated or stale citation: ${detail}`,
+          verdicts: [],
+        });
+        continue;
+      }
+
+      const { systemPrompt, userPrompt } = buildVerifyPrompt(claim);
+      const verdicts = await runVerifiers({
         claim,
-        reason: `fabricated or stale citation: ${detail}`,
-        verdicts: [],
+        attempts,
+        model: options.model,
+        systemPrompt,
+        userPrompt,
+        log,
       });
-      continue;
+
+      const decision = decideConfidence(verdicts);
+      const vocabulariesTried = vocabulariesFrom(verdicts);
+
+      if (decision.rejected) {
+        const why =
+          verdicts.find((v) => v.outcome === "refuted")?.reason ?? "refuted";
+        log(`[verify] ${claim.questionId}: REFUTED — ${why}`);
+        rejected.push({ claim, reason: why, verdicts });
+        continue;
+      }
+
+      // An absence claim that nobody searched properly is not absence. Downgrade
+      // rather than drop: the question is still open, we just cannot say "no".
+      let confidence = decision.confidence;
+      if (
+        claim.absence &&
+        confidence === "verified" &&
+        vocabulariesTried.length < MIN_VOCABULARIES
+      ) {
+        log(
+          `[verify] ${claim.questionId}: absence not established — ` +
+            `${vocabulariesTried.length} vocabulary/ies tried, ${MIN_VOCABULARIES} required`,
+        );
+        confidence = "not-determinable";
+      }
+
+      verified.push({
+        claim,
+        verdicts,
+        confidence,
+        verifiers: verdicts.length,
+        refutations: decision.refutations,
+        ...(decision.needsAccess ? { needsAccess: decision.needsAccess } : {}),
+        vocabulariesTried,
+      });
+    } finally {
+      options.onProgress?.(index + 1, options.claims.length);
     }
-
-    const { systemPrompt, userPrompt } = buildVerifyPrompt(claim);
-    const verdicts = await runVerifiers({ claim, attempts, model: options.model, systemPrompt, userPrompt, log });
-
-    const decision = decideConfidence(verdicts);
-    const vocabulariesTried = vocabulariesFrom(verdicts);
-
-    if (decision.rejected) {
-      const why = verdicts.find((v) => v.outcome === "refuted")?.reason ?? "refuted";
-      log(`[verify] ${claim.questionId}: REFUTED — ${why}`);
-      rejected.push({ claim, reason: why, verdicts });
-      continue;
-    }
-
-    // An absence claim that nobody searched properly is not absence. Downgrade
-    // rather than drop: the question is still open, we just cannot say "no".
-    let confidence = decision.confidence;
-    if (claim.absence && confidence === "verified" && vocabulariesTried.length < MIN_VOCABULARIES) {
-      log(
-        `[verify] ${claim.questionId}: absence not established — ` +
-          `${vocabulariesTried.length} vocabulary/ies tried, ${MIN_VOCABULARIES} required`,
-      );
-      confidence = "not-determinable";
-    }
-
-    verified.push({
-      claim,
-      verdicts,
-      confidence,
-      verifiers: verdicts.length,
-      refutations: decision.refutations,
-      ...(decision.needsAccess ? { needsAccess: decision.needsAccess } : {}),
-      vocabulariesTried,
-    });
   }
 
   return { verified, rejected };
@@ -357,25 +405,32 @@ async function runVerifiers(args: {
   userPrompt: string;
   log: (message: string) => void;
 }): Promise<VerifierVerdict[]> {
-  const runs = Array.from({ length: args.attempts }, (_, index) => index + 1).map(
-    async (verifier): Promise<VerifierVerdict> => {
-      try {
-        const verdict = await args.model.refute({
-          claim: args.claim,
-          verifier,
-          systemPrompt: args.systemPrompt,
-          userPrompt: args.userPrompt,
-        });
-        return { ...verdict, verifier };
-      } catch (error) {
-        // A verifier that crashed did not clear the claim. Counting a failure as
-        // "not refuted" would let an outage manufacture confidence.
-        const detail = error instanceof Error ? error.message : String(error);
-        args.log(`[verify] ${args.claim.questionId}: verifier ${verifier} failed — ${detail}`);
-        return { verifier, outcome: "cannot-determine", reason: `verifier failed: ${detail}` };
-      }
-    },
-  );
+  const runs = Array.from(
+    { length: args.attempts },
+    (_, index) => index + 1,
+  ).map(async (verifier): Promise<VerifierVerdict> => {
+    try {
+      const verdict = await args.model.refute({
+        claim: args.claim,
+        verifier,
+        systemPrompt: args.systemPrompt,
+        userPrompt: args.userPrompt,
+      });
+      return { ...verdict, verifier };
+    } catch (error) {
+      // A verifier that crashed did not clear the claim. Counting a failure as
+      // "not refuted" would let an outage manufacture confidence.
+      const detail = error instanceof Error ? error.message : String(error);
+      args.log(
+        `[verify] ${args.claim.questionId}: verifier ${verifier} failed — ${detail}`,
+      );
+      return {
+        verifier,
+        outcome: "cannot-determine",
+        reason: `verifier failed: ${detail}`,
+      };
+    }
+  });
 
   const verdicts = await Promise.all(runs);
   return verdicts.sort((a, b) => a.verifier - b.verifier);

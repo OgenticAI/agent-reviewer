@@ -124,7 +124,7 @@ export interface FindingEvent {
 export interface RunEvent {
   kind: "run";
   runId: string;
-  status: "cancelled";
+  status: "cancelled" | "mask-fired";
   at: string;
 }
 
@@ -383,6 +383,23 @@ export class AuditTelemetry {
       this.recordCancelled();
     }
     throw new RunCancelled(stage);
+  }
+
+  /**
+   * A literal secret reached the rendered report.
+   *
+   * Only the engine can report this: it is detected by masking the rendered
+   * text and noticing that masking CHANGED it, and the dashboard never sees the
+   * unmasked version — which is the point. So the fact travels as a run event
+   * and becomes a release blocker on the other side.
+   */
+  recordMaskFired(): void {
+    this.record({
+      kind: "run",
+      runId: this.runId,
+      status: "mask-fired",
+      at: this.at(),
+    });
   }
 
   /** The engine confirming it acted. Distinct from the request. */

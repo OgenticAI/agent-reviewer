@@ -728,6 +728,19 @@ async function runRender(args: string[]): Promise<number> {
       mask: (text) => maskSecrets(text),
     });
 
+    // Masking altering the rendered text means a literal secret reached the
+    // report. The renderer refuses this outright on a release; on a draft it
+    // warns, and the warning must not stop at this terminal — it is a release
+    // blocker, and only the engine can see it.
+    if (rendered.warnings.some((w) => /DRAFT ONLY/.test(w))) {
+      renderTelemetry.recordMaskFired();
+      renderTelemetry.log(
+        "render",
+        "error",
+        "secret masking altered the rendered report",
+      );
+    }
+
     // A skipped PDF is a skipped stage with a reason, not a silent success.
     if (rendered.pdfSkipped)
       renderTelemetry.stageSkipped("render", rendered.pdfSkipped);

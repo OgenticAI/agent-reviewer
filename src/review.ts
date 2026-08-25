@@ -28,6 +28,7 @@ import { REVIEWER_VERSION } from "./version.js";
 import { resolveResearchPolicy, type ResearchPolicy } from "./research/policy.js";
 import { EMPTY_TRACE, type ResearchTrace } from "./research/trace.js";
 import type { ToolCallRecord } from "./engine/tools/loop.js";
+import { fenceUntrusted, sanitizeUntrusted } from "./engine/tools/sanitize.js";
 import { hashPrompt, hashToolOutputs, isCacheHit } from "./cache/verdict-cache.js";
 import { adjudicateVerdict, type AdjudicatorModel } from "./adjudicate.js";
 import { CI_UNAVAILABLE, type CiSummary } from "./pr/ci/summary.js";
@@ -816,11 +817,19 @@ async function produceVerdictWithRetry(args: {
             lastError,
             "```",
             ``,
+            // Fenced, not just quoted. This text is the model's own output
+            // produced AFTER reading the PR diff, so it can carry anything the
+            // diff carried — including an instruction aimed at us that the
+            // model echoed. Re-sending it unfenced would launder attacker
+            // content from "something we read" into "something we said". The
+            // `<untrusted>` tag is the one the standing rule already in this
+            // prompt (UNTRUSTED_CONTENT_RULE, carried in args.userPrompt)
+            // refers to, so no new instruction is needed here.
             `This is what you returned:`,
             ``,
-            "```",
-            excerptForRetry(lastText),
-            "```",
+            fenceUntrusted(sanitizeUntrusted(excerptForRetry(lastText)), {
+              source: "rejected-verdict",
+            }),
             ``,
             `Return the corrected JSON only — same checklist, one object per item,`,
             `each with its 1-based "id". Do not explain the correction.`,

@@ -54,6 +54,14 @@ export interface ToolCallRecord {
 export interface ToolLoopResult {
   /** Every content block across every turn, in order. */
   content: unknown[];
+  /**
+   * Just the FINAL turn's content — which is where the answer is.
+   *
+   * Distinct from `content` because the model narrates as it works, and that
+   * narration is text like any other. Parsing the concatenation treats
+   * everything the model said on the way to the answer as part of the answer.
+   */
+  finalContent: unknown[];
   transcript: ToolCallRecord[];
   /** Why the loop stopped early, or undefined if it finished normally. */
   degraded?: string;
@@ -163,6 +171,7 @@ export async function runToolLoop(args: {
   const knownSecrets = collectKnownSecrets();
   const messages: LoopMessage[] = [{ role: "user", content: args.userPrompt }];
   const collected: unknown[] = [];
+  let lastContent: unknown[] = [];
   const transcript: ToolCallRecord[] = [];
 
   let iterations = 0;
@@ -182,6 +191,15 @@ export async function runToolLoop(args: {
 
     const response = await args.turn(messages);
     collected.push(...response.content);
+    // The LAST turn's content, kept apart from the running collection.
+    //
+    // The model narrates while it reads — "I'll start by reading the auth
+    // middleware" — and that narration is a text block like any other. Joining
+    // every turn's text and parsing the result as the answer means the answer
+    // is prefixed with everything the model thought on the way there, and on a
+    // TypeScript codebase that narration quotes code, which contains braces.
+    // The answer is the last thing said, not the union of everything said.
+    lastContent = response.content;
 
     // Server-side tool loop paused (web search etc). Re-send as-is to resume;
     // do NOT inject a "continue" message — the API resumes off the trailing
@@ -238,7 +256,7 @@ export async function runToolLoop(args: {
     degraded = `iteration cap of ${maxIterations} reached`;
   }
 
-  return { content: collected, transcript, degraded, iterations };
+  return { content: collected, finalContent: lastContent, transcript, degraded, iterations };
 }
 
 /**

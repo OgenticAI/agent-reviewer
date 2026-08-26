@@ -237,14 +237,57 @@ export function replyExcerpt(text: string): string {
     : `${flat.slice(0, REPLY_EXCERPT_CHARS - 1)}\u2026`;
 }
 
+/**
+ * The last balanced JSON object in a string.
+ *
+ * Slicing from the FIRST "{" to the LAST "}" fails the moment any prose before
+ * the answer contains a brace — and on a TypeScript codebase the model quotes
+ * code constantly, so it always does. That produced ten unparseable replies on
+ * a real run where every answer was in fact well-formed.
+ *
+ * Scanning backwards for a balanced object finds the answer regardless of what
+ * was said before it. Strings are tracked so a brace inside a quoted code
+ * fragment cannot unbalance the count.
+ */
+function lastJsonObject(text: string): string | null {
+  for (let end = text.lastIndexOf("}"); end !== -1; end = text.lastIndexOf("}", end - 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = end; i >= 0; i--) {
+      const ch = text[i] as string;
+
+      if (inString) {
+        // Walking backwards, a quote ends the string unless it is escaped —
+        // and that is decided by the run of backslashes before it.
+        if (ch === '"') {
+          let slashes = 0;
+          for (let j = i - 1; j >= 0 && text[j] === "\\"; j--) slashes++;
+          if (slashes % 2 === 0) inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"') { inString = true; escaped = false; continue; }
+      if (ch === "}") depth++;
+      else if (ch === "{") {
+        depth--;
+        if (depth === 0) return text.slice(i, end + 1);
+      }
+    }
+    void escaped;
+  }
+  return null;
+}
+
 function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = (fenced?.[1] ?? text).trim();
-  const start = candidate.indexOf("{");
-  const end = candidate.lastIndexOf("}");
-  if (start === -1 || end === -1 || end < start) return null;
+  const object = lastJsonObject(candidate);
+  if (object === null) return null;
   try {
-    return JSON.parse(candidate.slice(start, end + 1));
+    return JSON.parse(object);
   } catch {
     return null;
   }

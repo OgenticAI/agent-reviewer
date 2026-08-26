@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   semgrepAdapter,
@@ -52,6 +53,9 @@ const SEMGREP_JSON = JSON.stringify({
   ],
   errors: [],
 });
+
+/** A report path the caller names; only the file-mode analyzers use it. */
+const REPORT = "/tmp/audit-report.json";
 
 describe("the semgrep adapter", () => {
   it("normalises results into findings", () => {
@@ -213,7 +217,7 @@ describe("the tree under audit cannot configure the tools", () => {
     }
 
     for (const spec of [SEMGREP, SECRET_SCAN, DEPENDENCY_AUDIT]) {
-      const args = spec.args(scratch).join(" ");
+      const args = spec.args(scratch, REPORT).join(" ");
       for (const name of [".semgrepignore", ".semgrep.yml", ".gitleaksignore", ".gitleaks.toml", ".npmrc"]) {
         expect(args).not.toContain(name);
       }
@@ -221,7 +225,7 @@ describe("the tree under audit cannot configure the tools", () => {
   });
 
   it("names its own semgrep ruleset instead of resolving one at run time", () => {
-    const args = SEMGREP.args(scratch);
+    const args = SEMGREP.args(scratch, REPORT);
     expect(args).toContain("--config=p/security-audit");
     expect(args).not.toContain("--config=auto");
     // A codebase that excludes itself from review would otherwise scan clean
@@ -230,7 +234,7 @@ describe("the tree under audit cannot configure the tools", () => {
   });
 
   it("stops the secret scanner honouring an ignore file in the tree", () => {
-    expect(SECRET_SCAN.args(scratch)).toContain("--no-git");
+    expect(SECRET_SCAN.args(scratch, REPORT)).toContain("--no-git");
   });
 });
 
@@ -309,12 +313,17 @@ describe("a skipped analyzer says why", () => {
     );
   });
 
+  // The timeout is explicit because this test invokes the REAL analyzers. It
+  // was written when none of them was installed, so it returned skips in
+  // milliseconds; once OGE-2463 put semgrep on the machine it started actually
+  // scanning and blew vitest's 5s default. A test that passes only while the
+  // tooling is missing is a test that fails on every properly set-up machine.
   it("runs the whole set without one failure taking down the others", async () => {
     const jobs = await runAnalyzers(scratch);
     expect(jobs.map((j) => j.job).sort()).toEqual(["dependency-audit", "secret-scan", "semgrep"]);
-    // Nothing throws even with no tools installed and no lockfile.
+    // Nothing throws, whether the tools are installed or not.
     expect(jobs.every((j) => Array.isArray(j.findings))).toBe(true);
-  });
+  }, 120_000);
 });
 
 /* ── analyzer reach per language ─────────────────────────────────────────── */
@@ -383,5 +392,51 @@ describe("analyzer reach, so a report cannot imply parity", () => {
       { job: "secret-scan", parsed: true, findings: [] },
     ];
     expect(analyzerLanguageCoverage(inventory, jobs).typescript?.analyzers).toEqual(["secret-scan"]);
+  });
+});
+
+/* ── /dev/stdout is not a report path ─────────────────────────────────────── */
+
+describe("analyzers that write their report to a file", () => {
+  // gitleaks pre-checks that --report-path is writable by opening it, and
+  // /dev/stdout fails that check with EACCES whenever stdout is a pipe — which
+  // it always is under a spawn. The failure is total: the scan never starts.
+  //
+  // The trap is that the old form LOOKED fine. On a developer's terminal stdout
+  // is a tty and /dev/stdout opens happily, so it broke only where it mattered:
+  // on the box, where every run is piped. Measured there as
+  // "secret-scan SKIPPED — gitleaks failed to run" with every non-code language
+  // reading NOTHING RAN OVER THIS.
+  it("never asks a tool to write its report to /dev/stdout", () => {
+    for (const spec of [SEMGREP, SECRET_SCAN, DEPENDENCY_AUDIT]) {
+      expect(spec.args(scratch, REPORT).join(" ")).not.toContain("/dev/stdout");
+    }
+  });
+
+  it("hands the secret scanner the path the runner chose", () => {
+    const args = SECRET_SCAN.args(scratch, REPORT);
+    expect(args[args.indexOf("--report-path") + 1]).toBe(REPORT);
+    expect(SECRET_SCAN.usesReportFile).toBe(true);
+  });
+
+  // The report is ours and belongs nowhere near the subject: a file we create
+  // inside a client's checkout could be mistaken for part of it.
+  it("puts the report outside the tree under audit", () => {
+    expect(REPORT.startsWith(scratch)).toBe(false);
+    const src = readFileSync(
+      fileURLToPath(new URL("../../src/engine/audit/analyze.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(src).toMatch(/mkdtemp\(join\(tmpdir\(\)/);
+  });
+
+  // Several gitleaks versions write nothing at all when they find nothing.
+  // That is an empty result, not a failure to run.
+  it("treats an absent report after a clean exit as no findings", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../../src/engine/audit/analyze.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(src).toMatch(/existsSync\(reportPath\) \? readFileSync\(reportPath, "utf8"\) : "\[\]"/);
   });
 });

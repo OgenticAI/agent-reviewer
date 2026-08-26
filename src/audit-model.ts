@@ -61,7 +61,18 @@ function openedFrom(transcript: ReadonlyArray<{ name: string; input: unknown }>)
   return [...new Set(paths)];
 }
 
+import type { UsageMeter } from "./engine/audit/usage.js";
+
 export interface AuditModelOptions {
+  /**
+   * Records what every call cost (OGE-2502).
+   *
+   * Optional so a caller that does not care about spend is unaffected, but the
+   * CLI always supplies one — this is the ONLY place the audit path reaches the
+   * API, so a meter here sees every investigate and verify call including each
+   * tool-loop iteration.
+   */
+  meter?: UsageMeter;
   anthropic: Anthropic;
   /** The `read_file` tool, already bound to the tree and the access log. */
   readTool: ReviewTool;
@@ -85,6 +96,9 @@ async function runOnce(options: AuditModelOptions, systemPrompt: string, userPro
       messages: messages as Anthropic.MessageParam[],
       ...(tools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
     });
+    // Before anything can throw on the response shape: an unmeasured call is
+    // recorded as unmeasured, never dropped.
+    options.meter?.record(completion);
     return { content: completion.content, stopReason: completion.stop_reason };
   };
 

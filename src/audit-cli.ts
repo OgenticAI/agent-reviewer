@@ -51,6 +51,12 @@ import {
   type Claim,
 } from "./engine/audit/investigate.js";
 import {
+  UsageMeter,
+  rateCardFromEnv,
+  buildUsageReport,
+  renderUsage,
+} from "./engine/audit/usage.js";
+import {
   verifyClaims,
   summariseVerification,
   type LineReader,
@@ -68,7 +74,9 @@ import {
   TagCache,
   type RepoFile,
 } from "./engine/repomap/index.js";
-import { makeInvestigateModel, makeVerifierModel } from "./audit-model.js";
+import { makeInvestigateModel, makeVerifierModel,
+  AUDIT_MODEL,
+} from "./audit-model.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -474,7 +482,12 @@ async function investigateRun(ctx: {
   const readTool = makeReadTool({ root: tree, log: accessLog });
 
   const anthropic = new Anthropic({ apiKey });
-  const modelOptions = { anthropic, readTool };
+  // One meter for the whole run. audit-model.ts is the only place this path
+  // reaches the API, so this sees every call including each tool-loop
+  // iteration (OGE-2502).
+  const meter = new UsageMeter();
+  const rateCard = rateCardFromEnv();
+  const modelOptions = { anthropic, readTool, meter };
 
   // Building the repo map parses every file for tags. Those reads are
   // deliberately NOT access-log events: the map shows the model a ranked
@@ -495,6 +508,7 @@ async function investigateRun(ctx: {
       `${inventory.files.length} file(s) in scope\n`,
   );
 
+  meter.enter("investigate");
   const results = await withStage(telemetry, "investigate", async () => {
     const runs = await investigate({
       questions: questionSet.questions,
@@ -528,6 +542,7 @@ async function investigateRun(ctx: {
       `  files      ${accessLog.opened().size} opened\n`,
   );
 
+  meter.enter("verify");
   const verification = await withStage(telemetry, "verify", async () => {
     const result = await verifyClaims({
       claims,
@@ -587,6 +602,14 @@ async function investigateRun(ctx: {
     )}\n`,
   );
 
+  // What the run cost, beside what it produced (OGE-2502). Written before the
+  // findings so a run that dies during render still leaves its spend recorded —
+  // an audit that cost money and reported nothing is exactly the one worth
+  // being able to account for.
+  const usage = buildUsageReport(meter, AUDIT_MODEL, rateCard);
+  writeFileSync(join(out, "usage.json"), `${JSON.stringify(usage, null, 2)}\n`);
+  telemetry.usage(usage);
+
   accessLog.writeTo(out);
   const findingsPath = join(out, "findings.json");
   writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
@@ -600,6 +623,8 @@ async function investigateRun(ctx: {
         ? `  ! ${outstanding.events} telemetry event(s) undelivered after ${outstanding.failedFlushes} failed flush(es)\n`
         : "") +
       `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
+      renderUsage(usage, subject.loc).join("\n") +
+      "\n\n" +
       renderAsk(consolidateAsk(closure.findings)).join("\n") +
       "\n\n",
   );

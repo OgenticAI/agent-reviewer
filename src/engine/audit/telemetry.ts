@@ -28,6 +28,7 @@
 
 import { maskSecrets, collectKnownSecrets } from "../tools/sanitize.js";
 import type { AuditFinding } from "./finding.js";
+import type { UsageReport } from "./usage.js";
 
 /**
  * A run an operator stopped.
@@ -128,11 +129,26 @@ export interface RunEvent {
   at: string;
 }
 
+/**
+ * What the run cost (OGE-2502).
+ *
+ * Carries the rate card it was priced with, so the figure the dashboard shows
+ * stays a fact about THIS run rather than a recomputation against whatever the
+ * price list says later.
+ */
+export interface UsageEvent {
+  kind: "usage";
+  runId: string;
+  usage: UsageReport;
+  at: string;
+}
+
 export type AuditEvent =
   | StageEvent
   | ProgressEvent
   | LogEvent
   | FindingEvent
+  | UsageEvent
   | RunEvent;
 
 /**
@@ -319,6 +335,16 @@ export class AuditTelemetry {
    * cannot hide something the report would have shown — it only stops the
    * database being the place the raw value landed first.
    */
+  /**
+   * Report what the run cost.
+   *
+   * No redaction here, unlike a finding's message: token counts and rates carry
+   * nothing from the client's source.
+   */
+  usage(usage: UsageReport): void {
+    this.record({ kind: "usage", runId: this.runId, at: this.at(), usage });
+  }
+
   finding(finding: AuditFinding): void {
     this.record({
       kind: "finding",

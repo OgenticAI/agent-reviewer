@@ -295,8 +295,49 @@ describe("clone failures read as instructions, not crashes", () => {
   ])("explains an auth failure and says nothing was written", (stderr) => {
     const message = describeCloneFailure(url, stderr);
     expect(message).toMatch(/cannot authenticate/i);
-    expect(message).toMatch(/app password|SSH key/);
     expect(message).toMatch(/Nothing was written/);
+  });
+
+  // Bitbucket app passwords were REMOVED — that settings page is a 404. This
+  // message is the one thing an operator reads at the moment they are stuck, so
+  // pointing them at a feature that no longer exists costs an afternoon.
+  it("never recommends a feature Bitbucket has removed", () => {
+    for (const host of [
+      "https://bitbucket.org/acme/app",
+      "https://github.com/acme/app",
+      "git@gitlab.com:acme/app.git",
+    ]) {
+      expect(describeCloneFailure(host, "fatal: Authentication failed")).not.toMatch(
+        /app password/i,
+      );
+    }
+  });
+
+  // Both Bitbucket mistakes produce an IDENTICAL `Authentication failed`, which
+  // is exactly why they are worth naming here rather than left to be guessed.
+  it.each([
+    "https://bitbucket.org/acme/app.git",
+    "git@bitbucket.org:acme/app.git",
+  ])("names both ways a Bitbucket token fails, for %s", (bitbucket) => {
+    const message = describeCloneFailure(bitbucket, "fatal: Authentication failed");
+    expect(message).toMatch(/scopes/i);
+    expect(message).toMatch(/read:repository:bitbucket/);
+    // The expensive one: the account email authenticates against the REST API
+    // and is refused by git, so every check short of a clone looks healthy.
+    expect(message).toMatch(/x-bitbucket-api-token-auth/);
+    expect(message).toMatch(/REST API/);
+  });
+
+  // Advice for the host we were pointed at, and no other. A GitHub failure has
+  // no business being told about Atlassian tokens.
+  it.each([
+    "https://github.com/acme/app.git",
+    "https://gitlab.com/acme/app.git",
+    "git@github.com:acme/app.git",
+  ])("keeps Bitbucket-specific advice off %s", (other) => {
+    const message = describeCloneFailure(other, "fatal: Authentication failed");
+    expect(message).not.toMatch(/bitbucket/i);
+    expect(message).toMatch(/personal access token|SSH key/);
   });
 
   it("distinguishes not-found from not-authorised, without guessing which", () => {

@@ -209,7 +209,8 @@ describe("runToolLoop — caps", () => {
       userPrompt: "p",
       maxIterations: 4,
     });
-    expect(s.calls).toBe(4);
+    // Four budgeted turns plus the closing turn that asks for the answer.
+    expect(s.calls).toBe(5);
     expect(result.iterations).toBe(4);
     expect(result.degraded).toMatch(/iteration cap of 4/);
   });
@@ -385,5 +386,120 @@ describe("observation collapsing (OGE-1583)", () => {
     });
     expect(result.transcript).toHaveLength(7);
     for (const rec of result.transcript) expect(rec.result).toContain("full result");
+  });
+});
+
+/* ── The closing turn (OGE-2511) ──────────────────────────────────────────── */
+
+/** A scripted turn that also records the options it was called with. */
+function recordingTurn(responses: LoopTurnResponse[]): {
+  turn: TurnFn;
+  calls: number;
+  offers: Array<boolean | undefined>;
+  lastMessages: LoopMessage[];
+} {
+  let i = 0;
+  const state = { calls: 0, offers: [], lastMessages: [] } as unknown as {
+    calls: number;
+    offers: Array<boolean | undefined>;
+    lastMessages: LoopMessage[];
+    turn: TurnFn;
+  };
+  state.turn = async (messages, options) => {
+    state.calls += 1;
+    state.offers.push(options?.tools);
+    state.lastMessages = JSON.parse(JSON.stringify(messages)) as LoopMessage[];
+    return responses[Math.min(i++, responses.length - 1)]!;
+  };
+  return state;
+}
+
+const ANSWER: LoopTurnResponse = {
+  content: [{ type: "text", text: '{"claims":[]}' }],
+  stopReason: "end_turn",
+};
+
+describe("runToolLoop — the closing turn", () => {
+  // The bug this exists for: every question on a real run burned its whole
+  // budget reading files and handed back the sentence it happened to be saying
+  // ("Now let me look for actual test files:") as its answer. The reading was
+  // already paid for; nobody had asked for the conclusion.
+  it("asks for the answer once the budget is gone, and returns it", async () => {
+    const s = recordingTurn([toolUseTurn("read_file"), toolUseTurn("read_file"), ANSWER]);
+    const result = await runToolLoop({
+      turn: s.turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 2,
+    });
+
+    expect(result.forcedAnswer).toBe(true);
+    expect(JSON.stringify(result.finalContent)).toContain("claims");
+    expect(result.degraded).toMatch(/answered from what had already been read/);
+  });
+
+  // The load-bearing assertion. A model that still has tools will call one,
+  // because calling one is exactly what it was in the middle of doing — so
+  // withholding them IS the mechanism, not a tidiness detail.
+  it("withholds the tools on the closing turn and only on the closing turn", async () => {
+    // Never answers, so the cap trips and the closing turn is reached.
+    const s = recordingTurn([toolUseTurn("read_file")]);
+    await runToolLoop({
+      turn: s.turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 2,
+    });
+
+    expect(s.calls).toBe(3); // two budgeted turns, then the closing one
+    const closing = s.offers[s.offers.length - 1];
+    expect(closing).toBe(false);
+    for (const offer of s.offers.slice(0, -1)) expect(offer).not.toBe(false);
+  });
+
+  it("tells the model it has no tool calls left", async () => {
+    const s = recordingTurn([toolUseTurn("read_file")]);
+    await runToolLoop({
+      turn: s.turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 1,
+    });
+    expect(JSON.stringify(s.lastMessages)).toMatch(/no more tool calls available/);
+  });
+
+  // A question the model finished on its own must not be re-asked: that would
+  // spend a call on every healthy question and overwrite a good answer.
+  it("does not fire when the model answered of its own accord", async () => {
+    const s = recordingTurn([ANSWER]);
+    const result = await runToolLoop({
+      turn: s.turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 4,
+    });
+    expect(s.calls).toBe(1);
+    expect(result.forcedAnswer).toBe(false);
+    expect(result.degraded).toBeUndefined();
+  });
+
+  // A closing turn that throws must leave the run exactly as it would have
+  // been before this existed — degraded, with the last thing the model said.
+  it("survives a closing turn that fails", async () => {
+    let i = 0;
+    const turn: TurnFn = async () => {
+      i += 1;
+      if (i > 1) throw new Error("overloaded");
+      return toolUseTurn("read_file");
+    };
+    const result = await runToolLoop({
+      turn,
+      registry: makeRegistry([echoTool()]),
+      userPrompt: "p",
+      maxIterations: 1,
+    });
+    expect(result.forcedAnswer).toBe(false);
+    expect(result.degraded).toMatch(/closing turn failed \(overloaded\)/);
+    expect(result.finalContent.length).toBeGreaterThan(0);
   });
 });

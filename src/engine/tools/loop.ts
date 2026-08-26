@@ -38,8 +38,22 @@ export interface LoopTurnResponse {
   stopReason: string | null;
 }
 
+/** Options for a single turn. */
+export interface TurnOptions {
+  /**
+   * Offer the tools, or withhold them.
+   *
+   * Withheld for the closing turn only. A model that still has tools will keep
+   * using them, which is the exact behaviour the closing turn exists to stop.
+   */
+  tools: boolean;
+}
+
 /** One request/response against the model. Injected so tests can fake it. */
-export type TurnFn = (messages: LoopMessage[]) => Promise<LoopTurnResponse>;
+export type TurnFn = (
+  messages: LoopMessage[],
+  options?: TurnOptions,
+) => Promise<LoopTurnResponse>;
 
 /** One executed tool call, for the transcript. */
 export interface ToolCallRecord {
@@ -66,6 +80,15 @@ export interface ToolLoopResult {
   /** Why the loop stopped early, or undefined if it finished normally. */
   degraded?: string;
   iterations: number;
+  /**
+   * True when the answer came from the closing turn rather than from the model
+   * deciding it was done.
+   *
+   * A forced answer rests on whatever had been read by the time the budget ran
+   * out, which is thinner ground than one the model chose to give. The caller
+   * needs to be able to say so rather than present the two as equivalent.
+   */
+  forcedAnswer: boolean;
 }
 
 /** Iteration cap. Generous enough for real investigation, small enough to bound cost. */
@@ -256,7 +279,69 @@ export async function runToolLoop(args: {
     degraded = `iteration cap of ${maxIterations} reached`;
   }
 
-  return { content: collected, finalContent: lastContent, transcript, degraded, iterations };
+  // ── The closing turn ──────────────────────────────────────────────────────
+  //
+  // A budget that runs out mid-investigation used to end the run right there,
+  // and whatever the model happened to be saying at that moment — "Now let me
+  // look for actual test files:" — was handed back as its answer. On a real
+  // run every one of ten questions hit the cap, so every answer was a sentence
+  // of narration, and all of it was reported as an unparseable reply.
+  //
+  // The reading has already been paid for by then. What was missing was anyone
+  // asking for the conclusion. So: ask once, with the tools withheld.
+  //
+  // Withholding them is the whole mechanism. A model that can still call a
+  // tool will call one, because that is what it was in the middle of doing.
+  let forcedAnswer = false;
+  if (degraded && iterations > 0) {
+    askForTheAnswer(messages);
+    try {
+      const closing = await args.turn(messages, { tools: false });
+      collected.push(...closing.content);
+      lastContent = closing.content;
+      forcedAnswer = true;
+      degraded = `${degraded}; answered from what had already been read, without further tool use`;
+    } catch (error) {
+      // A failed closing turn must not lose the run. The caller keeps the
+      // original degraded reason and the last thing the model said, which is
+      // exactly the state it would have been in before this existed.
+      const detail = error instanceof Error ? error.message : String(error);
+      degraded = `${degraded}; the closing turn failed (${detail})`;
+    }
+  }
+
+  return {
+    content: collected,
+    finalContent: lastContent,
+    transcript,
+    degraded,
+    iterations,
+    forcedAnswer,
+  };
+}
+
+/**
+ * Append the instruction that asks for the conclusion.
+ *
+ * Folded into the trailing user message when there is one, rather than pushed
+ * as a second user message: the trailing message carries the `tool_result`
+ * blocks answering the model's last call, and keeping the request in the same
+ * message keeps that pairing obviously intact.
+ */
+function askForTheAnswer(messages: LoopMessage[]): void {
+  const instruction =
+    "You have no more tool calls available. Do not ask for another file. " +
+    "Answer now, in the required format, using only what you have already read. " +
+    "If the evidence you gathered is too thin to support a claim, say so in that " +
+    "same format rather than guessing — an honest empty answer is a result, and a " +
+    "fabricated one is worse than none.";
+
+  const last = messages[messages.length - 1];
+  if (last?.role === "user" && Array.isArray(last.content)) {
+    (last.content as unknown[]).push({ type: "text", text: instruction });
+    return;
+  }
+  messages.push({ role: "user", content: instruction });
 }
 
 /**

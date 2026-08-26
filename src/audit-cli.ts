@@ -487,7 +487,21 @@ async function investigateRun(ctx: {
   // iteration (OGE-2502).
   const meter = new UsageMeter();
   const rateCard = rateCardFromEnv();
-  const modelOptions = { anthropic, readTool, meter };
+  // `log` is not optional in practice, whatever the type says. Without it the
+  // model layer falls back to console.error, and the one thing it reports —
+  // that a question ran out of tool-loop budget before it answered — goes to a
+  // stream nothing posts. A whole run once came back with ten questions
+  // "unparseable" while the real reason sat in stderr, and the investigation
+  // went after the parser (OGE-2511).
+  //
+  // Attributed to `investigate` because that is the stage whose budget this
+  // reports on; the verify stage rebinds it below.
+  const modelOptions = {
+    anthropic,
+    readTool,
+    meter,
+    log: (message: string) => telemetry.log("investigate", "info", message),
+  };
 
   // Building the repo map parses every file for tags. Those reads are
   // deliberately NOT access-log events: the map shows the model a ranked
@@ -546,7 +560,12 @@ async function investigateRun(ctx: {
   const verification = await withStage(telemetry, "verify", async () => {
     const result = await verifyClaims({
       claims,
-      model: makeVerifierModel(modelOptions),
+      // Rebound so a verifier that runs out of budget is reported against the
+      // verify stage rather than mislabelled as investigate.
+      model: makeVerifierModel({
+        ...modelOptions,
+        log: (message: string) => telemetry.log("verify", "info", message),
+      }),
       readLine: lineReaderFor(tree),
       log: (message) => telemetry.log("verify", "info", message),
       onProgress: (done, total) => {

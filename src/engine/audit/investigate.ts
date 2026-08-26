@@ -67,6 +67,14 @@ export interface InvestigateResponse {
   text: string;
   /** Paths the tool loop opened during this run. */
   openedFiles?: string[];
+  /**
+   * Why the tool loop stopped early, when it did.
+   *
+   * Carried so that an answer which never arrived is reported as an answer
+   * that never arrived. Without it a truncated question is indistinguishable
+   * from a malformed one, and the two lead an investigation to opposite places.
+   */
+  truncated?: string;
 }
 
 /**
@@ -303,18 +311,20 @@ export function parseClaims(
   text: string,
   question: Question,
   subjectRev: string | null,
+  context?: { truncated?: string },
 ): { claims: Claim[]; dropped: DroppedClaim[] } {
   const data = extractJson(text);
   if (typeof data !== "object" || data === null) {
+    // Say which of the two happened. "Unparseable" names the parser, and when
+    // the real cause was a question that ran out of tool-loop budget before it
+    // answered, that sends whoever reads it to the wrong file. A whole run of
+    // ten truncated questions was investigated as a parser fault (OGE-2511).
+    const statement = context?.truncated
+      ? `(no answer — ${context.truncated}; last words: ${replyExcerpt(text)})`
+      : `(unparseable reply: ${replyExcerpt(text)})`;
     return {
       claims: [],
-      dropped: [
-        {
-          questionId: question.id,
-          statement: `(unparseable reply: ${replyExcerpt(text)})`,
-          reason: "unreadable",
-        },
-      ],
+      dropped: [{ questionId: question.id, statement, reason: "unreadable" }],
     };
   }
 
@@ -442,6 +452,7 @@ export async function investigate(
         response.text,
         question,
         options.subjectRev,
+        { truncated: response.truncated },
       );
       for (const drop of dropped) {
         log(

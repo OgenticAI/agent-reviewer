@@ -144,7 +144,11 @@ async function runOnce(options: AuditModelOptions, systemPrompt: string, userPro
   const registry = makeRegistry([options.readTool]);
   const tools = toolDefinitions(registry);
 
-  const turn: TurnFn = async (messages) => {
+  const turn: TurnFn = async (messages, turnOptions) => {
+    // Withheld only for the loop's closing turn. Offering tools to a model
+    // that has run out of budget is how the closing turn becomes another tool
+    // call instead of an answer.
+    const offerTools = turnOptions?.tools !== false;
     const completion = await options.anthropic.messages.create({
       model: options.model ?? AUDIT_MODEL,
       max_tokens: MAX_OUTPUT_TOKENS,
@@ -154,7 +158,7 @@ async function runOnce(options: AuditModelOptions, systemPrompt: string, userPro
       temperature: 0,
       system: systemPrompt,
       messages: withCachedPrefix(messages),
-      ...(tools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
+      ...(tools && offerTools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
     });
     // Before anything can throw on the response shape: an unmeasured call is
     // recorded as unmeasured, never dropped.
@@ -176,13 +180,24 @@ export function makeInvestigateModel(options: AuditModelOptions): InvestigateMod
       // A capped loop is reported, never silently accepted. A question the
       // model ran out of turns on has thinner evidence behind it than one it
       // finished, and the operator should know which is which.
+      //
+      // The turn count rides along because "everything hit the cap" is the
+      // single most useful thing to notice about a bad run, and it was
+      // previously only derivable by dividing the run's total model calls by
+      // the number of questions — which is not a thing anyone does in time.
       if (loop.degraded) {
-        log(`[audit] ${request.question.id}: tool loop degraded — ${loop.degraded}`);
+        log(
+          `[audit] ${request.question.id}: ${loop.iterations}/${MAX_TOOL_ITERATIONS} turns — ` +
+            `${loop.degraded}`,
+        );
       }
 
       return {
         text: extractText(loop.finalContent as unknown[]),
         openedFiles: openedFrom(loop.transcript),
+        // Only when the loop actually stopped short. A question that finished
+        // on its own must not be labelled truncated.
+        ...(loop.degraded ? { truncated: loop.degraded } : {}),
       };
     },
   };

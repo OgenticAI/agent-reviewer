@@ -171,6 +171,14 @@ async function withStage<T>(
   telemetry: AuditTelemetry,
   stage: AuditStage,
   fn: () => Promise<T> | T,
+  /**
+   * Queued before the flush, whether the stage succeeded or threw.
+   *
+   * This is where the running cost is emitted. Money is spent as the stage
+   * runs, so it has to be reported on the way out of the stage rather than at
+   * the end of the run — a run that dies has still spent it (OGE-2515).
+   */
+  onSettled?: () => void,
 ): Promise<T> {
   // A stage boundary is the cheapest honest checkpoint: nothing is half-done,
   // and the artifacts written so far stay valid. Stages that take an hour check
@@ -186,6 +194,14 @@ async function withStage<T>(
     );
     throw error;
   } finally {
+    // Before the flush, so the spend leaves on the same trip as the stage
+    // result. Never allowed to throw: failing to report a cost must not be
+    // what fails a run.
+    try {
+      onSettled?.();
+    } catch {
+      /* reporting spend is never worth losing the run over */
+    }
     await telemetry.flush();
   }
 }
@@ -487,6 +503,28 @@ async function investigateRun(ctx: {
   // iteration (OGE-2502).
   const meter = new UsageMeter();
   const rateCard = rateCardFromEnv();
+
+  /**
+   * Publish what has been spent SO FAR (OGE-2515).
+   *
+   * Called on the way out of every stage and on every progress tick, not once
+   * at the end. Two reasons, and the second is why this exists at all:
+   *
+   *   - A run that dies has still spent the money. Reporting only on success
+   *     meant a failed run showed no cost — which reads as "cost nothing"
+   *     rather than "cost unknown", and that is the same well-formed lie this
+   *     engine keeps being built against. One run burned an eighteen-minute
+   *     verify stage, died at closure, and recorded nothing at all.
+   *   - Spend needs to be legible WHILE a run is going. That verify stage ran
+   *     for sixteen minutes; the cost of it should not be a surprise revealed
+   *     at the end.
+   *
+   * Safe to call repeatedly: the dashboard applies a usage event as an UPDATE,
+   * so each call simply replaces the total with a more complete one.
+   */
+  const reportUsage = (): void => {
+    telemetry.usage(buildUsageReport(meter, AUDIT_MODEL, rateCard));
+  };
   // `log` is not optional in practice, whatever the type says. Without it the
   // model layer falls back to console.error, and the one thing it reports —
   // that a question ran out of tool-loop budget before it answered — goes to a
@@ -515,7 +553,7 @@ async function investigateRun(ctx: {
       inScope: inventory.files.length,
     });
     return files;
-  });
+  }, reportUsage);
 
   process.stdout.write(
     `investigating ${subject.name} — ${questionSet.questions.length} question(s), ` +
@@ -538,8 +576,12 @@ async function investigateRun(ctx: {
       analyzerJobs: jobs,
       subjectRev: subject.rev,
       log: (message) => telemetry.log("investigate", "info", message),
-      onProgress: (done, total) =>
-        telemetry.progress("investigate", done, total),
+      // Cost rides along with progress. A stage that runs for minutes should
+      // show what it is spending while it spends it, not at the end.
+      onProgress: (done, total) => {
+        telemetry.progress("investigate", done, total);
+        reportUsage();
+      },
     });
     telemetry.stageFinished("investigate", {
       questions: runs.length,
@@ -547,7 +589,7 @@ async function investigateRun(ctx: {
       filesOpened: accessLog.opened().size,
     });
     return runs;
-  });
+  }, reportUsage);
 
   const investigation = summariseInvestigation(results);
   const claims: Claim[] = results.flatMap((r) => r.claims);
@@ -570,6 +612,7 @@ async function investigateRun(ctx: {
       log: (message) => telemetry.log("verify", "info", message),
       onProgress: (done, total) => {
         telemetry.progress("verify", done, total);
+        reportUsage();
         void telemetry.flush();
       },
       shouldStop: () => telemetry.cancelRequested(),
@@ -582,7 +625,7 @@ async function investigateRun(ctx: {
       rejected: result.rejected.length,
     });
     return result;
-  });
+  }, reportUsage);
 
   const summary = summariseVerification(verification);
   process.stdout.write(
@@ -603,7 +646,7 @@ async function investigateRun(ctx: {
     for (const found of result.findings) telemetry.finding(found);
     telemetry.stageFinished("closure", { findings: result.findings.length });
     return result;
-  });
+  }, reportUsage);
 
   // What the investigation managed to ask, persisted for the maturity table.
   // A question that ran and found nothing is evidence; a question that never
@@ -621,10 +664,17 @@ async function investigateRun(ctx: {
     )}\n`,
   );
 
-  // What the run cost, beside what it produced (OGE-2502). Written before the
-  // findings so a run that dies during render still leaves its spend recorded —
-  // an audit that cost money and reported nothing is exactly the one worth
-  // being able to account for.
+  // The final total, written to disk beside what the run produced (OGE-2502).
+  //
+  // This is no longer what makes spend survive a failure — `reportUsage` does
+  // that, on the way out of every stage. This line USED to carry that job, and
+  // its comment claimed it covered "a run that dies during render". It sat
+  // after the closure stage, so it covered render and nothing earlier: a run
+  // that spent eighteen minutes and then died at closure recorded no cost at
+  // all, and the page showed nothing, which reads as free rather than unknown.
+  //
+  // What remains here is worth keeping — usage.json on disk, and one last
+  // authoritative total for a run that completed.
   const usage = buildUsageReport(meter, AUDIT_MODEL, rateCard);
   writeFileSync(join(out, "usage.json"), `${JSON.stringify(usage, null, 2)}\n`);
   telemetry.usage(usage);

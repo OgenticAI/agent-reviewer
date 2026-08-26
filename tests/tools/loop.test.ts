@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_ITERATIONS,
   runToolLoop,
+  type LoopMessage,
   type LoopTurnResponse,
   type TurnFn,
 } from "../../src/engine/tools/loop.js";

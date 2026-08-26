@@ -183,11 +183,45 @@ function liftSingleWrapperDirectory(root: string): void {
  * not a crash. Reporting it as a stack trace makes an ordinary setup step look
  * like a defect in the audit.
  */
+/**
+ * Bitbucket's two ways to fail with an identical message.
+ *
+ * Both of these produce a plain `Authentication failed` over git, which is why
+ * naming them is worth the words at the exact moment someone is stuck.
+ *
+ * The username is the expensive one. An Atlassian account email authenticates
+ * perfectly well against Bitbucket's REST API — `/2.0/repositories/...` returns
+ * 200 — and is rejected by git. So every check short of an actual clone reports
+ * a healthy credential, and the natural conclusion is that the token is bad
+ * when the token is fine.
+ *
+ * Bitbucket app passwords, which this message used to recommend, no longer
+ * exist; that settings page is a 404.
+ */
+function bitbucketCredentialHelp(): string {
+  return (
+    `On bitbucket.org an Atlassian API token needs two things that both fail this way: ` +
+    `it must be created with Bitbucket SCOPES (the "Create API token with scopes" button, ` +
+    `granting read:repository:bitbucket), and the git username must be ` +
+    `"x-bitbucket-api-token-auth" rather than the account email — the email works against ` +
+    `the REST API and is refused by git.`
+  );
+}
+
+/** Advice for the host we were actually pointed at, and no other. */
+function credentialHelpFor(url: string): string {
+  if (/(^|[/@.])bitbucket\.org([/:]|$)/i.test(url)) return bitbucketCredentialHelp();
+  return (
+    `Configure a read credential for that host — a personal access token, or an SSH key ` +
+    `with the git@ form of the URL.`
+  );
+}
+
 export function describeCloneFailure(url: string, stderr: string): string {
   if (/could not read Username|Authentication failed|terminal prompts disabled/i.test(stderr)) {
     return (
       `cannot authenticate to ${url}. ` +
-      `Configure a credential for that host (a Bitbucket app password, or an SSH key with the git@ form) and retry. ` +
+      `${credentialHelpFor(url)} ` +
       `Nothing was written.`
     );
   }

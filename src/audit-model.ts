@@ -121,7 +121,7 @@ export function makeInvestigateModel(options: AuditModelOptions): InvestigateMod
       }
 
       return {
-        text: extractText(loop.content as unknown[]),
+        text: extractText(loop.finalContent as unknown[]),
         openedFiles: openedFrom(loop.transcript),
       };
     },
@@ -167,7 +167,7 @@ export function makeVerifierModel(options: AuditModelOptions): VerifierModel {
     async refute(request: VerifyRequest): Promise<VerifierVerdict> {
       try {
         const loop = await runOnce(options, request.systemPrompt, request.userPrompt);
-        return parseVerdict(extractText(loop.content as unknown[]), request.verifier);
+        return parseVerdict(extractText(loop.finalContent as unknown[]), request.verifier);
       } catch (error) {
         // A verifier that crashed did not clear the claim. Same reasoning as
         // an unparseable reply: failure must never read as agreement.

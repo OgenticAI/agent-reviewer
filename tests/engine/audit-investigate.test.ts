@@ -454,3 +454,46 @@ describe("what an unparseable reply reports", () => {
     expect(parseClaims("```json\n" + good + "\n```", question(), REV).claims.length).toBe(1);
   });
 });
+
+/* ── The answer is the last thing said, not everything said ───────────────── */
+
+describe("a reply that came after the model narrated its work", () => {
+  const GOOD =
+    '{"claims":[{"statement":"a","absence":false,"evidence":[{"path":"src/a.ts","line":1,"quote":"q"}]}]}';
+
+  // The exact production failure. Ten questions returned well-formed answers
+  // and every one was discarded: the tool loop concatenated the text from every
+  // turn, the model narrates as it reads, and on a TypeScript codebase that
+  // narration quotes code — which contains braces. Slicing from the FIRST "{"
+  // to the LAST "}" then spans prose plus JSON and cannot parse.
+  it("parses the answer even when earlier prose contains braces", () => {
+    const narrated = [
+      "I'll start by reading the auth middleware.",
+      "This defines `export const guard = { strict: true }` which suggests…",
+      GOOD,
+    ].join("\n");
+    expect(parseClaims(narrated, question(), REV).claims).toHaveLength(1);
+  });
+
+  it("is not confused by a brace inside a quoted code fragment", () => {
+    const narrated = `The file had "if (x) { y }" in it. Here is the answer:\n${GOOD}`;
+    expect(parseClaims(narrated, question(), REV).claims).toHaveLength(1);
+  });
+
+  // Whatever else changes, the plain shapes must keep working.
+  it.each([
+    ["bare", GOOD],
+    ["fenced", "```json\n" + GOOD + "\n```"],
+    ["with a preamble", "Here are my findings:\n" + GOOD],
+  ])("still parses a %s reply", (_label, text) => {
+    expect(parseClaims(text, question(), REV).claims).toHaveLength(1);
+  });
+
+  // A reply with no JSON at all is still unparseable, and still says what it
+  // was — the excerpt must not be lost to the new extraction path.
+  it("still reports prose-only replies as unparseable, with the excerpt", () => {
+    const { claims, dropped } = parseClaims("I could not access those files.", question(), REV);
+    expect(claims).toHaveLength(0);
+    expect(dropped[0]!.statement).toMatch(/unparseable reply: I could not access/);
+  });
+});

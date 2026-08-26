@@ -209,6 +209,34 @@ function coerceEvidence(
 }
 
 /** Pull the JSON object out of a reply that may be fenced or prefaced. */
+/**
+ * How much of an unrecognised reply to keep.
+ *
+ * Enough to see WHAT came back — prose, an apology, an error, an empty string —
+ * without pasting a model's essay into a log line.
+ */
+export const REPLY_EXCERPT_CHARS = 200;
+
+/**
+ * Say what the model actually returned, rather than only that it was wrong.
+ *
+ * `(unparseable reply)` on its own is the same shape as reporting a Python
+ * crash as "Traceback (most recent call last):" — accurate, well-formed, and
+ * carrying nothing anyone can act on. A run where all ten questions came back
+ * unparseable left no way to tell an empty response from an apology from a
+ * rate-limit notice rendered as prose.
+ *
+ * Whitespace is collapsed because a reply full of newlines would otherwise take
+ * ten lines of the run log to say nothing.
+ */
+export function replyExcerpt(text: string): string {
+  const flat = (text ?? "").replace(/\s+/g, " ").trim();
+  if (flat === "") return "empty response";
+  return flat.length <= REPLY_EXCERPT_CHARS
+    ? flat
+    : `${flat.slice(0, REPLY_EXCERPT_CHARS - 1)}\u2026`;
+}
+
 function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = (fenced?.[1] ?? text).trim();
@@ -240,7 +268,7 @@ export function parseClaims(
       dropped: [
         {
           questionId: question.id,
-          statement: "(unparseable reply)",
+          statement: `(unparseable reply: ${replyExcerpt(text)})`,
           reason: "unreadable",
         },
       ],

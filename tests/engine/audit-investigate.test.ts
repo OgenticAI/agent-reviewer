@@ -16,6 +16,8 @@ import {
   renderAnalyzerFacts,
   summariseInvestigation,
   type InvestigateModel,
+  replyExcerpt,
+  REPLY_EXCERPT_CHARS,
 } from "../../src/engine/audit/investigate.js";
 import type { JobFindings } from "../../src/engine/findings/schema.js";
 
@@ -403,5 +405,52 @@ describe("running the stage", () => {
       dropped: 0,
       filesOpened: 1,
     });
+  });
+});
+
+/* ── An unreadable reply should say what it was ───────────────────────────── */
+
+describe("what an unparseable reply reports", () => {
+  // "(unparseable reply)" alone is the same shape as reporting a Python crash
+  // as "Traceback (most recent call last):" — accurate, well-formed, and
+  // carrying nothing anyone can act on. A run where all ten questions came back
+  // unparseable left no way to tell an empty response from an apology from a
+  // rate-limit notice rendered as prose.
+  it("carries an excerpt of what actually came back", () => {
+    const { dropped } = parseClaims(
+      "I'm sorry, I cannot access those files.",
+      question(),
+      REV,
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]!.statement).toMatch(/unparseable reply:/);
+    expect(dropped[0]!.statement).toMatch(/I'm sorry, I cannot access/);
+  });
+
+  // The commonest case and the least self-explanatory: an empty string used to
+  // render as an empty pair of brackets.
+  it("names an empty response rather than showing nothing", () => {
+    expect(replyExcerpt("")).toBe("empty response");
+    expect(replyExcerpt("   \n\t ")).toBe("empty response");
+  });
+
+  // A reply full of newlines would otherwise take ten lines of the run log to
+  // say nothing.
+  it("collapses whitespace onto one line", () => {
+    expect(replyExcerpt("line one\n\n   line two\n")).toBe("line one line two");
+  });
+
+  it("truncates an essay instead of pasting it into the log", () => {
+    const excerpt = replyExcerpt("x".repeat(1000));
+    expect(excerpt.length).toBeLessThanOrEqual(REPLY_EXCERPT_CHARS);
+    expect(excerpt.endsWith("\u2026")).toBe(true);
+  });
+
+  // Still parsed when it IS valid — the excerpt path must not swallow good
+  // replies, fenced or bare.
+  it("does not change a reply it can read", () => {
+    const good = '{"claims":[{"statement":"a","absence":false,"evidence":[{"path":"src/a.ts","line":1,"quote":"q"}]}]}';
+    expect(parseClaims(good, question(), REV).claims.length).toBe(1);
+    expect(parseClaims("```json\n" + good + "\n```", question(), REV).claims.length).toBe(1);
   });
 });

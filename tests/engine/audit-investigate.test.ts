@@ -497,3 +497,42 @@ describe("a reply that came after the model narrated its work", () => {
     expect(dropped[0]!.statement).toMatch(/unparseable reply: I could not access/);
   });
 });
+
+/* ── A truncated question is not a malformed one (OGE-2511) ───────────────── */
+
+describe("when the tool loop ran out of budget before the model answered", () => {
+  // Ten questions came back "(unparseable reply)" on a real run. Every one had
+  // burned all 24 turns reading files and been cut off mid-sentence. The word
+  // "unparseable" names the parser, so that is where the investigation went —
+  // and the parser was not the reason. What a failure is CALLED decides where
+  // the next person looks.
+  const stillWorking = "Now let me look for actual test files:";
+  const CAP = "iteration cap of 24 reached";
+
+  it("says the answer never arrived, not that it could not be read", () => {
+    const { dropped } = parseClaims(stillWorking, question(), REV, { truncated: CAP });
+    expect(dropped[0]!.statement).toContain("no answer");
+    expect(dropped[0]!.statement).toContain(CAP);
+    expect(dropped[0]!.statement).not.toContain("unparseable");
+  });
+
+  it("still quotes what the model was saying, which is the evidence", () => {
+    const { dropped } = parseClaims(stillWorking, question(), REV, { truncated: CAP });
+    expect(dropped[0]!.statement).toContain("Now let me look for actual test");
+  });
+
+  // Without a truncation reason the old wording stands: a genuinely malformed
+  // reply on a loop that finished normally really is a parser problem.
+  it("still says unparseable when the loop finished normally", () => {
+    const { dropped } = parseClaims("some prose", question(), REV);
+    expect(dropped[0]!.statement).toContain("unparseable reply");
+  });
+
+  it("does not label a question that answered normally as truncated", () => {
+    const good =
+      '{"claims":[{"statement":"a","absence":false,"evidence":[{"path":"src/a.ts","line":1,"quote":"q"}]}]}';
+    const { claims, dropped } = parseClaims(good, question(), REV, { truncated: undefined });
+    expect(claims).toHaveLength(1);
+    expect(dropped).toHaveLength(0);
+  });
+});

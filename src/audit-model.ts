@@ -18,7 +18,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 
-import { runToolLoop, type TurnFn } from "./engine/tools/loop.js";
+import { runToolLoop, type LoopMessage, type TurnFn } from "./engine/tools/loop.js";
 import { makeRegistry, toolDefinitions, type ReviewTool } from "./engine/tools/registry.js";
 import type { InvestigateModel, InvestigateRequest, InvestigateResponse } from "./engine/audit/investigate.js";
 import type { VerifierModel, VerifyRequest, VerifierVerdict, Outcome } from "./engine/audit/verify.js";
@@ -80,6 +80,66 @@ export interface AuditModelOptions {
   log?: (message: string) => void;
 }
 
+/**
+ * Mark the end of the reusable prefix (OGE-2505).
+ *
+ * The tool loop makes up to 24 calls per question, and every one of them
+ * resends the same opening: the tool schemas, the system prompt, and a first
+ * user message carrying the question, the repository map and the analyzer
+ * facts. That opening is the bulk of the input and it never changes within a
+ * question, so today it is billed at full rate two dozen times over.
+ *
+ * ── Why the breakpoint goes HERE and nowhere else ───────────────────────────
+ *
+ * Caching matches on a PREFIX, in render order `tools -> system -> messages`.
+ * So one breakpoint at the end of the first user message covers the tools and
+ * the system prompt too — there is no need to mark them separately, and marking
+ * the system prompt ALONE would cache nothing at all: it measures ~218 tokens
+ * against tools' ~84, and the minimum cacheable prefix is about 1024. Short
+ * prefixes are not an error; they simply never cache, which is the quiet kind
+ * of failure this codebase keeps being bitten by.
+ *
+ * It also cannot go any LATER. `collapseOldObservations` rewrites earlier tool
+ * results in place as the conversation grows, so every message after the first
+ * is mutable. A breakpoint past that point would be invalidated on each
+ * iteration — every call a miss, and every call paying the write premium.
+ *
+ * ── What this costs when it does not pay ────────────────────────────────────
+ *
+ * A cache write is billed ABOVE the input rate (1.25x). A question the model
+ * answers in a single call therefore costs ~25% more than it used to and never
+ * reads the entry back. That is the deliberate trade: audit questions read
+ * files, so single-call questions are the rare case, and the loop's other two
+ * dozen calls each drop from full rate to a tenth of it.
+ *
+ * Returns a NEW array. The loop owns `messages` and mutates it; writing a
+ * cache_control block back into it would leave the marker attached to a
+ * conversation the loop is still editing.
+ */
+export function withCachedPrefix(messages: LoopMessage[]): Anthropic.MessageParam[] {
+  const [first, ...rest] = messages;
+  // Defensive: the loop always opens with a plain string prompt, but a shape we
+  // do not recognise is passed through unmarked rather than reshaped. An
+  // unmarked request is merely uncached; a malformed one is a failed audit.
+  if (!first || typeof first.content !== "string") {
+    return messages as Anthropic.MessageParam[];
+  }
+
+  return [
+    {
+      role: first.role,
+      content: [
+        {
+          type: "text",
+          text: first.content,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+    },
+    ...rest,
+  ] as Anthropic.MessageParam[];
+}
+
 async function runOnce(options: AuditModelOptions, systemPrompt: string, userPrompt: string) {
   const registry = makeRegistry([options.readTool]);
   const tools = toolDefinitions(registry);
@@ -93,7 +153,7 @@ async function runOnce(options: AuditModelOptions, systemPrompt: string, userPro
       // up there as findings that came and went.
       temperature: 0,
       system: systemPrompt,
-      messages: messages as Anthropic.MessageParam[],
+      messages: withCachedPrefix(messages),
       ...(tools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
     });
     // Before anything can throw on the response shape: an unmeasured call is

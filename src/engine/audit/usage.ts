@@ -130,9 +130,11 @@ export interface RateCard {
  * Note on cache writes — Anthropic prices a 5-minute write and a 1-hour write
  * differently ($3.75 and $6.00 for this model). The API's
  * `cache_creation_input_tokens` does not say which TTL applied, so this uses
- * the 5-minute rate, which is the default TTL. A run that opted into 1-hour
- * caching would be UNDER-counted here — recorded in this comment because the
- * engine sets no `cache_control` today and the field is expected to be zero.
+ * the 5-minute rate. That is correct rather than merely a default: the engine
+ * marks exactly one breakpoint, in `withCachedPrefix`, and it asks for
+ * `ephemeral` — the 5-minute TTL. If a 1-hour breakpoint is ever added, this
+ * card starts UNDER-counting silently, because the response cannot tell the
+ * two apart. Change the rate in the same commit that changes the TTL.
  */
 export const DEFAULT_RATE_CARD: RateCard = {
   source: "platform.claude.com/docs/en/models/sonnet-4-5/overview",
@@ -279,10 +281,15 @@ export function buildUsageReport(meter: UsageMeter, model: string, card: RateCar
 /**
  * The operator-facing summary.
  *
- * Cache reads are shown beside uncached input rather than folded into one
- * figure, because they are priced an order of magnitude apart — two runs doing
+ * The three kinds of input are shown apart rather than folded into one figure,
+ * because they are priced an order of magnitude apart — two runs doing
  * identical work can differ several-fold on cost depending only on cache hits,
  * and a single "input" number hides the one lever worth pulling.
+ *
+ * Writes are shown next to reads on purpose. A write is billed ABOVE the input
+ * rate, so caching only pays once reads outnumber it; a stage showing writes
+ * and no reads is a breakpoint on a prefix that keeps changing, which costs
+ * more than not caching at all. Folded together the two are indistinguishable.
  */
 export function renderUsage(report: UsageReport, loc?: number): string[] {
   const n = (value: number): string => value.toLocaleString();
@@ -291,7 +298,8 @@ export function renderUsage(report: UsageReport, loc?: number): string[] {
   for (const [stage, usage] of Object.entries(report.byStage)) {
     lines.push(
       `    ${stage.padEnd(12)} ${n(usage.calls).padStart(4)} call(s)  ` +
-        `in ${n(usage.uncachedInput)} · cached ${n(usage.cacheRead)} · out ${n(usage.output)}`,
+        `in ${n(usage.uncachedInput)} · cache w${n(usage.cacheWrite)}/r${n(usage.cacheRead)} · ` +
+        `out ${n(usage.output)}`,
     );
   }
 

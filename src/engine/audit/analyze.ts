@@ -18,7 +18,9 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -49,8 +51,21 @@ export interface AnalyzerSpec {
    * ours; the flags below exist to stop the tool picking up the target's own
    * configuration behind our back.
    */
-  args(root: string): string[];
+  args(root: string, reportPath: string): string[];
   adapter: Adapter;
+  /**
+   * The tool writes its report to a FILE we name, rather than to stdout.
+   *
+   * gitleaks needs this. It pre-checks that `--report-path` is writable by
+   * opening it, and `/dev/stdout` fails that check with EACCES whenever stdout
+   * is a pipe — which it always is under a spawn. The failure is total: the
+   * scan never starts, and the only signal is a banner on stderr.
+   *
+   * Worth stating plainly because the old form appeared to work: a run on a
+   * developer's terminal, where stdout is a tty, opens /dev/stdout happily. It
+   * broke only where it mattered, on the box, where every run is piped.
+   */
+  usesReportFile?: boolean;
   reach: AnalyzerReach;
   /** A precondition that is not the tool's fault — a missing lockfile, say. */
   precondition?(root: string): string | null;
@@ -83,14 +98,15 @@ export const SEMGREP: AnalyzerSpec = {
 export const SECRET_SCAN: AnalyzerSpec = {
   job: "secret-scan",
   command: "gitleaks",
-  args: (root) => [
+  usesReportFile: true,
+  args: (root, reportPath) => [
     "detect",
     "--source",
     root,
     "--report-format",
     "json",
     "--report-path",
-    "/dev/stdout",
+    reportPath,
     // The tree may have no history at all (an archive), and a .gitleaksignore
     // inside it must not be allowed to silence the scan.
     "--no-git",
@@ -152,9 +168,17 @@ export async function runAnalyzer(spec: AnalyzerSpec, root: string): Promise<Job
     return skipped(spec.job, `${spec.command} is not installed on this machine`);
   }
 
+  // A report file for the tools that cannot write to stdout. Ours, in the OS
+  // temp dir rather than in the tree, so nothing we create is ever mistaken for
+  // part of the subject and no write lands inside a client's checkout.
+  const reportDir = spec.usesReportFile
+    ? await mkdtemp(join(tmpdir(), `audit-${spec.job}-`))
+    : null;
+  const reportPath = reportDir ? join(reportDir, "report.json") : "";
+
   let stdout: string;
   try {
-    const result = await run(spec.command, spec.args(root), {
+    const result = await run(spec.command, spec.args(root, reportPath), {
       timeout: ANALYZER_TIMEOUT_MS,
       maxBuffer: MAX_OUTPUT_BYTES,
     });
@@ -171,6 +195,17 @@ export async function runAnalyzer(spec: AnalyzerSpec, root: string): Promise<Job
       const stderr = (error as { stderr?: unknown }).stderr;
       const detail = typeof stderr === "string" && stderr.trim() !== "" ? stderr.trim().split("\n")[0] : "no output";
       return skipped(spec.job, `${spec.command} failed to run: ${detail}`);
+    }
+  }
+
+  if (reportDir) {
+    try {
+      // An absent report after a clean exit means the tool found nothing and
+      // wrote nothing, which several versions of gitleaks do. That is an empty
+      // result, not a failure.
+      stdout = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "[]";
+    } finally {
+      rmSync(reportDir, { recursive: true, force: true });
     }
   }
 

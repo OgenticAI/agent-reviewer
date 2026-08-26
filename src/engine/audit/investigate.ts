@@ -472,6 +472,61 @@ export async function investigate(
   return Promise.all(runs);
 }
 
+/**
+ * Raised when the model could not be reached at all, so no question ran.
+ *
+ * Distinct from "the investigation found nothing", which is a legitimate and
+ * reportable outcome. This one means the run never happened.
+ */
+export class ModelUnusableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ModelUnusableError";
+  }
+}
+
+/**
+ * Ten failures with one cause are one fact, not ten.
+ *
+ * Measured on the box: an invalid API key produced ten identical
+ * `401 authentication_error` lines, the stage completed, and the operator was
+ * left to infer from a wall of repetition that the credential was the problem.
+ * The worker then retried the whole audit twice more — re-cloning and
+ * re-analysing a repository — for a key that could not become valid.
+ *
+ * A question that fails for its own reasons is still dropped and still counted;
+ * that is the honest denominator this file exists to keep. But when EVERY
+ * question failed and none produced a claim, the investigation did not happen,
+ * and saying so once is worth more than saying nothing ten times.
+ */
+export function modelUnusableFrom(results: QuestionRunResult[]): string | null {
+  if (results.length === 0) return null;
+
+  const failures = results.filter(
+    (result) =>
+      result.claims.length === 0 &&
+      result.dropped.length > 0 &&
+      result.dropped.every((drop) => drop.statement.startsWith("(run failed:")),
+  );
+  if (failures.length !== results.length) return null;
+
+  // The shared detail, if there is one. Different errors across every question
+  // is a different problem and should not be described as a single cause.
+  const details = new Set(
+    failures.flatMap((result) => result.dropped.map((drop) => drop.statement)),
+  );
+  const shared = details.size === 1 ? [...details][0] ?? "" : "";
+  const detail = shared.replace(/^\(run failed: /, "").replace(/\)$/, "");
+
+  return (
+    `every one of the ${results.length} questions failed and none produced a claim, ` +
+    `so no investigation took place. ` +
+    (detail
+      ? `They all failed the same way: ${detail}`
+      : `They failed in different ways; the run log has each one.`)
+  );
+}
+
 /** Totals for the run record and the report's method section. */
 export function summariseInvestigation(results: QuestionRunResult[]): {
   questions: number;

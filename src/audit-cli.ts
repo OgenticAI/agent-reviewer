@@ -47,6 +47,7 @@ import type { AuditFinding } from "./engine/audit/finding.js";
 import type { JobFindings } from "./engine/findings/schema.js";
 import {
   investigate,
+  modelUnusableFrom,
   summariseInvestigation,
   type Claim,
 } from "./engine/audit/investigate.js";
@@ -583,6 +584,13 @@ async function investigateRun(ctx: {
         reportUsage();
       },
     });
+    // One cause reported once, rather than ten identical failures and a stage
+    // that claims to have finished. This throws BEFORE stageFinished so the
+    // stage is recorded as failed, and the message reaches stderr where the
+    // worker can see it and stop retrying something that cannot succeed.
+    const unusable = modelUnusableFrom(runs);
+    if (unusable) throw new CliError(`investigate: ${unusable}`);
+
     telemetry.stageFinished("investigate", {
       questions: runs.length,
       claims: runs.reduce((n, r) => n + r.claims.length, 0),

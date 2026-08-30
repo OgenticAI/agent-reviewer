@@ -160,6 +160,39 @@ async function isInstalled(command: string): Promise<boolean> {
  * reader can act on, because an audit that fell over silently is worse than one
  * that says which tool it could not run.
  */
+/**
+ * The line of a tool's stderr actually worth showing.
+ *
+ * Taking the FIRST line is right for a tool that prints one error and wrong for
+ * anything that raises. A Python traceback opens with
+ * "Traceback (most recent call last):" — so semgrep failing on the box reported
+ * exactly that, three times, and said nothing whatsoever about why:
+ *
+ *   analyze  semgrep did not run — semgrep failed to run: Traceback (most recent call last):
+ *
+ * The real cause was on the LAST line, five frames down:
+ * `PermissionError: [Errno 13] Permission denied: '.../.semgrep'`.
+ *
+ * So: for a traceback, the last non-empty line, which is the exception. For
+ * anything else the first, which is still the summary. Both are truncated,
+ * because this ends up on one row of a dashboard.
+ */
+export const MAX_DETAIL_CHARS = 300;
+
+export function describeToolFailure(stderr: unknown): string {
+  if (typeof stderr !== "string" || stderr.trim() === "") return "no output";
+  const lines = stderr
+    .trim()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length === 0) return "no output";
+
+  const isTraceback = /^Traceback \(most recent call last\)/.test(lines[0] ?? "");
+  const chosen = isTraceback ? (lines[lines.length - 1] as string) : (lines[0] as string);
+  return chosen.length <= MAX_DETAIL_CHARS ? chosen : `${chosen.slice(0, MAX_DETAIL_CHARS - 1)}\u2026`;
+}
+
 export async function runAnalyzer(spec: AnalyzerSpec, root: string): Promise<JobFindings> {
   const blocked = spec.precondition?.(root);
   if (blocked) return skipped(spec.job, blocked);
@@ -193,7 +226,7 @@ export async function runAnalyzer(spec: AnalyzerSpec, root: string): Promise<Job
       stdout = partial;
     } else {
       const stderr = (error as { stderr?: unknown }).stderr;
-      const detail = typeof stderr === "string" && stderr.trim() !== "" ? stderr.trim().split("\n")[0] : "no output";
+      const detail = describeToolFailure(stderr);
       return skipped(spec.job, `${spec.command} failed to run: ${detail}`);
     }
   }

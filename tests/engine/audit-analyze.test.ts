@@ -11,6 +11,8 @@ import {
   GITLEAKS_VALUE_FIELDS,
 } from "../../src/engine/audit/analyzers.js";
 import {
+  describeToolFailure,
+  MAX_DETAIL_CHARS,
   runAnalyzer,
   runAnalyzers,
   analyzerLanguageCoverage,
@@ -438,5 +440,51 @@ describe("analyzers that write their report to a file", () => {
       "utf8",
     );
     expect(src).toMatch(/existsSync\(reportPath\) \? readFileSync\(reportPath, "utf8"\) : "\[\]"/);
+  });
+});
+
+/* ── The line of stderr worth showing ─────────────────────────────────────── */
+
+describe("what a failed tool is reported as", () => {
+  // Measured on the box: semgrep crashed three times and every report read
+  // "semgrep failed to run: Traceback (most recent call last):" — the first
+  // line of a Python traceback, which is the one line guaranteed to carry no
+  // information. The cause was five frames below it.
+  it("reports the exception from a traceback, not its header", () => {
+    const stderr = [
+      "Traceback (most recent call last):",
+      '  File "semgrep/cli.py", line 12, in main',
+      "    self.configure()",
+      '  File "semgrep/terminal.py", line 91, in configure',
+      "    env.user_log_file.parent.mkdir(parents=True, exist_ok=True)",
+      "PermissionError: [Errno 13] Permission denied: '/home/x/.semgrep'",
+    ].join("\n");
+
+    const detail = describeToolFailure(stderr);
+    expect(detail).toMatch(/PermissionError/);
+    expect(detail).toMatch(/Permission denied/);
+    expect(detail).not.toMatch(/Traceback/);
+  });
+
+  // Taking the last line is only right for a traceback. A tool that prints one
+  // error and then some noise should still report the error.
+  it("reports the first line for anything that is not a traceback", () => {
+    const stderr = "fatal: repository not found\nsome trailing noise";
+    expect(describeToolFailure(stderr)).toBe("fatal: repository not found");
+  });
+
+  it("ignores blank lines at either end", () => {
+    expect(describeToolFailure("\n\n  fatal: nope  \n\n")).toBe("fatal: nope");
+  });
+
+  it.each([undefined, null, "", "   \n  "])("says so when there is no output: %s", (stderr) => {
+    expect(describeToolFailure(stderr)).toBe("no output");
+  });
+
+  // This ends up on one row of a dashboard.
+  it("truncates a very long line rather than filling the page", () => {
+    const detail = describeToolFailure(`Traceback (most recent call last):\nValueError: ${"x".repeat(2000)}`);
+    expect(detail.length).toBeLessThanOrEqual(MAX_DETAIL_CHARS);
+    expect(detail.endsWith("\u2026")).toBe(true);
   });
 });

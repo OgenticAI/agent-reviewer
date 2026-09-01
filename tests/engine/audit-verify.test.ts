@@ -28,6 +28,26 @@ function claim(over: Partial<Claim> = {}): Claim {
   };
 }
 
+/**
+ * A file whose lines 40-46 are ordinary TypeScript: an object literal spanning
+ * four lines, and a function signature whose body is on the next line. Both are
+ * the shapes the single-line gate could not match (OGE-2514).
+ */
+const blockTree: LineReader = (path, line) => {
+  if (path !== "src/startup.ts") return null;
+  const lines: Record<number, string> = {
+    1: 'import { Pool } from "pg";',
+    40: "const options = {",
+    41: '  connectionString: config.get("DB_URL"),',
+    42: "  poolSize: 10,",
+    43: "};",
+    44: "",
+    45: "export function createPool(options: PoolOptions): Pool {",
+    46: "  return new Pool(options);",
+  };
+  return lines[line] ?? null;
+};
+
 /** A tree where line 42 of startup.ts says what the claim says it says. */
 const honestTree: LineReader = (path, line) =>
   path === "src/startup.ts" && line === 42
@@ -103,6 +123,84 @@ describe("the citation check, which needs no model", () => {
   it("does not check a reference that quotes nothing", () => {
     const pointer = claim({ evidence: [{ path: "src/anything.ts", rev: REV, line: 9 }] });
     expect(checkAnchors(pointer, honestTree)).toEqual([]);
+  });
+
+  /* ── The window, and why it is not a loosening (OGE-2514) ──────────────── */
+
+  // A line number one out was fatal 99.1% of the time. It is an arithmetic
+  // slip, not a fabrication, and the quoted text is right there.
+  it("finds a quote one line from where the claim put it, and moves the citation to it", () => {
+    const offByOne = claim({
+      evidence: [{ path: "src/startup.ts", rev: REV, line: 43, quote: "poolSize: 10" }],
+    });
+    expect(checkAnchors(offByOne, blockTree)).toEqual([]);
+    expect(offByOne.evidence[0]?.line).toBe(42);
+  });
+
+  // A two-line construct at its own correct line passed only 32.7% of the time,
+  // because no single line can hold 80% of a quote spread across two.
+  // The quote must be one no single line can satisfy on its own: the object
+  // literal's opening carries 2 of its 7 words and the next line 5, so only the
+  // two read together reach the threshold. A quote whose words happen to repeat
+  // on one line would pass without the join and prove nothing.
+  it("matches a quote spanning two lines, and cites the line it starts on", () => {
+    const spanning = claim({
+      evidence: [
+        {
+          path: "src/startup.ts",
+          rev: REV,
+          line: 40,
+          quote: 'const options = {\n  connectionString: config.get("DB_URL"),',
+        },
+      ],
+    });
+    expect(checkAnchors(spanning, blockTree)).toEqual([]);
+    expect(spanning.evidence[0]?.line).toBe(40);
+  });
+
+  // The property the gate exists for. If this ever passes, the window has
+  // stopped being a fix and become a hole.
+  it("still rejects a fabricated quote, absent from every line of the window", () => {
+    const fabricated = claim({
+      evidence: [
+        {
+          path: "src/startup.ts",
+          rev: REV,
+          line: 42,
+          quote: "await stripe.charges.create(payload)",
+        },
+      ],
+    });
+    expect(checkAnchors(fabricated, blockTree)[0]?.reason).toBe("quote-not-at-line");
+  });
+
+  // Widening the search must not drag a citation off a line that was already
+  // right, or the report starts pointing somewhere the model never meant.
+  it("leaves a citation alone when the quote is at the line it claims", () => {
+    const exact = claim({
+      evidence: [{ path: "src/startup.ts", rev: REV, line: 42, quote: "poolSize: 10" }],
+    });
+    expect(checkAnchors(exact, blockTree)).toEqual([]);
+    expect(exact.evidence[0]?.line).toBe(42);
+  });
+
+  // `packages/web/__tests__:0` was reported as an unreadable file. The path is
+  // real; it is simply not a line, and an operator sent after a reading failure
+  // is looking for a bug that does not exist.
+  it("treats a directory or a :0 reference as its own case, not an unreadable file", () => {
+    const directory = claim({
+      evidence: [{ path: "packages/web/__tests__", rev: REV, line: 0, quote: "test files" }],
+    });
+    expect(checkAnchors(directory, blockTree)[0]?.reason).toBe("not-a-line-reference");
+  });
+
+  // A line past the end of a file that reads perfectly well is a wrong
+  // citation, not a missing file.
+  it("calls a line beyond the end of a readable file a wrong citation", () => {
+    const past = claim({
+      evidence: [{ path: "src/startup.ts", rev: REV, line: 900, quote: "poolSize: 10" }],
+    });
+    expect(checkAnchors(past, blockTree)[0]?.reason).toBe("quote-not-at-line");
   });
 });
 

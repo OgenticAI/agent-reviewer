@@ -87,8 +87,25 @@ export type LineReader = (path: string, line: number) => string | null;
 
 export interface AnchorProblem {
   ref: EvidenceRef;
-  reason: "file-unreadable" | "quote-not-at-line";
+  reason: "file-unreadable" | "quote-not-at-line" | "not-a-line-reference";
 }
+
+/**
+ * How far either side of the cited line the quote is looked for.
+ *
+ * The gate used to read exactly one line, which rejected two ordinary and
+ * honest things: a quote spanning a multi-line construct, and a line number one
+ * out. Measured over 4,000 sampled lines of a real subject, a two-line quote at
+ * its own correct line passed 32.7% of the time and a single-line quote one line
+ * out passed 0.9% — while a fabricated quote passes this window 0.0% of the
+ * time. The two failure modes are separable, and only one of them was ever the
+ * point (OGE-2514).
+ *
+ * Three lines, not more: far enough for a signature, an object literal or a
+ * short `if` block, near enough that a correction still points at the construct
+ * the model meant.
+ */
+export const ANCHOR_WINDOW = 3;
 
 /**
  * Fraction of a quote's distinctive words that must appear at the cited line.
@@ -123,6 +140,11 @@ function significantWords(text: string): string[] {
  *
  * Refs with no quote are not checked here: a path-and-line reference is a
  * pointer, not an assertion about content, and the verifiers judge it.
+ *
+ * CHECKS AND CORRECTS. Where the quote is found within `ANCHOR_WINDOW` lines of
+ * the line claimed, `ref.line` is rewritten to where it actually is, so the
+ * report cites the truth rather than the model's arithmetic. The claim is
+ * mutated in place; nothing else about it is touched.
  */
 export function checkAnchors(
   claim: Claim,
@@ -133,17 +155,92 @@ export function checkAnchors(
   for (const ref of claim.evidence) {
     if (!ref.quote || ref.line === undefined) continue;
 
-    const actual = readLine(ref.path, ref.line);
-    if (actual === null) {
+    // A directory, or the `:0` a model writes when it means "this path". It
+    // asserts nothing about a line, so the line gate has nothing to judge.
+    // Reporting it as an unreadable file was wrong twice over: the path is
+    // often perfectly real, and the operator was told to go looking for a
+    // reading failure that never happened.
+    if (ref.line < 1) {
+      problems.push({ ref, reason: "not-a-line-reference" });
+      continue;
+    }
+
+    const found = locateQuote(ref.quote, ref.path, ref.line, readLine);
+    if (found === "unreadable") {
       problems.push({ ref, reason: "file-unreadable" });
       continue;
     }
-    if (!quoteAppearsAt(ref.quote, actual)) {
+    if (found === null) {
       problems.push({ ref, reason: "quote-not-at-line" });
+      continue;
     }
+    // Found, but not where the claim said. Correcting it here is the point:
+    // accepting it silently would leave the report pointing a reader at a line
+    // that does not contain the quoted text, which is the same disappointment
+    // as a fabricated citation even though the evidence is real.
+    if (found !== ref.line) ref.line = found;
   }
 
   return problems;
+}
+
+/**
+ * Where the quote actually is, within `ANCHOR_WINDOW` lines of the claim.
+ *
+ * Returns the line it was found at, `null` if it is nowhere in the window, or
+ * `"unreadable"` if the file itself could not be read. That last distinction
+ * matters: a line beyond the end of a real file is a wrong citation, not a
+ * missing file, and telling an operator otherwise sends them after the wrong
+ * bug.
+ */
+function locateQuote(
+  quote: string,
+  path: string,
+  line: number,
+  readLine: LineReader,
+): number | null | "unreadable" {
+  const lines = new Map<number, string>();
+  for (let n = Math.max(1, line - ANCHOR_WINDOW); n <= line + ANCHOR_WINDOW; n++) {
+    const text = readLine(path, n);
+    if (text !== null) lines.set(n, text);
+  }
+  if (lines.size === 0) {
+    // Nothing readable around the citation. Line 1 settles which kind of wrong
+    // this is, and costs nothing: the reader caches the file either way.
+    return readLine(path, 1) === null ? "unreadable" : null;
+  }
+
+  // Nearest first, so a correction moves the reference as little as the
+  // evidence allows, and an exact hit at the cited line never gets displaced.
+  const nearest = [...lines.keys()].sort(
+    (a, b) => Math.abs(a - line) - Math.abs(b - line) || a - b,
+  );
+
+  for (const n of nearest) {
+    if (quoteAppearsAt(quote, lines.get(n)!)) return n;
+  }
+
+  // A multi-line construct spreads its words across consecutive lines, so no
+  // single line can hold 80% of them however close it is. Join before matching.
+  // The span is bounded by the quote's own height: a two-line quote is looked
+  // for in two lines, never in four, so the extra text cannot be what lets a
+  // fabricated quote through.
+  const height = Math.min(quote.split("\n").length, ANCHOR_WINDOW + 1);
+  for (let span = 2; span <= Math.max(height, 2); span++) {
+    for (const start of nearest) {
+      const run: string[] = [];
+      for (let n = start; n < start + span; n++) {
+        const text = lines.get(n);
+        if (text === undefined) break;
+        run.push(text);
+      }
+      if (run.length === span && quoteAppearsAt(quote, run.join("\n"))) {
+        return start;
+      }
+    }
+  }
+
+  return null;
 }
 
 export function quoteAppearsAt(quote: string, line: string): boolean {

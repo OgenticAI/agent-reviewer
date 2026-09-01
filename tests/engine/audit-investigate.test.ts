@@ -18,6 +18,7 @@ import {
   type InvestigateModel,
   replyExcerpt,
   REPLY_EXCERPT_CHARS,
+  modelUnusableFrom,
 } from "../../src/engine/audit/investigate.js";
 import type { JobFindings } from "../../src/engine/findings/schema.js";
 
@@ -534,5 +535,71 @@ describe("when the tool loop ran out of budget before the model answered", () =>
     const { claims, dropped } = parseClaims(good, question(), REV, { truncated: undefined });
     expect(claims).toHaveLength(1);
     expect(dropped).toHaveLength(0);
+  });
+});
+
+/* ── Ten failures with one cause are one fact ─────────────────────────────── */
+
+describe("a model that could not be reached at all", () => {
+  const failed = (id: string, detail: string) => ({
+    questionId: id,
+    claims: [],
+    dropped: [{ questionId: id, statement: `(run failed: ${detail})`, reason: "unreadable" as const }],
+    openedFiles: [],
+  });
+  const answered = (id: string) => ({
+    questionId: id,
+    claims: [{ questionId: id, statement: "something", evidence: [] }] as never[],
+    dropped: [],
+    openedFiles: ["src/a.ts"],
+  });
+
+  const AUTH = '401 {"type":"error","error":{"type":"authentication_error","message":"API key is invalid."}}';
+
+  // Measured on the box: an invalid key produced ten identical 401 lines, the
+  // stage completed, and the worker then re-cloned and re-analysed the whole
+  // repository twice more for a key that could not become valid.
+  it("is reported once, naming the shared cause", () => {
+    const message = modelUnusableFrom([failed("a", AUTH), failed("b", AUTH), failed("c", AUTH)]);
+    expect(message).toMatch(/every one of the 3 questions failed/);
+    expect(message).toMatch(/no investigation took place/);
+    expect(message).toMatch(/authentication_error/);
+  });
+
+  // The honest denominator this file exists to keep: one question failing for
+  // its own reasons is still just a dropped question, not a dead run.
+  it("is not raised when any question produced a claim", () => {
+    expect(modelUnusableFrom([failed("a", AUTH), answered("b")])).toBeNull();
+  });
+
+  it("is not raised when a question failed for its own reason among successes", () => {
+    expect(modelUnusableFrom([answered("a"), answered("b"), failed("c", AUTH)])).toBeNull();
+  });
+
+  // Different errors everywhere is a different problem, and describing it as
+  // one shared cause would be a guess.
+  it("does not invent a shared cause when the failures differ", () => {
+    const message = modelUnusableFrom([
+      failed("a", AUTH),
+      failed("b", "socket hang up"),
+    ]);
+    expect(message).toMatch(/failed in different ways/);
+    expect(message).not.toMatch(/authentication_error/);
+  });
+
+  it("says nothing about an empty run", () => {
+    expect(modelUnusableFrom([])).toBeNull();
+  });
+
+  // A question dropped for a genuine reason — a claim carrying no evidence — is
+  // not a failed run and must not be swept up.
+  it("ignores questions dropped for ordinary reasons", () => {
+    const unevidenced = {
+      questionId: "a",
+      claims: [],
+      dropped: [{ questionId: "a", statement: "a claim with no evidence", reason: "no-evidence" as const }],
+      openedFiles: ["src/a.ts"],
+    };
+    expect(modelUnusableFrom([unevidenced])).toBeNull();
   });
 });

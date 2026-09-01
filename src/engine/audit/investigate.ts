@@ -473,19 +473,6 @@ export async function investigate(
 }
 
 /**
- * Raised when the model could not be reached at all, so no question ran.
- *
- * Distinct from "the investigation found nothing", which is a legitimate and
- * reportable outcome. This one means the run never happened.
- */
-export class ModelUnusableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ModelUnusableError";
-  }
-}
-
-/**
  * Ten failures with one cause are one fact, not ten.
  *
  * Measured on the box: an invalid API key produced ten identical

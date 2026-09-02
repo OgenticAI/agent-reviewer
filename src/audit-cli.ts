@@ -11,8 +11,12 @@
  *   acquire → inventory → map → analyze → investigate → verify → closure → render
  */
 
+import { execFile } from "node:child_process";
 import { writeFileSync, readFileSync, statSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
 
 import {
   acquire,
@@ -61,6 +65,7 @@ import {
   verifyClaims,
   summariseVerification,
   type LineReader,
+  type PathKind,
 } from "./engine/audit/verify.js";
 import {
   toAuditFindings,
@@ -101,7 +106,7 @@ import { maskSecrets } from "./engine/tools/sanitize.js";
 
 const USAGE = `audit — codebase audit
 
-  audit acquire   --from <source> --into <dir> [--replace]
+  audit acquire   --from <source> --into <dir> [--replace] [--started-by <email>]
   audit inventory --tree <dir> [--out <dir>]
   audit analyze   --tree <dir> [--out <dir>]
   audit investigate --tree <dir> [--out <dir>] [--questions <yml>] [--verifiers <n>]
@@ -112,6 +117,9 @@ const USAGE = `audit — codebase audit
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
     --into    where the tree lands; refuses an existing directory
     --replace overwrite an existing directory instead of refusing
+    --started-by who is running this, reported once to Mission Control
+                 alongside the subject it resolves; falls back to the
+                 machine's own 'git config --global user.email', then omitted
     --tree    an acquired tree to enumerate
     --out     where inventory.json / findings land (default: beside the tree)
     --questions  a question set (default: questions/taxonomy.yml)
@@ -126,6 +134,34 @@ const USAGE = `audit — codebase audit
 function flag(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index === -1 ? undefined : args[index + 1];
+}
+
+/**
+ * Who is running this, for the subject telemetry event (OGE-2563).
+ *
+ * An explicit `--started-by` always wins. Absent that, a best-effort read of
+ * the machine's own global git identity — the same value every commit on
+ * this box already carries — rather than nothing. Never thrown on: a machine
+ * with no git identity configured, or no git at all, must not fail an audit
+ * over a byline. Never a local (per-repo) identity: `--into` is the SUBJECT
+ * being cloned, and its committers have no bearing on who is running the
+ * audit against it.
+ *
+ * `env` is injected for tests only — real callers take the default so this
+ * reads the same `~/.gitconfig` every commit on the machine already does.
+ */
+export async function resolveStartedBy(
+  explicit: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  if (explicit) return explicit;
+  try {
+    const { stdout } = await run("git", ["config", "--global", "user.email"], { env });
+    const email = stdout.trim();
+    return email.length > 0 ? email : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -215,6 +251,7 @@ async function runAcquire(args: string[]): Promise<number> {
     return 2;
   }
 
+  const startedBy = await resolveStartedBy(flag(args, "--started-by"));
   const { telemetry: acquireTelemetry } = resolveRun(dirname(resolve(into)));
   const subject = await withStage(acquireTelemetry, "acquire", () =>
     acquire({
@@ -226,6 +263,13 @@ async function runAcquire(args: string[]): Promise<number> {
         files: acquired.files,
         lines: acquired.loc,
       });
+      // Inside withStage's try, before its finally flushes — recordSubject and
+      // stageFinished go out on the same POST. `runAcquire` never flushes
+      // again itself (each subcommand is a separate process; see
+      // resolveRun's own doc comment), so a subject recorded any later than
+      // this would sit in `pending` until whichever process happens to call
+      // acquire again, which may be never for a one-shot acquire.
+      acquireTelemetry.recordSubject(acquired, startedBy);
       return acquired;
     }),
   );
@@ -617,6 +661,7 @@ async function investigateRun(ctx: {
         log: (message: string) => telemetry.log("verify", "info", message),
       }),
       readLine: lineReaderFor(tree),
+      pathKind: pathKindFor(tree),
       log: (message) => telemetry.log("verify", "info", message),
       onProgress: (done, total) => {
         telemetry.progress("verify", done, total);
@@ -742,6 +787,27 @@ function readRepoFiles(
  * line is a legitimate verdict — it is how a citation to a file that does not
  * exist gets caught.
  */
+/**
+ * What a cited path is, so the gate can tell a directory from a fabrication.
+ * Cached like the line reader: the same handful of paths are asked about
+ * repeatedly, and a stat per citation is a syscall for nothing.
+ */
+function pathKindFor(tree: string): PathKind {
+  const cache = new Map<string, "file" | "directory" | "missing">();
+  return (path: string) => {
+    let kind = cache.get(path);
+    if (kind === undefined) {
+      try {
+        kind = statSync(join(tree, path)).isDirectory() ? "directory" : "file";
+      } catch {
+        kind = "missing";
+      }
+      cache.set(path, kind);
+    }
+    return kind;
+  };
+}
+
 function lineReaderFor(tree: string): LineReader {
   const cache = new Map<string, string[] | null>();
   return (path: string, line: number): string | null => {
@@ -1038,27 +1104,35 @@ async function main(): Promise<number> {
   return 1;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((error: unknown) => {
-    // A run someone stopped is not a failure. Its own exit code, so a script
-    // wrapping this can tell "the operator stopped it" from "it broke".
-    if (error instanceof RunCancelled) {
-      process.stderr.write(`\n${error.message}\n`);
-      process.exit(130);
-    }
-    // An AcquireError is a refusal we chose — say it plainly, without a stack
-    // that makes a deliberate safety check look like a crash.
-    if (
-      error instanceof AcquireError ||
-      error instanceof RenderRefused ||
-      error instanceof CliError
-    ) {
-      process.stderr.write(`\n${error.message}\n`);
+// Only run the CLI when this file is the entry point. Without this guard,
+// `import { resolveStartedBy } from "./audit-cli.js"` — which is exactly what
+// a test importing an exported helper does — ran the whole dispatcher against
+// the test runner's own argv, printed USAGE, and called `process.exit(1)` as
+// an unhandled rejection (found writing tests for OGE-2563, the first test
+// this file ever had).
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((error: unknown) => {
+      // A run someone stopped is not a failure. Its own exit code, so a script
+      // wrapping this can tell "the operator stopped it" from "it broke".
+      if (error instanceof RunCancelled) {
+        process.stderr.write(`\n${error.message}\n`);
+        process.exit(130);
+      }
+      // An AcquireError is a refusal we chose — say it plainly, without a stack
+      // that makes a deliberate safety check look like a crash.
+      if (
+        error instanceof AcquireError ||
+        error instanceof RenderRefused ||
+        error instanceof CliError
+      ) {
+        process.stderr.write(`\n${error.message}\n`);
+        process.exit(1);
+      }
+      process.stderr.write(
+        `\n${error instanceof Error ? error.stack : String(error)}\n`,
+      );
       process.exit(1);
-    }
-    process.stderr.write(
-      `\n${error instanceof Error ? error.stack : String(error)}\n`,
-    );
-    process.exit(1);
-  });
+    });
+}

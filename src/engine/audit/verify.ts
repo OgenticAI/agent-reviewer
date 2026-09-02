@@ -85,6 +85,20 @@ export interface VerificationResult {
 /** Reads one line of a file from the acquired tree. `null` if it cannot. */
 export type LineReader = (path: string, line: number) => string | null;
 
+/**
+ * What a cited path actually is in the acquired tree.
+ *
+ * `LineReader` returns `null` for a directory and for a file that is not there,
+ * which are different mistakes: one is a model citing a real thing at the wrong
+ * granularity, the other is a fabrication. Without this the first was reported
+ * as an unreadable file and sent an operator looking for a reading failure that
+ * never happened (OGE-2514).
+ *
+ * Optional, so a caller with nothing but a line reader still works. Such a
+ * caller gets `file-unreadable` for a directory, which is what it always got.
+ */
+export type PathKind = (path: string) => "file" | "directory" | "missing";
+
 export interface AnchorProblem {
   ref: EvidenceRef;
   reason: "file-unreadable" | "quote-not-at-line" | "not-a-line-reference";
@@ -149,18 +163,26 @@ function significantWords(text: string): string[] {
 export function checkAnchors(
   claim: Claim,
   readLine: LineReader,
+  pathKind?: PathKind,
 ): AnchorProblem[] {
   const problems: AnchorProblem[] = [];
 
   for (const ref of claim.evidence) {
     if (!ref.quote || ref.line === undefined) continue;
 
-    // A directory, or the `:0` a model writes when it means "this path". It
-    // asserts nothing about a line, so the line gate has nothing to judge.
-    // Reporting it as an unreadable file was wrong twice over: the path is
-    // often perfectly real, and the operator was told to go looking for a
-    // reading failure that never happened.
+    // `:0`, which is what a model writes when it means "this path". It asserts
+    // nothing about a line, so the line gate has nothing to judge.
     if (ref.line < 1) {
+      problems.push({ ref, reason: "not-a-line-reference" });
+      continue;
+    }
+
+    // A directory cited at a real-looking line is the same mistake wearing a
+    // different number, and it is the commoner shape: 2 of the 124 citation
+    // problems in run 4df552c1 were a directory at a positive line, against 0
+    // at `:0`. Checking the path first means the number it was given does not
+    // decide which mistake it gets called.
+    if (pathKind?.(ref.path) === "directory") {
       problems.push({ ref, reason: "not-a-line-reference" });
       continue;
     }
@@ -394,6 +416,8 @@ export interface VerifyOptions {
   claims: Claim[];
   model: VerifierModel;
   readLine: LineReader;
+  /** Tells a directory from a missing file. Without it, both read as missing. */
+  pathKind?: PathKind;
   /** How many independent attempts per claim. Never below MIN_VERIFIERS. */
   verifiers?: number;
   log?: (message: string) => void;
@@ -444,7 +468,7 @@ export async function verifyClaims(
     // silently skips them stalls on any run with a bad citation.
     try {
       // Gate one, free and deterministic: does the citation exist?
-      const anchorProblems = checkAnchors(claim, options.readLine);
+      const anchorProblems = checkAnchors(claim, options.readLine, options.pathKind);
       if (anchorProblems.length > 0) {
         const detail = anchorProblems
           .map(

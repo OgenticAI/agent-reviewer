@@ -194,6 +194,36 @@ describe("the citation check, which needs no model", () => {
     expect(checkAnchors(directory, blockTree)[0]?.reason).toBe("not-a-line-reference");
   });
 
+  // The gap the first fix left. `:0` was special-cased on the line number, so a
+  // directory cited at line 23 still came back as an unreadable file. Run
+  // 4df552c1 had 2 of those and 0 of the `:0` shape.
+  it("calls a directory a directory however plausible its line number", () => {
+    const directory = claim({
+      evidence: [{ path: "packages/web/__tests__", rev: REV, line: 23, quote: "test files" }],
+    });
+    const kind = (path: string) =>
+      path === "packages/web/__tests__" ? ("directory" as const) : ("missing" as const);
+    expect(checkAnchors(directory, blockTree, kind)[0]?.reason).toBe("not-a-line-reference");
+  });
+
+  // The other half of the same call: a path that is simply not there is a
+  // fabrication, and must not be softened into the directory case.
+  it("still calls a missing file missing when a probe is available", () => {
+    const missing = claim({
+      evidence: [{ path: "src/invented.ts", rev: REV, line: 23, quote: "anything" }],
+    });
+    expect(checkAnchors(missing, blockTree, () => "missing")[0]?.reason).toBe("file-unreadable");
+  });
+
+  // The probe is optional, and a caller without one must keep working rather
+  // than crash. It gets the old answer, which is the honest trade.
+  it("falls back to the old answer when no path probe is given", () => {
+    const directory = claim({
+      evidence: [{ path: "packages/web/__tests__", rev: REV, line: 23, quote: "test files" }],
+    });
+    expect(checkAnchors(directory, blockTree)[0]?.reason).toBe("file-unreadable");
+  });
+
   // A line past the end of a file that reads perfectly well is a wrong
   // citation, not a missing file.
   it("calls a line beyond the end of a readable file a wrong citation", () => {

@@ -533,3 +533,72 @@ describe("reporting that masking altered the rendered text", () => {
     expect(statuses).toEqual(["mask-fired", "cancelled"]);
   });
 });
+
+/* ── What this run is auditing, and who started it (OGE-2563) ────────────── */
+
+describe("reporting the subject and who started the run", () => {
+  it("records origin, name, rev and startedBy as one event", () => {
+    const t = telemetry();
+    t.recordSubject(
+      { origin: "github.com/OgenticAI/agentshub", name: "agentshub", rev: REV, revProvenance: "git" },
+      "david@ogenticai.com",
+    );
+
+    expect(t.events()).toEqual([
+      {
+        kind: "subject",
+        runId: "run-1",
+        origin: "github.com/OgenticAI/agentshub",
+        name: "agentshub",
+        rev: REV,
+        revProvenance: "git",
+        startedBy: "david@ogenticai.com",
+        at: "2026-08-25T12:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("carries startedBy as null rather than inventing one", () => {
+    const t = telemetry();
+    t.recordSubject(
+      { origin: "github.com/OgenticAI/agentshub", name: "agentshub", rev: null, revProvenance: "no .git directory" },
+      null,
+    );
+
+    const event = t.events()[0];
+    expect(event).toMatchObject({ kind: "subject", startedBy: null, rev: null });
+  });
+
+  it("is not confused with a run event", () => {
+    const t = telemetry();
+    t.recordSubject(
+      { origin: "github.com/OgenticAI/agentshub", name: "agentshub", rev: REV, revProvenance: "git" },
+      "david@ogenticai.com",
+    );
+    t.recordMaskFired();
+
+    const kinds = t.events().map((e) => e.kind);
+    expect(kinds).toEqual(["subject", "run"]);
+  });
+
+  it("is delivered like any other event, including retry on a failed post", async () => {
+    let attempts = 0;
+    const sink: TelemetrySink = {
+      send: async (events) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("network blip");
+        return { collected: events } as unknown as void;
+      },
+    };
+    const t = telemetry(sink);
+    t.recordSubject(
+      { origin: "github.com/OgenticAI/agentshub", name: "agentshub", rev: REV, revProvenance: "git" },
+      "david@ogenticai.com",
+    );
+
+    await t.flush();
+    expect(attempts).toBe(1);
+    await t.flush();
+    expect(attempts).toBe(2);
+  });
+});

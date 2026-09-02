@@ -130,6 +130,34 @@ export interface RunEvent {
 }
 
 /**
+ * What this run is auditing, and who started it (OGE-2563).
+ *
+ * A separate kind rather than a third RunEvent status: RunEvent's whole point
+ * is staying closed to facts that can only be reported at their own moment (a
+ * stop confirmed, a secret that reached a report). A subject is neither — it
+ * is known once, right after `acquire` resolves it, and never changes for the
+ * run, so it is reported exactly once and the dashboard treats it as a fact
+ * to record rather than a state to transition through.
+ *
+ * `startedBy` is best-effort and may be null: as of this change the CLI reads
+ * `--started-by`, then falls back to `git config user.email`, then gives up —
+ * never invents one. A dashboard-queued run already has a real, session-
+ * authenticated email for this from a more trustworthy source, so the
+ * receiving side must not let a null (or a guessed identity) here overwrite
+ * that.
+ */
+export interface SubjectEvent {
+  kind: "subject";
+  runId: string;
+  origin: string;
+  name: string;
+  rev: string | null;
+  revProvenance: string;
+  startedBy: string | null;
+  at: string;
+}
+
+/**
  * What the run cost (OGE-2502).
  *
  * Carries the rate card it was priced with, so the figure the dashboard shows
@@ -149,7 +177,8 @@ export type AuditEvent =
   | LogEvent
   | FindingEvent
   | UsageEvent
-  | RunEvent;
+  | RunEvent
+  | SubjectEvent;
 
 /**
  * Where events go. Implemented by the HTTP poster outside the engine, and by a
@@ -434,6 +463,29 @@ export class AuditTelemetry {
       kind: "run",
       runId: this.runId,
       status: "cancelled",
+      at: this.at(),
+    });
+  }
+
+  /**
+   * What this run is auditing, and who started it — call once, right after
+   * `acquire` resolves the subject (OGE-2563). Everything after this point
+   * cites path@rev against the same subject, so there is nothing to update
+   * later; a second call would just be a duplicate the dashboard has to
+   * de-dupe, so callers should not need one.
+   */
+  recordSubject(
+    subject: { origin: string; name: string; rev: string | null; revProvenance: string },
+    startedBy: string | null,
+  ): void {
+    this.record({
+      kind: "subject",
+      runId: this.runId,
+      origin: subject.origin,
+      name: subject.name,
+      rev: subject.rev,
+      revProvenance: subject.revProvenance,
+      startedBy,
       at: this.at(),
     });
   }

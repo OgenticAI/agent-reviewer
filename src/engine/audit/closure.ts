@@ -332,6 +332,34 @@ export function renderAsk(ask: ConsolidatedAsk): string[] {
  * report. `checkClosurePresent` in `finding.ts` catches one that is malformed;
  * this catches one that was never drafted, before the renderer is even called.
  */
+/**
+ * Publish the findings, then apply the gate.
+ *
+ * The order is the whole point, and it exists because the other order shipped.
+ * `assertAllClosuresResolved` throws, and nothing after a throw runs — so a
+ * single not-determinable finding with no closure path discarded EVERY finding
+ * in the run. An agent-knowledge audit finished investigate 9/9, verified 83 of
+ * 84 claims over 67 minutes, and persisted nothing, because the 84th had no
+ * closure path.
+ *
+ * The gate still fails the run, which is right: a bare "not determinable" hands
+ * the risk back to the client, and that is the one thing this stage exists to
+ * prevent. What changes is that refusing to CERTIFY the audit no longer means
+ * destroying its evidence. A failed run's findings are already treated as
+ * partial downstream and its report is never released, so the work survives
+ * without anything being passed off as complete.
+ *
+ * Taking `emit` rather than the telemetry object keeps this a pure ordering
+ * rule with no transport in it — which is what makes it testable.
+ */
+export function settleClosure(
+  result: ClosureResult,
+  emit: (finding: AuditFinding) => void,
+): void {
+  for (const finding of result.findings) emit(finding);
+  assertAllClosuresResolved(result);
+}
+
 export function assertAllClosuresResolved(result: ClosureResult): void {
   if (result.unresolved.length === 0) return;
 

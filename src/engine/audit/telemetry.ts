@@ -500,6 +500,47 @@ export class AuditTelemetry {
     return this.all;
   }
 
+  /**
+   * Flush, and keep trying while anything is still pending.
+   *
+   * `flush` retains what it could not deliver so the NEXT flush carries it,
+   * which is right while a process is still running and will flush again. At
+   * the end of a subcommand there is no next flush: the process exits and
+   * whatever is pending dies with it.
+   *
+   * That is not hypothetical on the box this runs on, whose outbound network
+   * stops for one to three minutes several times a day. Run 45dcd536 completed
+   * a full audit -- 1,245 model calls, a 182KB report -- and Mission Control
+   * recorded zero findings, because the flush carrying closure and every
+   * finding happened to land inside one of those windows. The report was fine.
+   * The record of it was empty.
+   *
+   * So the backoff is sized against the fault: twelve attempts spanning about
+   * three minutes, which covers the far end of the range actually observed.
+   * The per-sleep cap matters as much as the count -- uncapped doubling reaches
+   * three minutes in a single final sleep, which spends the whole budget on one
+   * throw of the dice instead of sampling a recovering network repeatedly.
+   *
+   * This only ever delays an exit when delivery is already failing. Losing three
+   * minutes at the end of a twenty-four minute run to keep its findings is a
+   * trade worth making every time.
+   */
+  async drain(
+    attempts = 12,
+    baseMs = 500,
+    maxDelayMs = 30_000,
+  ): Promise<{ events: number; failedFlushes: number }> {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      await this.flush();
+      if (this.pending.length === 0) break;
+      if (attempt < attempts) {
+        const delay = Math.min(baseMs * 2 ** (attempt - 1), maxDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    return this.outstanding();
+  }
+
   /** What flush could not deliver, for the operator's end-of-run summary. */
   outstanding(): { events: number; failedFlushes: number } {
     return { events: this.pending.length, failedFlushes: this.undelivered };

@@ -602,3 +602,98 @@ describe("reporting the subject and who started the run", () => {
     expect(attempts).toBe(2);
   });
 });
+
+/**
+ * drain — the last flush a process ever gets.
+ *
+ * `flush` retains what it could not deliver so the NEXT flush carries it. At the
+ * end of a subcommand there is no next flush: the process exits and whatever is
+ * pending dies with it.
+ *
+ * Run 45dcd536 completed a full audit — 1,245 model calls, a 182KB report — and
+ * Mission Control recorded ZERO findings, because the flush carrying closure and
+ * every finding landed inside one of the box's outbound stalls. The report was
+ * fine; the record of it was empty.
+ */
+describe("drain is the last chance, so it keeps trying", () => {
+  it("recovers events when delivery comes back mid-backoff", async () => {
+    const delivered: AuditEvent[] = [];
+    let attempts = 0;
+    const flaky: TelemetrySink = {
+      async send(events) {
+        attempts += 1;
+        // Down for the first two attempts, as a short outage would be.
+        if (attempts <= 2) throw new Error("down");
+        delivered.push(...events);
+      },
+    };
+
+    const t = telemetry(flaky);
+    t.stageStarted("closure");
+    t.progress("closure", 1, 1);
+
+    // Tiny backoff so the test does not sleep for two minutes.
+    const outstanding = await t.drain(5, 1);
+
+    expect(attempts).toBe(3);
+    expect(delivered).toHaveLength(2);
+    expect(outstanding.events).toBe(0);
+  });
+
+  it("gives up after its attempts and reports what was lost", async () => {
+    const dead: TelemetrySink = {
+      async send() {
+        throw new Error("down");
+      },
+    };
+
+    const t = telemetry(dead);
+    t.stageStarted("closure");
+
+    const outstanding = await t.drain(3, 1);
+
+    // Retained, not silently discarded — and countable, so the caller can say so.
+    expect(outstanding.events).toBe(1);
+    expect(outstanding.failedFlushes).toBe(3);
+  });
+
+  it("returns immediately when the first attempt succeeds", async () => {
+    const collector = new Collector();
+    const t = telemetry(collector);
+    t.stageStarted("verify");
+
+    const outstanding = await t.drain(8, 1000);
+
+    // One call, and no backoff slept: a healthy run must not pay for this.
+    expect(collector.calls).toBe(1);
+    expect(outstanding.events).toBe(0);
+  });
+
+  it("does nothing when there is nothing pending", async () => {
+    const collector = new Collector();
+    const t = telemetry(collector);
+    expect((await t.drain(3, 1)).events).toBe(0);
+    expect(collector.calls).toBe(0);
+  });
+
+  // Sized against the fault actually observed: outbound stops for one to three
+  // minutes. Defaults that cover only seconds would not have saved 45dcd536.
+  it("its defaults span about two minutes", async () => {
+    const dead: TelemetrySink = { async send() { throw new Error("down"); } };
+    const t = telemetry(dead);
+    t.stageStarted("closure");
+
+    const started = Date.now();
+    await t.drain(4, 10);   // 10+20+40 = 70ms, proving the shape
+    expect(Date.now() - started).toBeGreaterThanOrEqual(60);
+
+    // The real defaults: 12 attempts, doubling from 500ms, each sleep capped at
+    // 30s => 11 sleeps totalling ~181s. Computed rather than asserted as a
+    // magic number, so changing the defaults changes this and is noticed.
+    const sleeps = [...Array(11).keys()].map((i) => Math.min(500 * 2 ** i, 30_000));
+    const total = sleeps.reduce((a, b) => a + b, 0);
+    expect(total).toBeGreaterThanOrEqual(180_000);
+    // And no single sleep eats the whole budget.
+    expect(Math.max(...sleeps)).toBeLessThanOrEqual(30_000);
+  });
+});

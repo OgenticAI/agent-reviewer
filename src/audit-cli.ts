@@ -508,8 +508,10 @@ async function runInvestigate(args: string[]): Promise<number> {
   } catch (error) {
     // The confirmation is already recorded; this is the flush that delivers it,
     // so the dashboard shows "cancelled" rather than a run stuck at "stop
-    // requested" forever.
-    if (error instanceof RunCancelled) await telemetry.flush();
+    // requested" forever. Drained rather than flushed once: this is an exit
+    // path, and a cancel confirmation lost to a network stall leaves exactly
+    // the stuck run this line exists to prevent.
+    if (error instanceof RunCancelled) await telemetry.drain();
     throw error;
   }
 }
@@ -748,13 +750,17 @@ async function investigateRun(ctx: {
   const findingsPath = join(out, "findings.json");
   writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
 
-  await telemetry.flush();
-  const outstanding = telemetry.outstanding();
+  // drain, not flush: this is the last chance these events have. A single
+  // flush that lands in one of the box's outbound stalls loses closure and
+  // every finding, and the process exits before anything can retry.
+  const outstanding = await telemetry.drain();
 
   process.stdout.write(
     `  ${telemetryNote}\n` +
       (outstanding.events > 0
-        ? `  ! ${outstanding.events} telemetry event(s) undelivered after ${outstanding.failedFlushes} failed flush(es)\n`
+        ? `  ! LOST ${outstanding.events} telemetry event(s) after ${outstanding.failedFlushes} failed flush(es) — ` +
+          `the audit is complete and its report is on disk, but Mission Control did not receive ` +
+          `this run's findings\n`
         : "") +
       `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
       renderUsage(usage, subject.loc).join("\n") +
@@ -879,7 +885,8 @@ async function uploadArtifacts(
       lines.push(`  ! ${target.kind} not uploaded — ${outcome.reason}`);
     }
   }
-  await telemetry.flush();
+  // Render's own last chance, for the same reason investigate drains.
+  await telemetry.drain();
   return lines;
 }
 

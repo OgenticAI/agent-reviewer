@@ -255,3 +255,55 @@ describe("the consolidated ask", () => {
     expect(rendered).toMatch(/· config dump/);
   });
 });
+
+
+describe("code that was never in scope", () => {
+  // The exact string that killed a run against agent-knowledge after 50 minutes
+  // and US$19.78: the verifier wanted to read a cost parameter off code it had
+  // not been given, nothing in the catalogue matched, and the report never
+  // rendered. Kept verbatim rather than paraphrased — a paraphrase would drift
+  // toward whatever the implementation happens to match.
+  const REAL =
+    "The API key creation endpoint or server action that calls bcrypt.hash() to " +
+    "generate the hashedSecret field. This would show the actual cost parameter used.";
+
+  it("closes the finding that had no closure path", () => {
+    const closure = deriveClosure(REAL);
+    expect(closure).not.toBeNull();
+    expect(closure?.effortHours).toBe(1);
+    // The verifier's own words survive into the ask, so the client is told what
+    // is actually wanted rather than a catalogue category.
+    expect(closure?.access).toContain("bcrypt.hash()");
+  });
+
+  it("asks for the code, not for a console export", () => {
+    const closure = deriveClosure(REAL);
+    expect(closure?.blocker).toMatch(/repository or path/i);
+    expect(closure?.method).toMatch(/nothing is executed/i);
+  });
+
+  it.each([
+    "the implementation of the token refresh helper",
+    "the server action that writes the row",
+  ])("covers the other ways a verifier asks for source: %s", (access) => {
+    expect(deriveClosure(access)).not.toBeNull();
+  });
+
+  // Appended last so they can only catch what already fell through. If one of
+  // these were hoisted above `configuration` or `log`, a deployed-state question
+  // would start being answered with "send us the code", which is the wrong ask
+  // and a wrong estimate.
+  it("does not shadow the deployed-state entries", () => {
+    expect(deriveClosure("the deployed endpoint's configuration")?.effortHours).toBe(1);
+    expect(deriveClosure("the deployed endpoint's configuration")?.blocker).toMatch(/hosting console/i);
+    expect(deriveClosure("logs from the endpoint")?.blocker).toMatch(/log sample/i);
+  });
+
+  // The gate has to keep its teeth. Some access genuinely has no catalogue
+  // answer, and inventing an estimate for it is worse than refusing to render —
+  // these hours get quoted and signed off.
+  it("still refuses what it cannot price", () => {
+    expect(deriveClosure("a conversation with the original architect")).toBeNull();
+    expect(deriveClosure("the client's threat model")).toBeNull();
+  });
+});

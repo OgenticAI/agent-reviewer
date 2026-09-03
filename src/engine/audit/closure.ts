@@ -108,6 +108,51 @@ export const CLOSURE_CATALOGUE: readonly ClosureTemplate[] = [
     effortHours: 0.5,
     blocker: "Client confirms the credential name",
   },
+
+  // ── Code that was never in scope ─────────────────────────────────────────
+  //
+  // Every entry above is deployed or runtime state: something the repository
+  // cannot answer because the answer lives on a server. This class is different
+  // and was missing entirely — the answer IS source, and we simply were not
+  // given it. A repo-scoped audit of a client with more than one repository hits
+  // this routinely: the route, the server action or the helper that does the
+  // thing under review lives next door.
+  //
+  // Found by a run against agent-knowledge dying at the closure gate after 50
+  // minutes and US$19.78, on a verifier that wanted "the API key creation
+  // endpoint or server action that calls bcrypt.hash()" to read off the cost
+  // parameter. Nothing in the catalogue matched, so the report never rendered.
+  //
+  // These sit LAST on purpose. `find` takes the first match, so appending means
+  // they can only catch text that already fell through every entry above — "the
+  // deployed endpoint's configuration" still matches `configuration`, and "logs
+  // from the endpoint" still matches `log`. They widen what is closable without
+  // moving anything that already worked.
+  //
+  // One hour, matching `configuration` and `pipeline`: reading one named code
+  // path once someone has pointed at it. The estimate is quoted to a client, so
+  // it is deliberately the cost of the reading and not of the hunt.
+  {
+    match: ["endpoint"],
+    access: "The repository or path holding that endpoint, added to the audit scope",
+    method: "Read the named handler and settle the claim against it; nothing is executed",
+    effortHours: 1,
+    blocker: "Client names the repository or path, or adds it to the scope",
+  },
+  {
+    match: ["server", "action"],
+    access: "The repository or path holding that server action, added to the audit scope",
+    method: "Read the named action and settle the claim against it; nothing is executed",
+    effortHours: 1,
+    blocker: "Client names the repository or path, or adds it to the scope",
+  },
+  {
+    match: ["implementation"],
+    access: "The repository or path holding that implementation, added to the audit scope",
+    method: "Read the named code path and settle the claim against it; nothing is executed",
+    effortHours: 1,
+    blocker: "Client names the repository or path, or adds it to the scope",
+  },
 ];
 
 /**

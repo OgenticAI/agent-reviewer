@@ -7,7 +7,9 @@ import {
   consolidateAsk,
   renderAsk,
   assertAllClosuresResolved,
+  settleClosure,
   CLOSURE_CATALOGUE,
+  type ClosureResult,
 } from "../../src/engine/audit/closure.js";
 import { validateFindings, type AuditFinding } from "../../src/engine/audit/finding.js";
 import type { VerifiedClaim } from "../../src/engine/audit/verify.js";
@@ -305,5 +307,54 @@ describe("code that was never in scope", () => {
   it("still refuses what it cannot price", () => {
     expect(deriveClosure("a conversation with the original architect")).toBeNull();
     expect(deriveClosure("the client's threat model")).toBeNull();
+  });
+});
+
+/**
+ * settleClosure — refusing to certify an audit must not destroy its evidence.
+ *
+ * From a real run. An agent-knowledge audit finished investigate 9/9 and
+ * verified 83 of 84 claims over 67 minutes, then persisted NOTHING: the 84th
+ * finding was not-determinable with no closure path, `assertAllClosuresResolved`
+ * threw, and the loop that publishes findings sat after the throw.
+ *
+ * The gate is correct and stays — a bare "not determinable" hands the risk back
+ * to the client. What must not follow from it is losing the 83 that were fine.
+ */
+describe("settleClosure", () => {
+  const finding = (id: string): AuditFinding =>
+    ({ id, message: `finding ${id}` }) as unknown as AuditFinding;
+
+  it("publishes every finding before the gate can throw", () => {
+    const published: string[] = [];
+    const result: ClosureResult = {
+      findings: [finding("a"), finding("b"), finding("c")],
+      unresolved: [{ id: "c", needsAccess: "a running instance" }],
+    };
+
+    expect(() => settleClosure(result, (f) => void published.push(f.id))).toThrow(
+      /no closure path/,
+    );
+    // The refusal stands AND the evidence survives it.
+    expect(published).toEqual(["a", "b", "c"]);
+  });
+
+  it("still throws, so an unresolved closure never passes silently", () => {
+    const result: ClosureResult = {
+      findings: [finding("a")],
+      unresolved: [{ id: "a", needsAccess: "production logs" }],
+    };
+    expect(() => settleClosure(result, () => {})).toThrow(/hands the risk back to the client/);
+  });
+
+  it("publishes and returns when everything is resolved", () => {
+    const published: string[] = [];
+    const result: ClosureResult = { findings: [finding("a"), finding("b")], unresolved: [] };
+    expect(() => settleClosure(result, (f) => void published.push(f.id))).not.toThrow();
+    expect(published).toEqual(["a", "b"]);
+  });
+
+  it("a run with no findings is not an error", () => {
+    expect(() => settleClosure({ findings: [], unresolved: [] }, () => {})).not.toThrow();
   });
 });

@@ -69,7 +69,7 @@ import {
 } from "./engine/audit/verify.js";
 import {
   toAuditFindings,
-  assertAllClosuresResolved,
+  settleClosure,
   consolidateAsk,
   renderAsk,
 } from "./engine/audit/closure.js";
@@ -693,10 +693,22 @@ async function investigateRun(ctx: {
 
   const closure = await withStage(telemetry, "closure", () => {
     const result = toAuditFindings({ verified: verification.verified });
-    assertAllClosuresResolved(result);
     // Findings go up as they are settled, so the UI can show them long before
     // the PDF exists.
-    for (const found of result.findings) telemetry.finding(found);
+    //
+    // BEFORE the closure gate, not after it. The gate throws, and everything
+    // after a throw does not run — so a single not-determinable finding with no
+    // closure path discarded every finding in the run, including the ones that
+    // verified cleanly. An agent-knowledge audit finished investigate 9/9,
+    // verified 83 of 84 claims over 67 minutes, and persisted NOTHING because
+    // the 84th had no closure path. The comment above this loop already said
+    // findings should arrive as they settle; the ordering was what prevented it.
+    //
+    // The gate still fails the run, which is right: a bare "not determinable"
+    // hands the risk back to the client. What changes is that the evidence
+    // survives the refusal. A failed run's findings are already treated as
+    // partial downstream, and its report is not released.
+    settleClosure(result, (found) => telemetry.finding(found));
     telemetry.stageFinished("closure", { findings: result.findings.length });
     return result;
   }, reportUsage);

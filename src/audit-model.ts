@@ -39,8 +39,57 @@ const MAX_OUTPUT_TOKENS = 8192;
  * Iterations per question. Higher than the review path's default because an
  * audit question is answered by reading around a codebase, not by reading one
  * diff — the model needs to follow an import chain to reach the answer.
+ *
+ * ── Why 48 and not 24 ───────────────────────────────────────────────────────
+ *
+ * 24 was not a budget, it was a wall every question hit. Two runs on 2026-09-03:
+ *
+ *   · agent-knowledge, 533 files / 92,409 lines — 9 of 9 questions exhausted it
+ *   · ogentic-redact,  149 files / 19,917 lines — 4 of 4 questions exhausted it
+ *
+ * A question that runs out of turns is answered from `askForTheAnswer` with the
+ * tools withheld, so its citations are recalled rather than read. `checkAnchors`
+ * then rejects them as `quote-not-at-line` — correctly, because a line number
+ * written from memory is a fabricated citation whatever the intent behind it.
+ * The first run spent US$39.20 over 1,245 model calls and published nothing at
+ * all; the second survived 3 claims out of 35.
+ *
+ * So the cap was not bounding cost, it was buying it and throwing the result
+ * away. 48 keeps the wall-clock cap the real ceiling: the 24-turn questions on
+ * the smaller subject took ~95s against a 5-minute limit, so doubling the turns
+ * still lands inside it, and a question that genuinely cannot be settled now
+ * stops on wall-clock — a bound on work rather than a bound on reading.
+ *
+ * Tunable without a deploy because the right number is a property of the
+ * subject, not of this file, and the next bad run should be answerable by
+ * changing an env var on the box rather than shipping a release.
  */
-export const MAX_TOOL_ITERATIONS = 24;
+/** Default used when the env var is absent, empty or not a positive integer. */
+export const DEFAULT_AUDIT_TOOL_ITERATIONS = 48;
+
+/**
+ * Read the cap from `AUDIT_MAX_TOOL_ITERATIONS`.
+ *
+ * Refuses junk rather than coercing it. `Number("")` is 0 and `Number("12abc")`
+ * is NaN — silently accepting either would cap investigation at zero turns and
+ * present the resulting empty audit as a finished one, which is the failure this
+ * whole comment exists to stop happening twice.
+ *
+ * Declared above `MAX_TOOL_ITERATIONS`, and the order is load-bearing: that
+ * constant calls this at module scope, so a `const` it reads must already be
+ * initialised. Declared below, `DEFAULT_AUDIT_TOOL_ITERATIONS` is in its
+ * temporal dead zone and importing this file throws.
+ */
+export function readIterationCap(
+  raw: string | undefined = process.env.AUDIT_MAX_TOOL_ITERATIONS,
+): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_AUDIT_TOOL_ITERATIONS;
+  const parsed = Number(raw.trim());
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_AUDIT_TOOL_ITERATIONS;
+  return parsed;
+}
+
+export const MAX_TOOL_ITERATIONS = readIterationCap();
 
 function extractText(content: unknown[]): string {
   return content

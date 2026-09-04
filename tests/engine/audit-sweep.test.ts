@@ -56,7 +56,7 @@ describe("visiting every file", () => {
 
 describe("what the sweep can establish without a model", () => {
   it("finds a token read without validation", () => {
-    const found = signalsIn("Auth.cs", "var token = handler.ReadJwtToken(clerkToken);");
+    const found = signalsIn("Auth.cs", "var token = handler.ReadJwtToken(rawToken);");
     expect(found[0]?.kind).toBe("unvalidated-token");
     expect(found[0]?.cwe).toBe("CWE-347");
     expect(found[0]?.owasp).toMatch(/API2/);
@@ -119,8 +119,9 @@ describe("what the sweep can establish without a model", () => {
 });
 
 describe("separating surface from defects", () => {
-  // 513 by-id fetches against 450 authorization checks is a statement worth
-  // making. Calling those 513 defects would bury the eleven that are.
+  // Hundreds of by-id fetches against a comparable number of authorization
+  // checks is a statement worth making. Calling every one of them a defect
+  // would bury the handful that are.
   it("classes an endpoint as surface and an unvalidated token as a defect", () => {
     const surface = signalsIn("C.cs", "[HttpGet]");
     const defect = signalsIn("C.cs", "var t = handler.ReadJwtToken(x);");

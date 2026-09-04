@@ -82,11 +82,11 @@ export const SEMGREP: AnalyzerSpec = {
     // against the registry at run time, and never a path inside the target.
     //
     // p/security-audit alone is not enough, and the gap is not small. Measured
-    // on a 2,177-file tree that is 42% C#: p/security-audit returned ZERO
-    // findings with zero parse errors, while p/csharp returned 7 on the same
-    // tree, including five instances of a token-expiry rule that corroborated a
-    // high-severity finding established by hand. The pack was reading the files
-    // and had nothing to say about them.
+    // on a .NET subject of a couple of thousand files: p/security-audit
+    // returned ZERO findings with zero parse errors, while p/csharp returned a
+    // handful on the same tree, several of them a token-expiry rule that
+    // corroborated a high-severity finding established by hand. The pack was
+    // reading the files and had nothing to say about them.
     //
     // So the language packs are added from what the tree actually contains. A
     // pack for a language that is absent costs a registry fetch and finds
@@ -108,7 +108,7 @@ export const SEMGREP: AnalyzerSpec = {
   // question the report answers with its own numbers, not with this list.
   //
   // csharp earns its place here only because `languagePacks` now adds p/csharp.
-  // Under p/security-audit alone it produced nothing on a 900-file C# tree, and
+  // Under p/security-audit alone it produced nothing on a C# tree, and
   // listing it then would have reported those files as deterministically
   // covered by a pack that had no rules for them.
   reach: ["typescript", "javascript", "python", "go", "java", "ruby", "php", "csharp"],

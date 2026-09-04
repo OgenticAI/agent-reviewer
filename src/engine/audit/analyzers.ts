@@ -228,4 +228,69 @@ export const npmAuditAdapter: Adapter = {
   },
 };
 
-export const AUDIT_ADAPTERS: Adapter[] = [semgrepAdapter, gitleaksAdapter, npmAuditAdapter];
+/**
+ * Advisories from OSV, for the ecosystems npm cannot answer for.
+ *
+ * OSV reports per package inside per source file, so a finding is attached to
+ * the manifest that declares the package. That keeps it consistent with the npm
+ * adapter above: the fix is a version bump in a manifest, not an edit to any
+ * source line a reviewer could read.
+ *
+ * Severity comes from the advisory's own database-specific rating when it has
+ * one. OSV entries frequently carry NO severity at all, and those are reported
+ * as warnings rather than promoted or silently dropped: an advisory with an
+ * unstated severity is still an advisory.
+ */
+export const osvScannerAdapter: Adapter = {
+  source: "dependency-audit-osv",
+  parse(raw) {
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (typeof data !== "object" || data === null) return null;
+    const results = (data as { results?: unknown }).results;
+    // osv-scanner always emits `results`, empty when it found nothing. Its
+    // absence means this is some other JSON, not a clean scan.
+    if (!Array.isArray(results)) return null;
+
+    const findings: Finding[] = [];
+    for (const result of results as OsvResult[]) {
+      const manifest = typeof result.source?.path === "string" ? result.source.path : "(manifest)";
+      for (const pkg of result.packages ?? []) {
+        const name = pkg.package?.name ?? "(unnamed package)";
+        const version = pkg.package?.version ? `@${pkg.package.version}` : "";
+        for (const vuln of pkg.vulnerabilities ?? []) {
+          const id = vuln.id ?? "advisory";
+          const summary = typeof vuln.summary === "string" && vuln.summary ? `: ${vuln.summary}` : "";
+          findings.push({
+            path: manifest,
+            message: `${name}${version}: ${id}${summary}`,
+            severity: normalizeSeverity(osvSeverity(vuln)),
+            source: "dependency-audit-osv",
+            code: id,
+          });
+        }
+      }
+    }
+    return findings;
+  },
+};
+
+interface OsvResult {
+  source?: { path?: string };
+  packages?: Array<{
+    package?: { name?: string; version?: string; ecosystem?: string };
+    vulnerabilities?: Array<{ id?: string; summary?: string; database_specific?: { severity?: string } }>;
+  }>;
+}
+
+/** OSV severity where the advisory states one; unstated is not the same as low. */
+function osvSeverity(vuln: { database_specific?: { severity?: string } }): string {
+  const stated = vuln.database_specific?.severity;
+  return typeof stated === "string" && stated ? stated.toLowerCase() : "moderate";
+}
+
+export const AUDIT_ADAPTERS: Adapter[] = [semgrepAdapter, gitleaksAdapter, npmAuditAdapter, osvScannerAdapter];

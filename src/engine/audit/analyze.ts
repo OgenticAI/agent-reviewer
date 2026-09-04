@@ -26,7 +26,8 @@ import { promisify } from "node:util";
 
 import type { Adapter } from "../findings/adapters.js";
 import type { JobFindings } from "../findings/schema.js";
-import { gitleaksAdapter, npmAuditAdapter, semgrepAdapter } from "./analyzers.js";
+import { gitleaksAdapter, npmAuditAdapter, osvScannerAdapter, semgrepAdapter } from "./analyzers.js";
+import { describeUnscanned, scanDependencyManifests } from "./dependencies.js";
 import type { Inventory } from "./inventory.js";
 
 const run = promisify(execFile);
@@ -131,13 +132,49 @@ export const DEPENDENCY_AUDIT: AnalyzerSpec = {
   // which is precisely the implied parity this table exists to prevent. The
   // first version of this file got that wrong.
   reach: [],
-  precondition: (root) =>
-    existsSync(join(root, "package-lock.json")) || existsSync(join(root, "npm-shrinkwrap.json"))
-      ? null
-      : "no npm lockfile at the repository root — dependency advisories cannot be resolved",
+  // The skip has to say what went unexamined, not just what was absent. "No npm
+  // lockfile at the repository root" is true over a .NET tree and reads as
+  // "there is nothing here", when the truth was 123 NuGet packages nobody had
+  // looked at. Counting them first is what makes the sentence honest.
+  precondition: (root) => {
+    if (existsSync(join(root, "package-lock.json")) || existsSync(join(root, "npm-shrinkwrap.json"))) {
+      return null;
+    }
+    const unscanned = describeUnscanned(scanDependencyManifests(root), []);
+    return unscanned
+      ? `no npm lockfile at the repository root; ${unscanned}`
+      : "no dependency manifest found in any supported ecosystem (npm, NuGet, PyPI, Go, Maven)";
+  },
 };
 
-export const AUDIT_ANALYZERS: AnalyzerSpec[] = [SEMGREP, SECRET_SCAN, DEPENDENCY_AUDIT];
+/**
+ * Advisories for everything npm cannot answer for.
+ *
+ * One scanner rather than one analyzer per ecosystem. A NuGet-shaped copy of
+ * `npm audit` would need the .NET SDK on this host and a successful restore
+ * against whatever private feeds the project uses, which fails closed on
+ * exactly the repositories most worth scanning — and it would solve this once,
+ * with the next Python or Java subject reopening the same gap.
+ *
+ * Skips loudly rather than silently when the binary is absent: an unscanned
+ * ecosystem the reader is told about is a coverage gap, and one they are not
+ * told about is a wrong report.
+ */
+export const DEPENDENCY_AUDIT_OSV: AnalyzerSpec = {
+  job: "dependency-audit-osv",
+  command: "osv-scanner",
+  args: (root) => ["--format", "json", "--recursive", root],
+  adapter: osvScannerAdapter,
+  // Same reason as above: this reads the dependency graph, not the code. Its
+  // findings attach to manifests and say nothing about any source file.
+  reach: [],
+  precondition: (root) => {
+    const found = scanDependencyManifests(root).filter((f) => f.ecosystem !== "npm" && f.packages > 0);
+    return found.length === 0 ? "no non-npm dependency manifest in the tree" : null;
+  },
+};
+
+export const AUDIT_ANALYZERS: AnalyzerSpec[] = [SEMGREP, SECRET_SCAN, DEPENDENCY_AUDIT, DEPENDENCY_AUDIT_OSV];
 
 function skipped(job: string, reason: string): JobFindings {
   return { job, parsed: false, findings: [], reason };

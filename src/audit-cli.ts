@@ -53,9 +53,11 @@ import type { JobFindings } from "./engine/findings/schema.js";
 import {
   investigate,
   modelUnusableFrom,
+  questionsWithoutFindings,
   summariseInvestigation,
   type Claim,
 } from "./engine/audit/investigate.js";
+import { ModelCallFailures } from "./engine/audit/model-failures.js";
 import {
   UsageMeter,
   rateCardFromEnv,
@@ -884,6 +886,11 @@ async function investigateRun(ctx: {
   // iteration (OGE-2502).
   const meter = new UsageMeter();
   const rateCard = rateCardFromEnv();
+  // One counter for the whole run, at the same seam as the meter (OGE-2711).
+  // Every call the API rejected is counted where it was made, so the number
+  // covers investigate and verify alike, and the run record can carry it on
+  // the stage row the release gate reads.
+  const failures = new ModelCallFailures();
 
   /**
    * Publish what has been spent SO FAR (OGE-2515).
@@ -928,6 +935,7 @@ async function investigateRun(ctx: {
     anthropic,
     readTool,
     meter,
+    failures,
     log: (message: string) => telemetry.log("investigate", "info", message),
   };
 
@@ -951,6 +959,9 @@ async function investigateRun(ctx: {
   );
 
   meter.enter("investigate");
+  // Kept outside the stage so the same counts can be re-sent after verify
+  // with the failure total brought up to date; see the re-emit below.
+  let investigateCounts: Record<string, number> = {};
   const results = await keepingLedger("investigate", persistLedger, () =>
     withStage(telemetry, "investigate", async () => {
       const runs = await investigate({
@@ -981,23 +992,48 @@ async function investigateRun(ctx: {
       const unusable = modelUnusableFrom(runs);
       if (unusable) throw new CliError(`investigate: ${unusable}`);
 
-      telemetry.stageFinished("investigate", {
-        questions: runs.length,
-        claims: runs.reduce((n, r) => n + r.claims.length, 0),
+      // Which questions came out with nothing to verify, by name. The count
+      // below goes on the stage row; the names go in the log, because the
+      // release gate can say "3 of 9 questions produced nothing" from the
+      // row alone but can only say WHICH three from here.
+      const empty = questionsWithoutFindings(runs);
+      if (empty.length > 0) {
+        telemetry.log(
+          "investigate",
+          "warn",
+          `${empty.length} of ${runs.length} question(s) produced no kept claim: ${empty.join(", ")}`,
+        );
+      }
+
+      const summary = summariseInvestigation(runs);
+      investigateCounts = {
+        questions: summary.questions,
+        claims: summary.claims,
         // The model's own reads. The ledger's size is coverage, reported by
         // render from the union; here it would say the model read the sweep's
         // files.
         filesOpened: modelLog.opened().size,
         filesInLedger: accessLog.opened().size,
-      });
+        // What the release gate reads (OGE-2711). A run that lost calls to
+        // the API, or that answered from a fraction of its questions, has
+        // "finished" in exactly the shape of one that did neither, and these
+        // two numbers are how the gate tells them apart. The failure count
+        // is what it is SO FAR; verify adds to it and re-sends this row.
+        modelCallFailures: failures.count(),
+        questionsWithFindings: summary.questionsWithFindings,
+      };
+      telemetry.stageFinished("investigate", investigateCounts);
       return runs;
     }, reportUsage),
   );
 
   const investigation = summariseInvestigation(results);
   const claims: Claim[] = results.flatMap((r) => r.claims);
+  const investigateFailures = failures.count();
   process.stdout.write(
     `  claims     ${claims.length} kept, ${investigation.dropped} dropped\n` +
+      `  questions  ${investigation.questionsWithFindings} of ${investigation.questions} produced a kept claim\n` +
+      `  model      ${investigateFailures} call(s) failed\n` +
       `  files      ${modelLog.opened().size} opened by the model; ${accessLog.opened().size} in the run's ledger\n`,
   );
 
@@ -1043,6 +1079,27 @@ async function investigateRun(ctx: {
       `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n` +
       `  ${describeVerification(summary)}\n`,
   );
+
+  // Verify's failed calls, added to the investigate row (OGE-2711).
+  //
+  // The release gate reads one row for the run's model-call failures, and it
+  // is the investigate row: that is the stage record every run has, and the
+  // gate's contract names it. But the count is meant to cover verify too, and
+  // verify has not run when that row is first sent. So the row is sent again,
+  // same counts with the failure total brought up to date, and only when the
+  // total actually moved. The dashboard replaces a stage's counts wholesale on
+  // a re-sent finish, which is why the whole object goes back rather than the
+  // one field; it also takes the re-send's timestamp as the stage's finish,
+  // which is the price of putting the number where the gate looks, and it is
+  // paid only on a run the gate is going to block anyway.
+  if (failures.count() > investigateFailures) {
+    investigateCounts = { ...investigateCounts, modelCallFailures: failures.count() };
+    telemetry.stageFinished("investigate", investigateCounts);
+    process.stdout.write(
+      `  model      ${failures.count()} call(s) failed across investigate and verify\n`,
+    );
+    await telemetry.flush();
+  }
 
   // Verification stops mid-list on a cancel, so the claim set here is partial.
   // Rendering a report from it would produce a document that looks complete and

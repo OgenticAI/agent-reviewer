@@ -514,16 +514,42 @@ export function modelUnusableFrom(results: QuestionRunResult[]): string | null {
   );
 }
 
+/**
+ * The questions that came out with nothing to verify (OGE-2711).
+ *
+ * A question whose every claim was dropped, and one whose run failed, and one
+ * the model answered with an empty list, all look the same from here: no kept
+ * claim. That is the right thing to count. The claims total already says how
+ * much the stage produced; this says how much of the question set it produced
+ * it FROM, because ten claims on one question and none on the other nine is a
+ * report about one question wearing the cover of ten.
+ *
+ * Named, not just counted, so the run record can say which ones.
+ */
+export function questionsWithoutFindings(results: QuestionRunResult[]): string[] {
+  return results
+    .filter((result) => result.claims.length === 0)
+    .map((result) => result.questionId);
+}
+
 /** Totals for the run record and the report's method section. */
 export function summariseInvestigation(results: QuestionRunResult[]): {
   questions: number;
+  /** Distinct question ids with at least one kept claim. */
+  questionsWithFindings: number;
   claims: number;
   dropped: number;
   filesOpened: number;
 } {
   const opened = new Set(results.flatMap((result) => result.openedFiles));
+  const withFindings = new Set(
+    results
+      .filter((result) => result.claims.length > 0)
+      .map((result) => result.questionId),
+  );
   return {
     questions: results.length,
+    questionsWithFindings: withFindings.size,
     claims: results.reduce((total, result) => total + result.claims.length, 0),
     dropped: results.reduce(
       (total, result) => total + result.dropped.length,

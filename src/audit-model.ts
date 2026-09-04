@@ -113,6 +113,7 @@ function openedFrom(transcript: ReadonlyArray<{ name: string; input: unknown }>)
 }
 
 import type { UsageMeter } from "./engine/audit/usage.js";
+import type { ModelCallFailures } from "./engine/audit/model-failures.js";
 
 export interface AuditModelOptions {
   /**
@@ -124,6 +125,17 @@ export interface AuditModelOptions {
    * tool-loop iteration.
    */
   meter?: UsageMeter;
+  /**
+   * Records every call that threw (OGE-2711).
+   *
+   * Same seam as the meter, for the same reason: a call the API rejected is
+   * seen here whatever it was doing, whether an investigation turn, the
+   * closing turn a capped loop asks for, or a verifier. Downstream each of
+   * those becomes something well-formed (a dropped question, a degraded
+   * reason, a cannot-determine verdict) and the count is the one thing that
+   * says the run lost calls at all.
+   */
+  failures?: ModelCallFailures;
   anthropic: Anthropic;
   /** The `read_file` tool, already bound to the tree and the access log. */
   readTool: ReviewTool;
@@ -200,17 +212,27 @@ async function runOnce(options: AuditModelOptions, systemPrompt: string, userPro
     // that has run out of budget is how the closing turn becomes another tool
     // call instead of an answer.
     const offerTools = turnOptions?.tools !== false;
-    const completion = await options.anthropic.messages.create({
-      model: options.model ?? AUDIT_MODEL,
-      max_tokens: MAX_OUTPUT_TOKENS,
-      // Zero, so that two runs over an unchanged tree can be compared. The
-      // report is diffed against the previous audit; sampling noise would show
-      // up there as findings that came and went.
-      temperature: 0,
-      system: systemPrompt,
-      messages: withCachedPrefix(messages),
-      ...(tools && offerTools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
-    });
+    let completion: Anthropic.Message;
+    try {
+      completion = await options.anthropic.messages.create({
+        model: options.model ?? AUDIT_MODEL,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        // Zero, so that two runs over an unchanged tree can be compared. The
+        // report is diffed against the previous audit; sampling noise would show
+        // up there as findings that came and went.
+        temperature: 0,
+        system: systemPrompt,
+        messages: withCachedPrefix(messages),
+        ...(tools && offerTools ? { tools: tools as Anthropic.Messages.ToolUnion[] } : {}),
+      });
+    } catch (error) {
+      // Counted and rethrown. The throw still has to reach whoever asked for
+      // the call, because each caller already turns it into the right kind of
+      // honest nothing for its own stage; this only makes sure the run can say
+      // how many times that happened.
+      options.failures?.record(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
     // Before anything can throw on the response shape: an unmeasured call is
     // recorded as unmeasured, never dropped.
     options.meter?.record(completion);

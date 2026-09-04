@@ -23,7 +23,7 @@
 import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { SKIP_DIRS, walkTree, type TreeFile } from "./tree.js";
+import { AUDIT_ARTIFACTS, SKIP_DIRS, runDirWithin, walkTree, type TreeFile } from "./tree.js";
 
 /**
  * Printed wherever a coverage figure is. Not decoration — the single most
@@ -38,7 +38,8 @@ export const COVERAGE_CAVEAT =
 export interface Inventory {
   files: TreeFile[];
   /**
-   * Directory names excluded from the walk, recorded rather than dropped.
+   * What the walk excluded, recorded rather than dropped: directory names,
+   * and the run's own artifacts when they sit inside the tree.
    *
    * A denominator that silently omits things is not a denominator. Naming the
    * exclusions is what lets a reader judge whether the ratio means anything —
@@ -48,10 +49,24 @@ export interface Inventory {
   builtAt: string;
 }
 
-export function buildInventory(root: string): Inventory {
+/**
+ * Every file the audit is answerable for.
+ *
+ * `runDir` is where this run's artifacts land. With the default `--out` that
+ * is the tree itself, and the artifacts would otherwise be counted in the
+ * denominator and read by the sweep as if they were the subject's; see
+ * `AUDIT_ARTIFACTS`. Named in `excluded` so the report says what was left out.
+ */
+export function buildInventory(root: string, runDir?: string): Inventory {
+  const artifactDir = runDirWithin(root, runDir);
   return {
-    files: walkTree(root),
-    excluded: [...SKIP_DIRS].sort(),
+    files: walkTree(root, { runDir }),
+    excluded: [
+      ...[...SKIP_DIRS].sort(),
+      ...(artifactDir === null
+        ? []
+        : [`this run's own artifacts in ${artifactDir === "" ? "the tree root" : artifactDir} (${[...AUDIT_ARTIFACTS].join(", ")})`]),
+    ],
     builtAt: new Date().toISOString(),
   };
 }
@@ -188,5 +203,27 @@ export class FileAccessLog {
     const path = join(outDir, "access-log.json");
     writeFileSync(path, `${JSON.stringify(this.records, null, 2)}\n`);
     return path;
+  }
+}
+
+/**
+ * A log that records into a second log as well as itself.
+ *
+ * The investigation writes into the run's ledger, and the sweep may already
+ * have put every file in the tree there. Reported from the ledger, "files the
+ * model opened" became "files the sweep opened" the moment the sweep ran
+ * first, and the dashboard was told the model had read the whole tree
+ * (OGE-2746). The model's reads go through this instead: the ledger keeps the
+ * union coverage is computed from, and `opened()` on this log is the model's
+ * own count.
+ */
+export class TeeAccessLog extends FileAccessLog {
+  constructor(private readonly ledger: FileAccessLog) {
+    super();
+  }
+
+  override record(path: string, outcome: AccessOutcome): void {
+    super.record(path, outcome);
+    this.ledger.record(path, outcome);
   }
 }

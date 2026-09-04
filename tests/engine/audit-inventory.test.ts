@@ -9,11 +9,12 @@ import {
   topLevelArea,
   writeInventory,
   FileAccessLog,
+  TeeAccessLog,
   COVERAGE_CAVEAT,
   type Inventory,
 } from "../../src/engine/audit/inventory.js";
 import { makeRepoTools } from "../../src/engine/tools/repo.js";
-import type { TreeFile } from "../../src/engine/audit/tree.js";
+import { AUDIT_ARTIFACTS, runDirWithin, type TreeFile } from "../../src/engine/audit/tree.js";
 
 let scratch: string;
 
@@ -74,6 +75,45 @@ describe("the inventory", () => {
 
     expect(inventory.excluded).toContain("node_modules");
     expect(inventory.files.some((f) => f.path.startsWith("node_modules/"))).toBe(false);
+  });
+
+  // The run's own artifacts sit inside the tree under the default --out, and
+  // were counted in the denominator as if they were the subject's. They leave
+  // it, and the report is told, rather than a coverage ratio over files the
+  // audit wrote itself.
+  describe("the run's own artifacts", () => {
+    it("leaves them out of the denominator when the run directory is the tree", () => {
+      plantCodebase(scratch);
+      const before = buildInventory(scratch).files.length;
+      for (const name of AUDIT_ARTIFACTS) writeFileSync(join(scratch, name), "{}\n");
+      const inventory = buildInventory(scratch, scratch);
+      expect(inventory.files.length).toBe(before);
+      expect(inventory.files.some((f) => AUDIT_ARTIFACTS.has(f.path))).toBe(false);
+    });
+
+    it("names the exclusion rather than dropping it silently", () => {
+      plantCodebase(scratch);
+      const named = buildInventory(scratch, scratch).excluded.filter((e) => /artifacts/.test(e));
+      expect(named).toHaveLength(1);
+      for (const name of AUDIT_ARTIFACTS) expect(named[0]).toContain(name);
+      expect(buildInventory(scratch).excluded.some((e) => /artifacts/.test(e))).toBe(false);
+    });
+
+    it("counts a same-named file elsewhere in the tree as the subject's", () => {
+      plantCodebase(scratch);
+      writeFileSync(join(scratch, "src", "findings.json"), "[]\n");
+      const paths = buildInventory(scratch, scratch).files.map((f) => f.path);
+      expect(paths).toContain("src/findings.json");
+    });
+
+    it("resolves the run directory relative to the tree, or to nothing when outside it", () => {
+      expect(runDirWithin(scratch, scratch)).toBe("");
+      expect(runDirWithin(scratch, join(scratch, ".audit"))).toBe(".audit");
+      expect(runDirWithin(scratch, join(scratch, "a", "b"))).toBe("a/b");
+      expect(runDirWithin(scratch, join(scratch, ".."))).toBeNull();
+      expect(runDirWithin(scratch, join(scratch, "..", "sibling"))).toBeNull();
+      expect(runDirWithin(scratch, undefined)).toBeNull();
+    });
   });
 
   it("writes inventory.json", () => {
@@ -289,5 +329,40 @@ describe("the tool loop feeds the log", () => {
     expect(coverage.opened).toBe(2);
     expect(coverage.share).toBe(0.5);
     expect(coverage.unreadable).toEqual(["src/auth/nope.ts"]);
+  });
+});
+
+/**
+ * TeeAccessLog: the model's own reads, beside the run's ledger.
+ *
+ * With the sweep running first, "files the model opened" reported from the
+ * ledger became "every file in the tree" whatever the model had read. The tee
+ * keeps the ledger whole for coverage and gives the stage its own count.
+ */
+describe("TeeAccessLog", () => {
+  it("records every outcome into both logs", () => {
+    const ledger = new FileAccessLog();
+    const tee = new TeeAccessLog(ledger);
+    tee.record("src/a.ts", "read");
+    tee.record("src/gone.ts", "missing");
+    expect(ledger.all().map((r) => [r.path, r.outcome])).toEqual(tee.all().map((r) => [r.path, r.outcome]));
+    expect(ledger.failed()).toEqual(tee.failed());
+  });
+
+  it("counts only its own reads, while the ledger holds the union", () => {
+    const ledger = new FileAccessLog();
+    ledger.record("src/swept.ts", "read");
+    ledger.record("src/both.ts", "read");
+    const tee = new TeeAccessLog(ledger);
+    tee.record("src/both.ts", "read");
+    tee.record("src/model-only.ts", "read");
+
+    expect(tee.opened()).toEqual(new Set(["src/both.ts", "src/model-only.ts"]));
+    expect(ledger.opened()).toEqual(new Set(["src/swept.ts", "src/both.ts", "src/model-only.ts"]));
+    expect(tee.opened().size).toBeLessThan(ledger.opened().size);
+  });
+
+  it("is a FileAccessLog, so the read tool cannot tell the difference", () => {
+    expect(new TeeAccessLog(new FileAccessLog())).toBeInstanceOf(FileAccessLog);
   });
 });

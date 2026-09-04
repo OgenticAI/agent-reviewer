@@ -51,10 +51,11 @@ function finding(over: Partial<AuditFinding> = {}): AuditFinding {
 /* ── The stage model ──────────────────────────────────────────────────────── */
 
 describe("the stage model", () => {
-  it("names the eight stages in pipeline order", () => {
+  it("names the nine stages in pipeline order", () => {
     expect([...AUDIT_STAGES]).toEqual([
       "acquire",
       "inventory",
+      "sweep",
       "map",
       "analyze",
       "investigate",
@@ -695,5 +696,23 @@ describe("drain is the last chance, so it keeps trying", () => {
     expect(total).toBeGreaterThanOrEqual(180_000);
     // And no single sleep eats the whole budget.
     expect(Math.max(...sleeps)).toBeLessThanOrEqual(30_000);
+  });
+
+  // Telemetry off is not telemetry failing. Events still queue for the
+  // in-memory record, and the loop used to back off through every attempt
+  // with nowhere to send them, then call them LOST: a local run sat for three
+  // minutes at the end of a stage that had taken a second.
+  it("returns at once, with nothing lost, when there is no sink", async () => {
+    const t = telemetry();
+    t.stageStarted("sweep");
+    t.stageFinished("sweep", { files: 1 });
+
+    const started = Date.now();
+    const outstanding = await t.drain(4, 1000);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(outstanding).toEqual({ events: 0, failedFlushes: 0 });
+    expect(t.outstanding()).toEqual({ events: 0, failedFlushes: 0 });
+    // The record itself is untouched: the events are still there to be read.
+    expect(t.events().length).toBeGreaterThanOrEqual(2);
   });
 });

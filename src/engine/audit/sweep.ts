@@ -28,7 +28,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { FileAccessLog } from "./inventory.js";
-import { languageOf, walkTree, type TreeFile } from "./tree.js";
+import { languageOf, walkTree, type TreeFile, type WalkOptions } from "./tree.js";
 
 /** Files above this are recorded as seen and not parsed: minified bundles, vendored blobs. */
 export const MAX_SWEEP_BYTES = 1_500_000;
@@ -55,9 +55,10 @@ export type SignalKind =
  * What a signal is claiming.
  *
  * `surface` measures the attack surface: endpoints, by-id fetches, authorization
- * attributes. None is a defect, and the ratios between them are the point. 513
- * by-id fetches against 450 authorization checks is a statement worth making;
- * calling those 513 defects would bury the eleven that are.
+ * attributes. None is a defect, and the ratios between them are the point.
+ * Hundreds of by-id fetches against a comparable number of authorization
+ * checks is a statement worth making; calling every one of them a defect would
+ * bury the handful that are.
  *
  * `defect` is a candidate finding: something that is wrong if the line means
  * what it appears to mean. Still not a finding until something with judgment
@@ -218,20 +219,21 @@ const RULES: SignalRule[] = [
   // the check is absent, only that the shape is present, so this is a candidate
   // for the investigation to settle rather than a finding on sight.
   //
-  // Calibrated against a real one rather than guessed. The true positive reads
+  // Calibrated against a real one rather than guessed. The shape of a true
+  // positive, in a .NET subject:
   //
-  //     public Task<Patient> GetPatientById(string patientId)
-  //         => _noSqlDbManager.GetItemByIdAsync<Patient>(patientId);
+  //     public Task<Order> GetOrderById(string orderId)
+  //         => _store.GetItemByIdAsync<Order>(orderId);
   //
-  // and its own sibling in the same class shows the contrast: GetByOrganizationId
+  // and its own sibling in the same class shows the contrast: GetByTenantId
   // filters on the tenant, this one does not. So the shape worth flagging is a
   // by-id fetch through a data accessor, which is where the ownership check
   // should be and often is not.
   //
-  // A first attempt matched any `.FirstOrDefault(x => x.Id == …)` and fired 65
-  // times, mostly on in-memory filtering of an already-loaded object graph
-  // where ownership was settled before the line ran. A rule that fires on
-  // everything trains a reader to skip the section it appears in.
+  // A first attempt matched any `.FirstOrDefault(x => x.Id == …)` and fired
+  // dozens of times, mostly on in-memory filtering of an already-loaded object
+  // graph where ownership was settled before the line ran. A rule that fires
+  // on everything trains a reader to skip the section it appears in.
   {
     kind: "insecure-direct-object-reference",
     signalClass: "surface",
@@ -280,7 +282,7 @@ const RULES: SignalRule[] = [
     kind: "sensitive-field",
     signalClass: "surface",
     languages: [],
-    pattern: /\b(?:BirthDate|DateOfBirth|SSN|SocialSecurity|MedicalRecord|Diagnosis|PatientName|NationalId)\b/,
+    pattern: /\b(?:BirthDate|DateOfBirth|SSN|SocialSecurity|NationalId|PassportNumber|TaxId|CardNumber|HealthRecord|Diagnosis)\b/,
     cwe: "CWE-311",
   },
 ];
@@ -348,9 +350,12 @@ export function signalsIn(path: string, source: string): Signal[] {
  * The access log is the same one the investigation writes to, so the existing
  * coverage machinery reports this without change. That is the point: coverage
  * stops being a claim the report makes and becomes a ledger it can show.
+ *
+ * `options.runDir` keeps the run's own artifacts out of the walk. Without it
+ * a re-run sweep read the previous sweep.json and matched its own excerpts.
  */
-export function sweepTree(root: string, log: FileAccessLog): SweepResult {
-  const files: TreeFile[] = walkTree(root);
+export function sweepTree(root: string, log: FileAccessLog, options: WalkOptions = {}): SweepResult {
+  const files: TreeFile[] = walkTree(root, options);
   const dispositions: FileDisposition[] = [];
   const signals: Signal[] = [];
 

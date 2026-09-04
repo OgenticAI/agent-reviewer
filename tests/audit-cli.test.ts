@@ -1,9 +1,19 @@
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveStartedBy } from "../src/audit-cli.js";
+import {
+  resolveStartedBy,
+  writeLedger,
+  ledgerPersister,
+  keepingLedger,
+  readSweep,
+  joinRun,
+} from "../src/audit-cli.js";
+import { FileAccessLog } from "../src/engine/audit/inventory.js";
+import { UsageMeter, buildUsageReport, DEFAULT_RATE_CARD } from "../src/engine/audit/usage.js";
+import type { AuditStage } from "../src/engine/audit/telemetry.js";
 
 /**
  * resolveStartedBy — who to attribute an audit's subject event to (OGE-2563).
@@ -50,5 +60,238 @@ describe("resolveStartedBy", () => {
   it("resolves to null when git itself is not on PATH", async () => {
     const result = await resolveStartedBy(undefined, { HOME: "/nonexistent", PATH: "" });
     expect(result).toBeNull();
+  });
+});
+
+
+/**
+ * writeLedger — the run's coverage and spend, on disk at every stage boundary.
+ *
+ * The end-only write left a run that threw at the closure gate with no
+ * access-log.json, and the renderer refused a coverage figure of zero. This
+ * is the helper investigateRun now calls on the way out of each stage; the
+ * stages themselves need a model, so what is tested is the write.
+ */
+describe("writeLedger", () => {
+  let scratch: string;
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "ledger-test-"));
+  });
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  const usage = () => buildUsageReport(new UsageMeter(), "some-model", DEFAULT_RATE_CARD);
+
+  it("puts both artifacts on disk where the renderer looks for them", () => {
+    const log = new FileAccessLog();
+    log.record("src/a.ts", "read");
+    const paths = writeLedger(scratch, log, usage());
+
+    expect(paths.accessLogPath).toBe(join(scratch, "access-log.json"));
+    expect(paths.usagePath).toBe(join(scratch, "usage.json"));
+    expect(existsSync(paths.accessLogPath)).toBe(true);
+    expect(existsSync(paths.usagePath)).toBe(true);
+  });
+
+  it("writes a log the next stage can load and continue", () => {
+    const log = new FileAccessLog();
+    log.record("src/a.ts", "read");
+    log.record("src/gone.ts", "missing");
+    writeLedger(scratch, log, usage());
+
+    const reloaded = FileAccessLog.load(scratch);
+    expect(reloaded.opened()).toEqual(log.opened());
+    expect(reloaded.failed()).toEqual(log.failed());
+  });
+
+  // Each call carries the latest state, so whichever stage a run dies in, what
+  // is on disk is what had been read by then.
+  it("replaces the previous write with the current state", () => {
+    const log = new FileAccessLog();
+    log.record("src/a.ts", "read");
+    writeLedger(scratch, log, usage());
+    const before = FileAccessLog.load(scratch).opened().size;
+
+    log.record("src/b.ts", "read");
+    writeLedger(scratch, log, usage());
+    const after = FileAccessLog.load(scratch).opened().size;
+
+    expect(after).toBe(before + 1);
+  });
+
+  it("writes the usage report as given, so a partial total is a partial total", () => {
+    const report = usage();
+    writeLedger(scratch, new FileAccessLog(), report);
+    expect(JSON.parse(readFileSync(join(scratch, "usage.json"), "utf8"))).toEqual(report);
+  });
+
+  it("throws rather than pretending when the directory does not exist", () => {
+    expect(() => writeLedger(join(scratch, "missing"), new FileAccessLog(), usage())).toThrow();
+  });
+});
+
+/**
+ * The ledger survives a stage that throws.
+ *
+ * This is the property the boundary write exists for, and `writeLedger` alone
+ * does not show it: what matters is that the write runs on the way OUT of a
+ * stage that died, and that a failure to write does not replace the error the
+ * stage died of. Exercised here with a fake stage in place of the model.
+ */
+describe("keeping the ledger through a failure", () => {
+  let scratch: string;
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "ledger-keep-"));
+  });
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  const usage = () => buildUsageReport(new UsageMeter(), "some-model", DEFAULT_RATE_CARD);
+  const stageDied = new Error("closure gate: a not-determinable finding has no closure path");
+
+  function persister(out: string, accessLog: FileAccessLog, warnings: Array<[AuditStage, string]>) {
+    return ledgerPersister({ out, accessLog, usage, warn: (stage, message) => warnings.push([stage, message]) });
+  }
+
+  it("puts what was read before the throw on disk, and lets the throw through unchanged", async () => {
+    const accessLog = new FileAccessLog();
+    const warnings: Array<[AuditStage, string]> = [];
+    const stage = async () => {
+      accessLog.record("src/read-before-death.ts", "read");
+      throw stageDied;
+    };
+
+    await expect(keepingLedger("closure", persister(scratch, accessLog, warnings), stage)).rejects.toBe(stageDied);
+
+    expect(FileAccessLog.load(scratch).opened()).toEqual(accessLog.opened());
+    expect(existsSync(join(scratch, "usage.json"))).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  it("returns the stage's value and writes the ledger on success too", async () => {
+    const accessLog = new FileAccessLog();
+    const value = await keepingLedger("verify", persister(scratch, accessLog, []), async () => {
+      accessLog.record("src/a.ts", "read");
+      return 42;
+    });
+    expect(value).toBe(42);
+    expect(FileAccessLog.load(scratch).opened()).toEqual(new Set(["src/a.ts"]));
+  });
+
+  // A throw from the finally would replace the stage's own error, and "could
+  // not write usage.json" is a worse diagnosis than the gate's message.
+  it("reports a failed write as a warning against the stage rather than masking the stage's error", async () => {
+    const notADirectory = join(scratch, "file-not-dir");
+    writeFileSync(notADirectory, "");
+    const warnings: Array<[AuditStage, string]> = [];
+
+    await expect(
+      keepingLedger("investigate", persister(notADirectory, new FileAccessLog(), warnings), async () => {
+        throw stageDied;
+      }),
+    ).rejects.toBe(stageDied);
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.[0]).toBe("investigate");
+    expect(warnings[0]?.[1]).toMatch(/investigate/);
+  });
+
+  it("does not turn a failed write into a failed stage when the stage succeeded", async () => {
+    const notADirectory = join(scratch, "file-not-dir");
+    writeFileSync(notADirectory, "");
+    const warnings: Array<[AuditStage, string]> = [];
+    await expect(
+      keepingLedger("verify", persister(notADirectory, new FileAccessLog(), warnings), async () => "ok"),
+    ).resolves.toBe("ok");
+    expect(warnings.map(([stage]) => stage)).toEqual(["verify"]);
+  });
+});
+
+/**
+ * readSweep: absent and damaged are different answers.
+ *
+ * A damaged sweep.json used to read as "no sweep ran", and the report then
+ * said the coverage figure rested on the investigation alone, for a run whose
+ * sweep had read every file.
+ */
+describe("readSweep", () => {
+  let scratch: string;
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "read-sweep-"));
+  });
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it("is undefined when no sweep ran", () => {
+    expect(readSweep(scratch)).toBeUndefined();
+  });
+
+  it("returns the record when it is one", () => {
+    const record = { dispositions: [], signals: [], summary: [], read: 0, skipped: 0, total: 0, rev: null };
+    writeFileSync(join(scratch, "sweep.json"), JSON.stringify(record));
+    expect(readSweep(scratch)).toEqual(record);
+  });
+
+  it("refuses a damaged record instead of reporting that no sweep ran", () => {
+    writeFileSync(join(scratch, "sweep.json"), "{ not json");
+    expect(() => readSweep(scratch)).toThrow(/sweep\.json exists but could not be read/);
+  });
+
+  it("refuses a file that is not a sweep record", () => {
+    writeFileSync(join(scratch, "sweep.json"), JSON.stringify({ runId: "not-a-sweep" }));
+    expect(() => readSweep(scratch)).toThrow(/not a sweep record/);
+  });
+});
+
+/**
+ * joinRun: a run is one revision.
+ *
+ * An --out reused after a re-acquire at another ref continued the previous
+ * run's ledger and stamped the new rev onto reads made over a tree that no
+ * longer existed. The record pins the rev from the first stage that knows it.
+ */
+describe("joinRun", () => {
+  const path = "/run/run.json";
+  const existing = { runId: "run-1", startedAt: "2026-09-01T00:00:00.000Z" };
+
+  it("starts a run when there is none, carrying the rev when it is known", () => {
+    const known = joinRun(undefined, "abc123", path);
+    const unknown = joinRun(undefined, undefined, path);
+    expect(known.write).toBe(true);
+    expect(known.record.rev).toBe("abc123");
+    expect(unknown.write).toBe(true);
+    expect("rev" in unknown.record).toBe(false);
+    expect(known.record.runId).not.toBe(unknown.record.runId);
+  });
+
+  it("joins an existing run at the same rev without rewriting it", () => {
+    const joined = joinRun({ ...existing, rev: "abc123" }, "abc123", path);
+    expect(joined.write).toBe(false);
+    expect(joined.record.runId).toBe(existing.runId);
+  });
+
+  it("pins a rev onto a record that had none, keeping its id", () => {
+    const pinned = joinRun(existing, "abc123", path);
+    expect(pinned.write).toBe(true);
+    expect(pinned.record).toEqual({ ...existing, rev: "abc123" });
+  });
+
+  it("joins without judgement when the caller does not know the rev", () => {
+    const joined = joinRun({ ...existing, rev: "abc123" }, undefined, path);
+    expect(joined.write).toBe(false);
+    expect(joined.record.rev).toBe("abc123");
+  });
+
+  it("refuses a run over another revision, naming both", () => {
+    expect(() => joinRun({ ...existing, rev: "abc123" }, "def456", path)).toThrow(/abc123.*def456/s);
+    expect(() => joinRun({ ...existing, rev: "abc123" }, null, path)).toThrow(/fresh directory/);
+  });
+
+  it("treats a subject with no history as a rev of its own", () => {
+    expect(joinRun({ ...existing, rev: null }, null, path).write).toBe(false);
+    expect(() => joinRun({ ...existing, rev: null }, "abc123", path)).toThrow();
   });
 });

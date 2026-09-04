@@ -131,6 +131,29 @@ describe("3 — verified has to be earned", () => {
     expect(checkVerifiedIsEarned(verified({ confidence: "inferred", verifiers: 0 }))).toBeNull();
     expect(checkVerifiedIsEarned(notDeterminable({ verifiers: 0 }))).toBeNull();
   });
+
+  // A citation the check had to relocate was written from memory. The verify
+  // stage caps such a claim at inferred as it goes; this is the same rule where
+  // the report is admitted, so a finding that slipped past the first cannot
+  // pass the second.
+  it("fails a verified finding whose citation was moved, however many verifiers agreed", () => {
+    const moved = verified({
+      verifiers: 9,
+      refutations: 0,
+      evidence: [{ path: "src/media/upload.ts", rev: REV, line: 128, quote: "rawToken", corrected: { citedLine: 88, beyondEof: false } }],
+    });
+    expect(checkVerifiedIsEarned(moved)?.code).toBe("unearned-verified");
+    expect(checkVerifiedIsEarned(moved)?.detail).toMatch(/moved/);
+  });
+
+  it("allows a moved citation on an inferred finding, which is what the cap produces", () => {
+    const moved = verified({
+      confidence: "inferred",
+      evidence: [{ path: "src/media/upload.ts", rev: REV, line: 128, quote: "rawToken", corrected: { citedLine: 88, beyondEof: true } }],
+    });
+    expect(checkVerifiedIsEarned(moved)).toBeNull();
+    expect(validateFinding(moved, REV)).toEqual([]);
+  });
 });
 
 describe("4 — citations are against the revision actually audited", () => {

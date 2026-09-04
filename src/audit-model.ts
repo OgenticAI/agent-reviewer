@@ -49,8 +49,10 @@ const MAX_OUTPUT_TOKENS = 8192;
  *
  * A question that runs out of turns is answered from `askForTheAnswer` with the
  * tools withheld, so its citations are recalled rather than read. `checkAnchors`
- * then rejects them as `quote-not-at-line` — correctly, because a line number
- * written from memory is a fabricated citation whatever the intent behind it.
+ * then rejects them as `quote-absent` or `line-beyond-eof`, or moves them as
+ * `line-drift` and caps the claim at inferred — correctly, because a line
+ * number written from memory is not a line number read from the file whatever
+ * the intent behind it.
  * The first run spent US$39.20 over 1,245 model calls and published nothing at
  * all; the second survived 3 claims out of 35.
  *

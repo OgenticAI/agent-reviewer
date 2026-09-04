@@ -63,6 +63,31 @@ export interface EvidenceRef {
   line?: number;
   /** The excerpt relied on. Masked before it reaches a rendered report. */
   quote?: string;
+  /**
+   * Present only when the citation check moved this reference to the line the
+   * quote is actually on. Written by that check and by nothing else; a model
+   * cannot supply it, because `coerceEvidence` keeps only path, line and quote.
+   */
+  corrected?: EvidenceCorrection;
+}
+
+/**
+ * Where a citation was before the citation check moved it.
+ *
+ * A quote found somewhere other than the line the claim gave is real evidence
+ * with a wrong address, and the address is fixed. But a claim whose line
+ * numbers were wrong was written from memory rather than from the file (a
+ * question that exhausted its turn budget answers without its tools), and a
+ * claim written from memory has not earned `verified` whatever the verifiers
+ * make of it. The marker is what lets `checkVerifiedIsEarned` hold that line,
+ * and what lets the report say the citation was moved rather than silently
+ * printing a line the claim never cited.
+ */
+export interface EvidenceCorrection {
+  /** The line the claim cited. */
+  citedLine: number;
+  /** True when that line was past the end of the file. */
+  beyondEof: boolean;
 }
 
 /**
@@ -180,15 +205,32 @@ export const MIN_VERIFIERS = 2;
  *
  * Two independent attempts to break it, and none succeeded. One verifier is an
  * opinion; a single refutation means the claim is live, not settled.
+ *
+ * And every citation is where the claim said it was. A quote the citation
+ * check had to go looking for was cited from memory, and the verifiers judged
+ * a claim whose author had not read the line; that is supported at best, never
+ * re-derived. The verify stage caps such a claim at `inferred` as it goes; this
+ * is the same rule at the point where a report is admitted, so the two cannot
+ * drift apart.
  */
 export function checkVerifiedIsEarned(f: AuditFinding): Violation | null {
   if (f.confidence !== "verified") return null;
-  if (f.verifiers >= MIN_VERIFIERS && f.refutations === 0) return null;
-  return {
-    code: "unearned-verified",
-    findingId: f.id,
-    detail: `verified needs >= ${MIN_VERIFIERS} verifiers and 0 refutations; got ${f.verifiers} and ${f.refutations}`,
-  };
+  if (f.verifiers < MIN_VERIFIERS || f.refutations !== 0) {
+    return {
+      code: "unearned-verified",
+      findingId: f.id,
+      detail: `verified needs >= ${MIN_VERIFIERS} verifiers and 0 refutations; got ${f.verifiers} and ${f.refutations}`,
+    };
+  }
+  const moved = f.evidence.filter((e) => e.corrected !== undefined).length;
+  if (moved > 0) {
+    return {
+      code: "unearned-verified",
+      findingId: f.id,
+      detail: `verified with ${moved} citation(s) moved from the line the claim gave; a citation the check had to relocate supports inferred at most`,
+    };
+  }
+  return null;
 }
 
 /**

@@ -55,6 +55,7 @@ import {
   SWEEP_SOURCE,
   type SweepArtifact,
 } from "./sweep-findings.js";
+import { describeVerification, type VerificationSummary } from "./verify.js";
 
 const run = promisify(execFile);
 
@@ -115,6 +116,14 @@ export interface ReportInput {
    * to show for them were not merged whatever the caller believed.
    */
   sweepMerged?: boolean;
+  /**
+   * What verification kept and threw away, for Coverage.
+   *
+   * Absent on a run that predates the record, in which case the line is
+   * omitted. It cannot be recomputed from `findings`: a rejected claim leaves
+   * no finding, and the count of what was thrown away is the whole point.
+   */
+  verification?: VerificationSummary;
   /** Present only once a named person has released it. Absent means DRAFT. */
   release?: { by: string; at: string };
 }
@@ -288,7 +297,35 @@ function coverageSection(input: ReportInput): string[] {
     );
   }
 
+  lines.push(...verificationSection(input));
+
   return lines;
+}
+
+/**
+ * How many claims verification threw away, and why.
+ *
+ * The same line the operator saw at the terminal, from the same function. A
+ * report that shows only the findings that survived reads as if that were all
+ * the investigation produced; a reader weighing 21 findings should know they
+ * are what was left of 75, and that 54 went for three different reasons, of
+ * which only one is fabrication. Omitted, not zeroed, when the run left no
+ * record. Emitted text carries no em dash.
+ */
+function verificationSection(input: ReportInput): string[] {
+  const { verification } = input;
+  if (!verification) return [];
+  return [
+    "== Claims and verification",
+    "",
+    escapeTypst(
+      `Verification examined ${verification.examined} claim(s); ${describeVerification(verification)}. ` +
+        "A rejected claim does not appear in this report. A claim corrected for line drift " +
+        "does, with its citation moved to the line the quoted text is on and its confidence " +
+        "capped at inferred, because its author cited the line from memory rather than from the file.",
+    ),
+    "",
+  ];
 }
 
 /**
@@ -475,7 +512,16 @@ function findingsSection(findings: AuditFinding[]): string[] {
       for (const ref of finding.evidence) {
         const where =
           ref.line === undefined ? ref.path : `${ref.path}:${ref.line}`;
-        lines.push(`- ${escapeTypst(where)}`);
+        // A moved citation says so. The line printed is where the quoted text
+        // is; the line the claim gave is kept beside it, so a reader who
+        // opens the file at the number sees the text, and a reader weighing
+        // the finding sees that its author did not.
+        const moved = ref.corrected
+          ? ` (the claim cited line ${ref.corrected.citedLine}` +
+            `${ref.corrected.beyondEof ? ", past the end of the file" : ""}; ` +
+            `the quoted text is at line ${ref.line})`
+          : "";
+        lines.push(`- ${escapeTypst(where + moved)}`);
       }
       lines.push("");
     }

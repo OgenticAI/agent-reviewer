@@ -153,6 +153,51 @@ export const CLOSURE_CATALOGUE: readonly ClosureTemplate[] = [
     effortHours: 1,
     blocker: "Client names the repository or path, or adds it to the scope",
   },
+
+  // ── Who calls this, and what does the vendor's code do ───────────────────
+  //
+  // Two more classes, both found the same way as the block above: a run died at
+  // the closure gate with two unmatched access requirements, after the model
+  // spend was already committed. Neither is deployed state and neither is a
+  // repository we were never given, so nothing above them matched.
+  //
+  // The first is the call graph. A verifier can read a function and still not
+  // settle the claim, because the question is whether anyone CHECKS what it
+  // returns. That answer lives at the call sites, which may be elsewhere in the
+  // same tree or in a sibling repository. `implementation` above does not catch
+  // it: the implementation is the one thing the verifier already had.
+  //
+  // The second is third-party behaviour. "Can this SDK call throw?" is a
+  // question about someone else's code, and the answer is published. It is the
+  // only entry here whose blocker is not the client, which is why its wording
+  // names the reviewer instead. The file already takes this position for
+  // absence claims further down: work that is ours does not belong in the
+  // client's ask.
+  //
+  // Both are appended for the same reason as the block above. `find` takes the
+  // first match, so a deployed-state question that happens to contain "calls"
+  // still matches `configuration` or `log` first.
+  {
+    match: ["calls"],
+    access: "The code that calls the named function, wherever it lives in this tree or a sibling repository",
+    method: "Read the call sites and settle whether they handle the case in question; nothing is executed",
+    effortHours: 1,
+    blocker: "Client names the repository or path holding the callers, or adds it to the scope",
+  },
+  {
+    match: ["caller"],
+    access: "The code that calls the named function, wherever it lives in this tree or a sibling repository",
+    method: "Read the call sites and settle whether they handle the case in question; nothing is executed",
+    effortHours: 1,
+    blocker: "Client names the repository or path holding the callers, or adds it to the scope",
+  },
+  {
+    match: ["documentation"],
+    access: "The third-party library's published documentation or source, at the version the project pins",
+    method: "Read the documented behaviour for the named call and settle the claim against it; nothing is executed",
+    effortHours: 0.5,
+    blocker: "Reviewer reads the library's published reference; no client action",
+  },
 ];
 
 /**

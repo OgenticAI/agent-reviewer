@@ -10,7 +10,7 @@
 
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join, relative, sep } from "node:path";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
  * Directories never worth walking. Same list as `tools/repo.ts` uses for the
@@ -57,6 +57,53 @@ const LANGUAGE_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
   [".yaml", "yaml"],
   [".md", "markdown"],
 ]);
+
+/**
+ * What the audit writes about a tree, by file name.
+ *
+ * `--out` defaults to the tree itself, so run.json and inventory.json sit
+ * inside the tree by the time the sweep walks it, and findings.json and the
+ * report do by the time render counts it. Left in, the run audits itself: a
+ * second `audit sweep` over a one-file tree visited four files and raised a
+ * weak-crypto candidate at sweep.json, whose excerpt was the previous run's
+ * own MD5 pattern (OGE-2746). The names are skipped only inside the run
+ * directory, never by name alone: a subject that ships a `findings.json` of
+ * its own somewhere else is still counted, because it is the subject's.
+ */
+export const AUDIT_ARTIFACTS: ReadonlySet<string> = new Set([
+  "run.json",
+  "inventory.json",
+  "sweep.json",
+  "access-log.json",
+  "analyzers.json",
+  "findings.json",
+  "questions.json",
+  "usage.json",
+  "recall.jsonl",
+  "report.typ",
+  "report.pdf",
+]);
+
+export interface WalkOptions {
+  /**
+   * The directory the run's artifacts land in. When it is inside the tree,
+   * `AUDIT_ARTIFACTS` found directly in it are skipped; anywhere else they
+   * are ordinary files.
+   */
+  runDir?: string;
+}
+
+/**
+ * The run directory as a repo-relative POSIX path, or null when it is outside
+ * the tree and there is nothing to skip. `""` is the tree root.
+ */
+export function runDirWithin(root: string, runDir: string | undefined): string | null {
+  if (runDir === undefined) return null;
+  const rel = relative(resolve(root), resolve(runDir));
+  if (rel === "..") return null;
+  if (rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  return rel.split(sep).join("/");
+}
 
 export const UNKNOWN_LANGUAGE = "other";
 
@@ -112,20 +159,26 @@ function readFileFacts(absolutePath: string, bytes: number): FileFacts {
  *
  * Symlinks are recorded by name but never followed: a link out of the tree
  * would count somebody else's code, and a link cycle would not terminate.
+ *
+ * The run's own artifacts are skipped when the run directory is inside the
+ * tree, so the inventory, the sweep and the repo map agree on what the tree
+ * is; see `AUDIT_ARTIFACTS`.
  */
-export function walkTree(root: string): TreeFile[] {
+export function walkTree(root: string, options: WalkOptions = {}): TreeFile[] {
   const files: TreeFile[] = [];
+  const artifactDir = runDirWithin(root, options.runDir);
 
-  const visit = (dir: string): void => {
+  const visit = (dir: string, rel: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       if (entry.isSymbolicLink()) continue;
       const absolute = join(dir, entry.name);
 
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) visit(absolute);
+        if (!SKIP_DIRS.has(entry.name)) visit(absolute, rel === "" ? entry.name : `${rel}/${entry.name}`);
         continue;
       }
       if (!entry.isFile()) continue;
+      if (artifactDir !== null && rel === artifactDir && AUDIT_ARTIFACTS.has(entry.name)) continue;
 
       const { size } = statSync(absolute);
       files.push({
@@ -137,7 +190,7 @@ export function walkTree(root: string): TreeFile[] {
     }
   };
 
-  visit(root);
+  visit(root, "");
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
 

@@ -28,7 +28,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { FileAccessLog } from "./inventory.js";
-import { languageOf, walkTree, type TreeFile } from "./tree.js";
+import { languageOf, walkTree, type TreeFile, type WalkOptions } from "./tree.js";
 
 /** Files above this are recorded as seen and not parsed: minified bundles, vendored blobs. */
 export const MAX_SWEEP_BYTES = 1_500_000;
@@ -350,9 +350,12 @@ export function signalsIn(path: string, source: string): Signal[] {
  * The access log is the same one the investigation writes to, so the existing
  * coverage machinery reports this without change. That is the point: coverage
  * stops being a claim the report makes and becomes a ledger it can show.
+ *
+ * `options.runDir` keeps the run's own artifacts out of the walk. Without it
+ * a re-run sweep read the previous sweep.json and matched its own excerpts.
  */
-export function sweepTree(root: string, log: FileAccessLog): SweepResult {
-  const files: TreeFile[] = walkTree(root);
+export function sweepTree(root: string, log: FileAccessLog, options: WalkOptions = {}): SweepResult {
+  const files: TreeFile[] = walkTree(root, options);
   const dispositions: FileDisposition[] = [];
   const signals: Signal[] = [];
 

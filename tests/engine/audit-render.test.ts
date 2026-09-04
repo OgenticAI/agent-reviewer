@@ -21,6 +21,7 @@ import type { AuditFinding } from "../../src/engine/audit/finding.js";
 import type { VerifiedClaim } from "../../src/engine/audit/verify.js";
 import type { Coverage } from "../../src/engine/audit/inventory.js";
 import type { Subject } from "../../src/engine/audit/acquire.js";
+import type { SweepArtifact } from "../../src/engine/audit/sweep-findings.js";
 
 const REV = "a3f91c2";
 let scratch: string;
@@ -209,6 +210,182 @@ describe("Coverage, generated from the run", () => {
     });
     expect(source).toMatch(/carried no version history/);
     expect(source).toMatch(/no history-derived/);
+  });
+});
+
+describe("what the sweep read, in Coverage", () => {
+  function sweep(over: Partial<SweepArtifact> = {}): SweepArtifact {
+    const dispositions: SweepArtifact["dispositions"] = [
+      { path: "src/a.cs", language: "csharp", bytes: 10, lines: 2, outcome: "read", signals: 2 },
+      { path: "src/b.cs", language: "csharp", bytes: 10, lines: 2, outcome: "read", signals: 0 },
+      { path: "img/l.png", language: "unknown", bytes: 10, lines: 0, outcome: "binary", signals: 0 },
+      { path: "v/big.js", language: "javascript", bytes: 10, lines: 0, outcome: "too-large", signals: 0 },
+    ];
+    return {
+      dispositions,
+      signals: [],
+      read: 2,
+      skipped: 2,
+      total: 4,
+      rev: REV,
+      summary: [
+        { kind: "anonymous-endpoint", signalClass: "defect", count: 3, files: 1 },
+        { kind: "http-endpoint", signalClass: "surface", count: 41, files: 9 },
+      ],
+      ...over,
+    };
+  }
+
+  /** A finding the investigation folded in from the sweep. */
+  const sweepFinding = () =>
+    finding({ id: "sweep-anonymous-endpoint-0badf00d", source: "sweep", confidence: "inferred", verifiers: 0 });
+
+  /** The sweep block alone, so assertions do not wander into older sections. */
+  function sweepBlock(source: string): string {
+    const start = source.indexOf("== Read by the sweep");
+    const end = source.indexOf("== By area", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return source.slice(start, end);
+  }
+
+  it("sits under Coverage, after the caveat and before the area table", () => {
+    const source = renderTypst({ input: input({ sweep: sweep() }), executiveSummary: SUMMARY });
+    const block = sweepBlock(source);
+    expect(source.indexOf("= Coverage")).toBeLessThan(source.indexOf("== Read by the sweep"));
+    expect(source.indexOf("not defect coverage")).toBeLessThan(source.indexOf("== Read by the sweep"));
+    expect(block).toMatch(/4 visited, 2 parsed, 2 not parsed/);
+  });
+
+  // "2 skipped" hides the difference between a vendored bundle and a permission
+  // error; the reasons are printed, and only the ones that occurred.
+  it("names why files were not parsed", () => {
+    const block = sweepBlock(renderTypst({ input: input({ sweep: sweep() }), executiveSummary: SUMMARY }));
+    expect(block).toMatch(/1 too-large/);
+    expect(block).toMatch(/1 binary/);
+    expect(block).not.toMatch(/unreadable/);
+  });
+
+  it("separates defect candidates from surface, defects first", () => {
+    const block = sweepBlock(renderTypst({ input: input({ sweep: sweep() }), executiveSummary: SUMMARY }));
+    const defects = block.indexOf("=== Defect candidates");
+    const surfaceAt = block.indexOf("=== Surface");
+    expect(defects).toBeGreaterThan(-1);
+    expect(surfaceAt).toBeGreaterThan(defects);
+    // Each kind lands in its own table, not the other's.
+    expect(block.slice(defects, surfaceAt)).toMatch(/anonymous-endpoint\], \[3\], \[1\]/);
+    expect(block.slice(defects, surfaceAt)).not.toContain("http-endpoint");
+    expect(block.slice(surfaceAt)).toMatch(/http-endpoint\], \[41\], \[9\]/);
+  });
+
+  it("says when a class matched nothing rather than printing an empty table", () => {
+    const block = sweepBlock(
+      renderTypst({
+        input: input({ sweep: sweep({ summary: [{ kind: "http-endpoint", signalClass: "surface", count: 1, files: 1 }] }) }),
+        executiveSummary: SUMMARY,
+      }),
+    );
+    expect(block).toMatch(/No defect pattern matched/);
+    expect(block).not.toMatch(/No surface pattern matched/);
+  });
+
+  it("tells the reader a candidate is a pattern match, not a reviewed result", () => {
+    const block = sweepBlock(
+      renderTypst({ input: input({ sweep: sweep(), findings: [finding(), sweepFinding()] }), executiveSummary: SUMMARY }),
+    );
+    expect(block).toMatch(/not been read by a reviewer/);
+    expect(block).toMatch(/inferred confidence/);
+  });
+
+  // The merge lives in investigate. A sweep that ran after it left candidates
+  // in sweep.json and nothing in findings.json, and the table used to promise
+  // each one was "under Detailed Findings" regardless. The promise is only
+  // made when a sweep-sourced finding exists to keep it.
+  describe("candidates the investigation never folded in", () => {
+    it("promises Detailed Findings only when a sweep-sourced finding is there to keep it", () => {
+      const withSweep = sweepBlock(
+        renderTypst({ input: input({ sweep: sweep(), findings: [finding(), sweepFinding()] }), executiveSummary: SUMMARY }),
+      );
+      const without = sweepBlock(
+        renderTypst({ input: input({ sweep: sweep(), findings: [finding()] }), executiveSummary: SUMMARY }),
+      );
+      expect(withSweep).toMatch(/appears under Detailed Findings/);
+      expect(withSweep).not.toMatch(/NOT FOLDED/);
+      expect(without).not.toMatch(/appears under Detailed Findings/);
+      expect(without).toMatch(/NOT FOLDED INTO FINDINGS/);
+      expect(without).toMatch(/Re-run the investigation/);
+    });
+
+    it("counts the unfolded candidates from the summary, not the findings", () => {
+      const block = sweepBlock(
+        renderTypst({ input: input({ sweep: sweep(), findings: [finding()] }), executiveSummary: SUMMARY }),
+      );
+      const candidates = sweep().summary.filter((r) => r.signalClass === "defect").reduce((n, r) => n + r.count, 0);
+      expect(block).toContain(`matched ${candidates} defect candidate(s)`);
+    });
+
+    // File order is the caller's evidence, and it wins even when older sweep
+    // findings are present: those came from an earlier sweep, and the newer
+    // sweep.json has candidates nobody merged.
+    it("believes the caller that a newer sweep.json was never merged", () => {
+      const block = sweepBlock(
+        renderTypst({
+          input: input({ sweep: sweep(), sweepMerged: false, findings: [finding(), sweepFinding()] }),
+          executiveSummary: SUMMARY,
+        }),
+      );
+      expect(block).toMatch(/NOT FOLDED INTO FINDINGS/);
+      expect(block).toMatch(/come from an earlier sweep/);
+    });
+
+    it("does not warn when there was nothing to fold in", () => {
+      const block = sweepBlock(
+        renderTypst({
+          input: input({
+            sweep: sweep({ summary: [{ kind: "http-endpoint", signalClass: "surface", count: 1, files: 1 }] }),
+            findings: [finding()],
+          }),
+          executiveSummary: SUMMARY,
+        }),
+      );
+      expect(block).not.toMatch(/NOT FOLDED/);
+    });
+
+    it("still emits no em dash", () => {
+      const block = sweepBlock(
+        renderTypst({ input: input({ sweep: sweep(), sweepMerged: false, findings: [finding()] }), executiveSummary: SUMMARY }),
+      );
+      expect(block).not.toContain("\u2014");
+    });
+  });
+
+  // A partial run must never render as complete. Without the sweep the coverage
+  // figure is the model's alone, and the section has to say so.
+  it("states that no sweep ran rather than omitting the section", () => {
+    const block = sweepBlock(renderTypst({ input: input(), executiveSummary: SUMMARY }));
+    expect(block).toMatch(/No sweep ran/);
+    expect(block).toMatch(/investigation alone/);
+    expect(block).not.toMatch(/=== /);
+  });
+
+  it("emits no em dash in the section, present or absent", () => {
+    for (const over of [{}, { sweep: sweep() }]) {
+      expect(sweepBlock(renderTypst({ input: input(over), executiveSummary: SUMMARY }))).not.toContain("\u2014");
+    }
+  });
+
+  it("names the source of every finding, and flags the sweep's as unreviewed", () => {
+    const source = renderTypst({
+      input: input({
+        findings: [
+          finding(),
+          finding({ id: "sweep-raw-sql-0badf00d", source: "sweep", confidence: "inferred", verifiers: 0 }),
+        ],
+      }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).toMatch(/\*Source:\* audit/);
+    expect(source).toMatch(/\*Source:\* sweep \(pattern match, not reviewed\)/);
   });
 });
 

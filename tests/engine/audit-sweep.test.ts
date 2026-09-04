@@ -52,6 +52,42 @@ describe("visiting every file", () => {
     expect(result.dispositions[0]?.outcome).toBe("too-large");
     expect(result.skipped).toBe(1);
   });
+
+  // With the default --out the run's artifacts land inside the tree. A second
+  // sweep over a one-file tree visited four files and raised a weak-crypto
+  // candidate at sweep.json, whose excerpt was its own MD5 pattern from the
+  // run before. The sweep must not audit itself.
+  describe("the run's own artifacts", () => {
+    const artifact = '{"signals":[{"kind":"weak-crypto","excerpt":"MD5.Create()"}]}';
+
+    it("neither visits nor matches them when the run directory is the tree", () => {
+      write("src/a.cs", "class A {}");
+      write("sweep.json", artifact);
+      write("run.json", '{"runId":"r"}');
+      const log = new FileAccessLog();
+      const result = sweepTree(scratch, log, { runDir: scratch });
+      expect(result.dispositions.map((d) => d.path)).toEqual(["src/a.cs"]);
+      expect(result.signals).toEqual([]);
+      expect(log.opened()).toEqual(new Set(["src/a.cs"]));
+    });
+
+    it("skips them only inside the run directory, so the subject's own files are still counted", () => {
+      write("src/a.cs", "class A {}");
+      write(".audit/sweep.json", artifact);
+      write("fixtures/sweep.json", artifact);
+      const result = sweepTree(scratch, new FileAccessLog(), { runDir: join(scratch, ".audit") });
+      expect(result.dispositions.map((d) => d.path).sort()).toEqual(["fixtures/sweep.json", "src/a.cs"]);
+    });
+
+    it("skips nothing when the run directory is outside the tree", () => {
+      write("src/a.cs", "class A {}");
+      write("sweep.json", artifact);
+      const outside = sweepTree(scratch, new FileAccessLog(), { runDir: join(scratch, "..", "elsewhere") });
+      const unspecified = sweepTree(scratch, new FileAccessLog());
+      expect(outside.total).toBe(unspecified.total);
+      expect(outside.dispositions.map((d) => d.path)).toContain("sweep.json");
+    });
+  });
 });
 
 describe("what the sweep can establish without a model", () => {

@@ -280,7 +280,7 @@ export function renderTargets(input: TargetsInput): string[] {
     lines.push(
       `*Excluded from the walk:* ${input.excluded.join(", ")}`,
       ``,
-      `These directories were never candidates for review. Coverage below is a share ` +
+      `These were never candidates for review. Coverage below is a share ` +
         `of what remained after these were removed, not of everything on disk.`,
       ``,
     );

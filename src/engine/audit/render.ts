@@ -50,6 +50,11 @@ import {
 } from "./maturity.js";
 import type { JobFindings } from "../findings/schema.js";
 import type { Subject } from "./acquire.js";
+import {
+  skippedByReason,
+  SWEEP_SOURCE,
+  type SweepArtifact,
+} from "./sweep-findings.js";
 
 const run = promisify(execFile);
 
@@ -91,6 +96,25 @@ export interface ReportInput {
   questionOutcomes?: QuestionOutcome[];
   /** Directory names the walk skipped, for Targets. */
   excluded?: string[];
+  /**
+   * What the sweep read and matched, for Coverage (OGE-2746).
+   *
+   * Absent when no sweep ran. That is not silently the same document minus a
+   * table: the section says the sweep did not run, because the coverage figure
+   * above it then rests on the investigation alone, which opens files at its
+   * own discretion and has been measured opening 2% of them.
+   */
+  sweep?: SweepArtifact;
+  /**
+   * Whether the investigation folded the sweep's candidates into `findings`.
+   *
+   * The CLI knows from file order: a sweep.json newer than findings.json was
+   * never merged, because the merge happens in investigate and only there.
+   * Absent means "as far as the caller knows, yes"; the section still checks
+   * the findings themselves, since candidates with no sweep-sourced finding
+   * to show for them were not merged whatever the caller believed.
+   */
+  sweepMerged?: boolean;
   /** Present only once a named person has released it. Absent means DRAFT. */
   release?: { by: string; at: string };
 }
@@ -223,6 +247,7 @@ function coverageSection(input: ReportInput): string[] {
     "",
     `#emph[${escapeTypst(COVERAGE_CAVEAT)}]`,
     "",
+    ...sweepSection(input),
     "== By area",
     "",
     "#table(",
@@ -262,6 +287,99 @@ function coverageSection(input: ReportInput): string[] {
       "",
     );
   }
+
+  return lines;
+}
+
+/**
+ * What the sweep read, and what it matched.
+ *
+ * Two tables rather than one, with defect candidates first, because the two
+ * classes mean different things and a reader skimming one table reads them as
+ * the same kind of row. A surface count is a denominator; a defect candidate
+ * is a line under Detailed Findings. The distinction is the whole reason the
+ * sweep separates them, so the report cannot fold them back together.
+ *
+ * The promise that a candidate "appears under Detailed Findings" is only made
+ * when it is true. The merge happens in investigate, so a sweep that ran after
+ * it left candidates in sweep.json and nothing in findings.json; the table
+ * then says so rather than pointing at findings that are not there.
+ *
+ * Emitted text carries no em dash; hyphens and semicolons only.
+ */
+function sweepSection(input: ReportInput): string[] {
+  const { sweep } = input;
+  const lines = ["== Read by the sweep", ""];
+
+  if (!sweep) {
+    lines.push(
+      "No sweep ran for this review. The figure above rests on the investigation alone,",
+      "which opens files at its own discretion; it is a floor on what was read, not a",
+      "statement that the rest was seen.",
+      "",
+    );
+    return lines;
+  }
+
+  const reasons = skippedByReason(sweep.dispositions)
+    .map((entry) => `${entry.count} ${entry.reason}`)
+    .join(", ");
+  const candidates = sweep.summary
+    .filter((row) => row.signalClass === "defect")
+    .reduce((n, row) => n + row.count, 0);
+  const sweepFindings = input.findings.filter((f) => f.source === SWEEP_SOURCE).length;
+  const folded = (input.sweepMerged ?? true) && !(candidates > 0 && sweepFindings === 0);
+
+  lines.push(
+    `The sweep visited every file in the tree: ${sweep.total} visited, ${sweep.read} parsed, ` +
+      `${sweep.skipped} not parsed${reasons ? ` (${escapeTypst(reasons)})` : ""}.`,
+    "",
+    "#emph[" +
+      escapeTypst(
+        "The sweep matches known-bad shapes by pattern over every parsed file. A defect " +
+          "candidate is a line that matches one; " +
+          (folded
+            ? "it appears under Detailed Findings at inferred confidence with source sweep, " +
+              "and has not been read by a reviewer. "
+            : "it has not been read by a reviewer. ") +
+          "A surface count is a measure of size, not a defect.",
+      ) +
+      "]",
+    "",
+  );
+  if (!folded) {
+    lines.push(
+      "#strong[" +
+        escapeTypst(
+          `NOT FOLDED INTO FINDINGS: the sweep matched ${candidates} defect candidate(s) and ` +
+            "the investigation did not merge them, because the sweep ran after it. They are " +
+            "counted below by kind and are not under Detailed Findings" +
+            (sweepFindings > 0
+              ? `; the ${sweepFindings} sweep-sourced finding(s) there come from an earlier sweep`
+              : "") +
+            ". Re-run the investigation stage over this run directory to add them.",
+        ) +
+        "]",
+      "",
+    );
+  }
+
+  const table = (rows: SweepArtifact["summary"]): string[] => [
+    "#table(",
+    "  columns: 3,",
+    "  [*Kind*], [*Matches*], [*Files*],",
+    ...rows.map((row) => `  [${escapeTypst(row.kind)}], [${row.count}], [${row.files}],`),
+    ")",
+    "",
+  ];
+
+  const defects = sweep.summary.filter((row) => row.signalClass === "defect");
+  const surface = sweep.summary.filter((row) => row.signalClass === "surface");
+
+  lines.push("=== Defect candidates", "");
+  lines.push(...(defects.length > 0 ? table(defects) : ["No defect pattern matched.", ""]));
+  lines.push("=== Surface", "");
+  lines.push(...(surface.length > 0 ? table(surface) : ["No surface pattern matched.", ""]));
 
   return lines;
 }
@@ -342,7 +460,11 @@ function findingsSection(findings: AuditFinding[]): string[] {
     lines.push(
       `== ${escapeTypst(finding.id)}`,
       "",
-      `*Severity:* ${escapeTypst(finding.severity)} · *Confidence:* ${escapeTypst(finding.confidence)}`,
+      `*Severity:* ${escapeTypst(finding.severity)} · *Confidence:* ${escapeTypst(finding.confidence)}` +
+        // Named so a reader can tell mechanical detection from reasoning
+        // without opening the JSON. The sweep's rows say so twice: here, and
+        // in the message that ends every one of them.
+        ` · *Source:* ${escapeTypst(finding.source)}${finding.source === SWEEP_SOURCE ? " (pattern match, not reviewed)" : ""}`,
       "",
       escapeTypst(finding.message),
       "",

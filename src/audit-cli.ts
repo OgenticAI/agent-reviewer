@@ -8,7 +8,7 @@
  * the first crack in the seam OGE-2424 just established.
  *
  * Subcommands land here as the stages are built:
- *   acquire → inventory → map → analyze → investigate → verify → closure → render
+ *   acquire → inventory → sweep → map → analyze → investigate → verify → closure → render
  */
 
 import { execFile } from "node:child_process";
@@ -30,6 +30,7 @@ import {
   writeInventory,
   computeCoverage,
   FileAccessLog,
+  TeeAccessLog,
   COVERAGE_CAVEAT,
 } from "./engine/audit/inventory.js";
 import {
@@ -60,7 +61,15 @@ import {
   rateCardFromEnv,
   buildUsageReport,
   renderUsage,
+  type UsageReport,
 } from "./engine/audit/usage.js";
+import { sweepTree } from "./engine/audit/sweep.js";
+import {
+  sweepArtifactFrom,
+  toSweepFindings,
+  mergeSweepFindings,
+  type SweepArtifact,
+} from "./engine/audit/sweep-findings.js";
 import {
   verifyClaims,
   summariseVerification,
@@ -108,6 +117,7 @@ const USAGE = `audit — codebase audit
 
   audit acquire   --from <source> --into <dir> [--ref <branch|tag|sha>] [--replace] [--started-by <email>]
   audit inventory --tree <dir> [--out <dir>]
+  audit sweep     --tree <dir> [--out <dir>]        read every file; no model
   audit analyze   --tree <dir> [--out <dir>]
   audit investigate --tree <dir> [--out <dir>] [--questions <yml>] [--verifiers <n>]
   audit render    --tree <dir> --findings <findings.json> [--out <dir>] [--release-by <email>]
@@ -124,7 +134,9 @@ const USAGE = `audit — codebase audit
                  alongside the subject it resolves; falls back to the
                  machine's own 'git config --global user.email', then omitted
     --tree    an acquired tree to enumerate
-    --out     where inventory.json / findings land (default: beside the tree)
+    --out     where inventory.json / sweep.json / findings land (default: the tree
+              itself; the run's own artifacts there are left out of the walk).
+              One run per directory: a stage over another revision is refused
     --questions  a question set (default: questions/taxonomy.yml)
     --verifiers  independent refutation attempts per claim (minimum 2)
     --findings   an AuditFinding[] produced by the verify + closure stages
@@ -168,29 +180,86 @@ export async function resolveStartedBy(
 }
 
 /**
+ * The subject's revision, when acquire has written one beside the tree.
+ *
+ * Undefined when there is no subject file at all (a scratch tree that was
+ * never acquired), which is different from a subject whose rev is null; the
+ * run record treats only the first as "unknown".
+ */
+function subjectRevIfPresent(tree: string): string | null | undefined {
+  const path = subjectPathFor(tree);
+  if (!existsSync(path)) return undefined;
+  return readArtifact<Subject>(path, "audit acquire").rev;
+}
+
+/** What run.json holds. `rev` is absent on records older than OGE-2746. */
+interface RunRecord {
+  runId: string;
+  startedAt: string;
+  rev?: string | null;
+}
+
+/**
+ * Join the run a directory already holds, or start one.
+ *
+ * A run is one revision. The ledger accumulates across stages in this
+ * directory, so an `--out` reused after a re-acquire at another ref would
+ * continue a log of reads made over a tree that no longer exists, and stamp
+ * the new rev onto them. The record carries the rev from the first stage that
+ * knows it, and a later stage over a different rev is refused rather than
+ * joined: the remedy is a fresh directory, not a merged ledger.
+ *
+ * `rev` undefined means the caller could not know it (no subject beside the
+ * tree yet); null means the subject has no history. Only a known, differing
+ * rev refuses. Exported for the tests; the file I/O stays in `resolveRun`.
+ */
+export function joinRun(
+  existing: RunRecord | undefined,
+  rev: string | null | undefined,
+  path: string,
+): { record: RunRecord; write: boolean } {
+  if (!existing) {
+    return {
+      record: { runId: randomUUID(), startedAt: new Date().toISOString(), ...(rev !== undefined ? { rev } : {}) },
+      write: true,
+    };
+  }
+  if (rev === undefined || existing.rev === undefined) {
+    return rev === undefined ? { record: existing, write: false } : { record: { ...existing, rev }, write: true };
+  }
+  if (existing.rev !== rev) {
+    throw new CliError(
+      `${path} belongs to a run over revision ${existing.rev ?? "(none)"}; this tree is at ${rev ?? "(none)"}.\n` +
+        `The ledger in that directory was built over a different tree. Point --out at a fresh directory ` +
+        `rather than continuing it.`,
+    );
+  }
+  return { record: existing, write: false };
+}
+
+/**
  * The run this invocation belongs to.
  *
  * Each subcommand is a separate process, so the id has to live on disk or the
  * dashboard sees five unrelated runs instead of one audit with five stages.
- * Written by whichever stage runs first; every later stage joins it.
+ * Written by whichever stage runs first; every later stage joins it, and a
+ * stage that knows the subject's revision pins the run to it (`joinRun`).
  */
-function resolveRun(outDir: string): {
+function resolveRun(
+  outDir: string,
+  rev?: string | null,
+): {
   runId: string;
   telemetry: AuditTelemetry;
   note: string;
 } {
   const path = join(outDir, "run.json");
-
-  let runId: string;
-  if (existsSync(path)) {
-    runId = (JSON.parse(readFileSync(path, "utf8")) as { runId: string }).runId;
-  } else {
-    runId = randomUUID();
-    writeFileSync(
-      path,
-      `${JSON.stringify({ runId, startedAt: new Date().toISOString() }, null, 2)}\n`,
-    );
-  }
+  const existing = existsSync(path)
+    ? (JSON.parse(readFileSync(path, "utf8")) as RunRecord)
+    : undefined;
+  const { record, write } = joinRun(existing, rev, path);
+  if (write) writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`);
+  const { runId } = record;
 
   const { sink, note } = sinkFromEnv(runId);
   return {
@@ -316,10 +385,10 @@ async function runInventory(args: string[]): Promise<number> {
   }
 
   const out = flag(args, "--out") ?? tree;
-  const { telemetry, note: telemetryNote } = resolveRun(out);
+  const { telemetry, note: telemetryNote } = resolveRun(out, subjectRevIfPresent(tree));
 
   const inventory = await withStage(telemetry, "inventory", () => {
-    const built = buildInventory(tree);
+    const built = buildInventory(tree, out);
     telemetry.stageFinished("inventory", {
       files: built.files.length,
       lines: built.files.reduce((n, f) => n + f.loc, 0),
@@ -364,7 +433,7 @@ async function runAnalyze(args: string[]): Promise<number> {
   }
 
   const out = flag(args, "--out") ?? tree;
-  const { telemetry, note: telemetryNote } = resolveRun(out);
+  const { telemetry, note: telemetryNote } = resolveRun(out, subjectRevIfPresent(tree));
 
   const jobs = await withStage(telemetry, "analyze", async () => {
     const result = await runAnalyzers(tree);
@@ -406,7 +475,7 @@ async function runAnalyze(args: string[]): Promise<number> {
     );
   }
 
-  const coverage = analyzerLanguageCoverage(buildInventory(tree), jobs);
+  const coverage = analyzerLanguageCoverage(buildInventory(tree, out), jobs);
   lines.push("", "  deterministic reach by language:");
   for (const [language, { files, analyzers }] of Object.entries(coverage)) {
     const ran =
@@ -467,9 +536,254 @@ function readAccessLog(outDir: string): FileAccessLog {
       `${join(outDir, "access-log.json")} not found.\n` +
         `It records which files the run opened, and Coverage is computed from it. ` +
         `Without it the report would claim 0% coverage, so render refuses. ` +
-        `Run the investigation stage over this tree first.`,
+        `Run the sweep or the investigation stage over this tree first.`,
     );
   }
+}
+
+/**
+ * The run's access log, continued rather than replaced.
+ *
+ * One ledger per run. The sweep writes what it read and the investigation
+ * appends what the model opened, and coverage is computed from the union; a
+ * stage that started a fresh log would erase the other's reads and print a
+ * coverage figure for itself alone. `opened()` is a set, so a stage re-run
+ * over the same directory adds records without changing the number.
+ *
+ * A log that exists and cannot be parsed is an error, not an empty log: the
+ * fresh-log fallback exists for a directory nothing has written to yet, and
+ * treating corruption the same way would quietly restart coverage from zero.
+ */
+function openAccessLog(outDir: string): FileAccessLog {
+  if (!existsSync(join(outDir, "access-log.json"))) return new FileAccessLog();
+  try {
+    return FileAccessLog.load(outDir);
+  } catch (error) {
+    throw new CliError(
+      `${join(outDir, "access-log.json")} exists but could not be read: ` +
+        `${error instanceof Error ? error.message : String(error)}\n` +
+        `Coverage accumulates into this file across stages. Fix or remove it rather than ` +
+        `letting a stage start a new one over it.`,
+    );
+  }
+}
+
+/**
+ * Put the run's ledger on disk now: the access log and the usage total.
+ *
+ * Called at every stage boundary of the investigation, not once at the end.
+ * The end-only write is the one that shipped first, and it left a run that
+ * threw at the closure gate with no access-log.json at all; the renderer then
+ * refused, correctly, because the only coverage number it could compute was
+ * zero. Eighteen minutes of verified reading, on disk nowhere. Writing the
+ * latest state at each boundary means whatever stage a run dies in, what it
+ * read and what it spent are already recorded (OGE-2746).
+ *
+ * Exported so the write can be tested without a model. Throws on a failed
+ * write like any other file operation; the caller decides whether that may
+ * mask a stage's own error.
+ */
+export function writeLedger(
+  outDir: string,
+  accessLog: FileAccessLog,
+  usage: UsageReport,
+): { accessLogPath: string; usagePath: string } {
+  const accessLogPath = accessLog.writeTo(outDir);
+  const usagePath = join(outDir, "usage.json");
+  writeFileSync(usagePath, `${JSON.stringify(usage, null, 2)}\n`);
+  return { accessLogPath, usagePath };
+}
+
+/**
+ * The stage-boundary writer of the ledger.
+ *
+ * A write failure is reported through `warn` and swallowed rather than thrown,
+ * because the returned function runs inside `keepingLedger`'s `finally`: a
+ * throw there replaces the error the stage died of, and "could not write
+ * usage.json" is a worse diagnosis than the closure gate's own message. The
+ * final writes at the end of investigate are outside any `finally` and throw
+ * as normal. Exported, with `keepingLedger`, so the property can be tested
+ * without a model.
+ */
+export function ledgerPersister(deps: {
+  out: string;
+  accessLog: FileAccessLog;
+  usage: () => UsageReport;
+  warn: (stage: AuditStage, message: string) => void;
+}): (stage: AuditStage) => void {
+  return (stage) => {
+    try {
+      writeLedger(deps.out, deps.accessLog, deps.usage());
+    } catch (error) {
+      deps.warn(
+        stage,
+        `ledger not written after ${stage}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+}
+
+/**
+ * Run a stage and put the ledger on disk on the way out, returned or thrown.
+ *
+ * The `finally` is the whole point: the stage's result or error passes through
+ * untouched, and whatever it read and spent by the time it stopped is already
+ * recorded. `persist` must not throw; `ledgerPersister` sees to that.
+ */
+export async function keepingLedger<T>(
+  stage: AuditStage,
+  persist: (stage: AuditStage) => void,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } finally {
+    persist(stage);
+  }
+}
+
+/**
+ * Was the sweep on disk before the findings were written, i.e. did the
+ * investigation have it to merge? True when the findings file cannot be
+ * stat'ed: the caller has already read it, so that is a race, not an answer.
+ */
+function sweepPredates(sweepPath: string, findingsPath: string): boolean {
+  try {
+    return statSync(sweepPath).mtimeMs <= statSync(findingsPath).mtimeMs;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * What the sweep read and matched, if it ran.
+ *
+ * Optional for the same reason `readQuestionOutcomes` is: a run that predates
+ * the sweep, or an operator who skipped it, must still render. The report says
+ * the sweep did not run rather than omitting the section, so the coverage
+ * figure above it is read for what it is.
+ *
+ * Absent and damaged are not the same answer. A sweep.json that exists and
+ * cannot be read is a sweep that DID run, and reporting it as "no sweep ran"
+ * is the false statement `openAccessLog` refuses to make about the ledger.
+ * Exported for the tests.
+ */
+export function readSweep(outDir: string): SweepArtifact | undefined {
+  const path = join(outDir, "sweep.json");
+  if (!existsSync(path)) return undefined;
+  let parsed: Partial<SweepArtifact>;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<SweepArtifact>;
+  } catch (error) {
+    throw new CliError(
+      `${path} exists but could not be read: ${error instanceof Error ? error.message : String(error)}\n` +
+        `A sweep ran and its record is damaged. Re-run audit sweep over this directory, or remove ` +
+        `the file if the report is meant to say no sweep ran.`,
+    );
+  }
+  if (!Array.isArray(parsed.signals) || !Array.isArray(parsed.dispositions) || !Array.isArray(parsed.summary)) {
+    throw new CliError(
+      `${path} is not a sweep record: it lacks signals, dispositions or summary.\n` +
+        `Re-run audit sweep over this directory, or remove the file if the report is meant to say no sweep ran.`,
+    );
+  }
+  return parsed as SweepArtifact;
+}
+
+/**
+ * Read every file in the tree, with no model (OGE-2746).
+ *
+ * Runs before the investigation so its reads are already in the ledger when
+ * the model starts; runs after it just as well, since the log is continued
+ * rather than replaced. Surface counts and defect candidates land in
+ * sweep.json, and investigate folds the candidates into findings.json behind
+ * whatever the model settled on the same lines.
+ */
+async function runSweep(args: string[]): Promise<number> {
+  const tree = flag(args, "--tree");
+  if (!tree) {
+    process.stderr.write("sweep needs --tree\n\n" + USAGE);
+    return 2;
+  }
+
+  const out = flag(args, "--out") ?? tree;
+  // Undefined on a tree nothing acquired: the sweep still runs, and the
+  // artifact records that no revision was known rather than inventing one.
+  const rev = subjectRevIfPresent(tree);
+  const { telemetry, note: telemetryNote } = resolveRun(out, rev);
+  const accessLog = openAccessLog(out);
+
+  const sweep = await withStage(telemetry, "sweep", () => {
+    // `runDir` keeps this run's own artifacts out of the walk. With the
+    // default --out they sit inside the tree, and a second sweep once raised a
+    // weak-crypto candidate at sweep.json: the previous run's own excerpt.
+    const result = sweepArtifactFrom(sweepTree(tree, accessLog, { runDir: out }), rev ?? null);
+    telemetry.stageFinished("sweep", {
+      files: result.total,
+      read: result.read,
+      signals: result.signals.length,
+    });
+    return result;
+  });
+
+  const sweepPath = join(out, "sweep.json");
+  writeFileSync(sweepPath, `${JSON.stringify(sweep, null, 2)}\n`);
+  const accessLogPath = accessLog.writeTo(out);
+
+  // The merge into findings.json happens in investigate and only there. A
+  // findings.json that already exists predates this sweep, so its candidates
+  // are in sweep.json and nowhere else until investigate runs again; the
+  // report will say so, and so does this, at the moment it can be acted on.
+  const findingsPredate = existsSync(join(out, "findings.json"));
+  if (findingsPredate)
+    telemetry.log(
+      "sweep",
+      "warn",
+      "findings.json predates this sweep; its candidates are not folded in until investigate runs again",
+    );
+
+  // drain, not flush: this process exits next, and a stage that Mission
+  // Control does not know yet is refused as a whole batch, since every event
+  // in it carries the same stage. What could not be delivered is said here
+  // rather than lost in silence with an exit code of 0.
+  const outstanding = await telemetry.drain();
+
+  const defects = sweep.summary.filter((row) => row.signalClass === "defect");
+  const surface = sweep.summary.filter((row) => row.signalClass === "surface");
+  const lines = [
+    `swept ${tree}`,
+    `  revision   ${rev === undefined ? "unknown; no subject beside the tree" : (rev ?? "none (subject has no history)")}`,
+    `  visited    ${sweep.total.toLocaleString()}`,
+    `  parsed     ${sweep.read.toLocaleString()}`,
+    `  skipped    ${sweep.skipped.toLocaleString()}`,
+    "",
+    `  defect candidates (${defects.reduce((n, r) => n + r.count, 0)}); inferred at most, never verified:`,
+    ...defects.map((r) => `    ${r.kind.padEnd(34)} ${String(r.count).padStart(5)} in ${r.files} file(s)`),
+    "",
+    `  surface (${surface.reduce((n, r) => n + r.count, 0)}); counted, never findings:`,
+    ...surface.map((r) => `    ${r.kind.padEnd(34)} ${String(r.count).padStart(5)} in ${r.files} file(s)`),
+    "",
+    `  sweep      ${sweepPath}`,
+    `  access log ${accessLogPath}`,
+    ...(findingsPredate
+      ? [
+          "  ! findings.json predates this sweep. The candidates above are not in it; re-run",
+          "    audit investigate over this directory to fold them in, or the report will say so.",
+        ]
+      : []),
+    "",
+    `  ${telemetryNote}`,
+    ...(outstanding.events > 0
+      ? [
+          `  ! LOST ${outstanding.events} telemetry event(s) after ${outstanding.failedFlushes} failed flush(es); ` +
+            `the sweep is on disk, but Mission Control did not record this stage. A dashboard that ` +
+            `does not know the sweep stage refuses the whole batch.`,
+        ]
+      : []),
+    "",
+  ];
+  process.stdout.write(lines.join("\n"));
+  return 0;
 }
 
 /**
@@ -504,7 +818,7 @@ async function runInvestigate(args: string[]): Promise<number> {
     flag(args, "--questions") ?? DEFAULT_QUESTIONS,
   );
 
-  const { telemetry, note: telemetryNote } = resolveRun(out);
+  const { telemetry, note: telemetryNote } = resolveRun(out, subject.rev);
   try {
     return await investigateRun({
       args,
@@ -550,11 +864,16 @@ async function investigateRun(ctx: {
     jobs,
     questionSet,
   } = ctx;
-  const inventory = buildInventory(tree);
+  const inventory = buildInventory(tree, out);
 
-  // The log the model writes into, and the only source of the coverage figure.
-  const accessLog = new FileAccessLog();
-  const readTool = makeReadTool({ root: tree, log: accessLog });
+  // The run's ledger, continued from whatever the sweep already recorded, and
+  // the only source of the coverage figure. The model reads through a tee
+  // into it, so "files the model opened" is the model's own count: reported
+  // from the ledger it was the sweep's whole-tree pass, and the dashboard was
+  // told the model had read every file whatever it had actually opened.
+  const accessLog = openAccessLog(out);
+  const modelLog = new TeeAccessLog(accessLog);
+  const readTool = makeReadTool({ root: tree, log: modelLog });
 
   const anthropic = new Anthropic({ apiKey });
   // One meter for the whole run. audit-model.ts is the only place this path
@@ -584,6 +903,15 @@ async function investigateRun(ctx: {
   const reportUsage = (): void => {
     telemetry.usage(buildUsageReport(meter, AUDIT_MODEL, rateCard));
   };
+
+  // The on-disk counterpart of `reportUsage`, plus the access log; see
+  // `ledgerPersister` for why a failed write here warns rather than throws.
+  const persistLedger = ledgerPersister({
+    out,
+    accessLog,
+    usage: () => buildUsageReport(meter, AUDIT_MODEL, rateCard),
+    warn: (stage, message) => telemetry.log(stage, "warn", message),
+  });
   // `log` is not optional in practice, whatever the type says. Without it the
   // model layer falls back to console.error, and the one thing it reports —
   // that a question ran out of tool-loop budget before it answered — goes to a
@@ -620,79 +948,87 @@ async function investigateRun(ctx: {
   );
 
   meter.enter("investigate");
-  const results = await withStage(telemetry, "investigate", async () => {
-    const runs = await investigate({
-      questions: questionSet.questions,
-      model: makeInvestigateModel(modelOptions),
-      repoMapFor: (seedTexts) =>
-        buildRepoMap({
-          files: repoFiles,
-          diffTouchedFiles: [],
-          seedTexts,
-          diffText: "",
-          cache,
-        }).text,
-      analyzerJobs: jobs,
-      subjectRev: subject.rev,
-      log: (message) => telemetry.log("investigate", "info", message),
-      // Cost rides along with progress. A stage that runs for minutes should
-      // show what it is spending while it spends it, not at the end.
-      onProgress: (done, total) => {
-        telemetry.progress("investigate", done, total);
-        reportUsage();
-      },
-    });
-    // One cause reported once, rather than ten identical failures and a stage
-    // that claims to have finished. This throws BEFORE stageFinished so the
-    // stage is recorded as failed, and the message reaches stderr where the
-    // worker can see it and stop retrying something that cannot succeed.
-    const unusable = modelUnusableFrom(runs);
-    if (unusable) throw new CliError(`investigate: ${unusable}`);
+  const results = await keepingLedger("investigate", persistLedger, () =>
+    withStage(telemetry, "investigate", async () => {
+      const runs = await investigate({
+        questions: questionSet.questions,
+        model: makeInvestigateModel(modelOptions),
+        repoMapFor: (seedTexts) =>
+          buildRepoMap({
+            files: repoFiles,
+            diffTouchedFiles: [],
+            seedTexts,
+            diffText: "",
+            cache,
+          }).text,
+        analyzerJobs: jobs,
+        subjectRev: subject.rev,
+        log: (message) => telemetry.log("investigate", "info", message),
+        // Cost rides along with progress. A stage that runs for minutes should
+        // show what it is spending while it spends it, not at the end.
+        onProgress: (done, total) => {
+          telemetry.progress("investigate", done, total);
+          reportUsage();
+        },
+      });
+      // One cause reported once, rather than ten identical failures and a stage
+      // that claims to have finished. This throws BEFORE stageFinished so the
+      // stage is recorded as failed, and the message reaches stderr where the
+      // worker can see it and stop retrying something that cannot succeed.
+      const unusable = modelUnusableFrom(runs);
+      if (unusable) throw new CliError(`investigate: ${unusable}`);
 
-    telemetry.stageFinished("investigate", {
-      questions: runs.length,
-      claims: runs.reduce((n, r) => n + r.claims.length, 0),
-      filesOpened: accessLog.opened().size,
-    });
-    return runs;
-  }, reportUsage);
+      telemetry.stageFinished("investigate", {
+        questions: runs.length,
+        claims: runs.reduce((n, r) => n + r.claims.length, 0),
+        // The model's own reads. The ledger's size is coverage, reported by
+        // render from the union; here it would say the model read the sweep's
+        // files.
+        filesOpened: modelLog.opened().size,
+        filesInLedger: accessLog.opened().size,
+      });
+      return runs;
+    }, reportUsage),
+  );
 
   const investigation = summariseInvestigation(results);
   const claims: Claim[] = results.flatMap((r) => r.claims);
   process.stdout.write(
     `  claims     ${claims.length} kept, ${investigation.dropped} dropped\n` +
-      `  files      ${accessLog.opened().size} opened\n`,
+      `  files      ${modelLog.opened().size} opened by the model; ${accessLog.opened().size} in the run's ledger\n`,
   );
 
   meter.enter("verify");
-  const verification = await withStage(telemetry, "verify", async () => {
-    const result = await verifyClaims({
-      claims,
-      // Rebound so a verifier that runs out of budget is reported against the
-      // verify stage rather than mislabelled as investigate.
-      model: makeVerifierModel({
-        ...modelOptions,
-        log: (message: string) => telemetry.log("verify", "info", message),
-      }),
-      readLine: lineReaderFor(tree),
-      pathKind: pathKindFor(tree),
-      log: (message) => telemetry.log("verify", "info", message),
-      onProgress: (done, total) => {
-        telemetry.progress("verify", done, total);
-        reportUsage();
-        void telemetry.flush();
-      },
-      shouldStop: () => telemetry.cancelRequested(),
-      ...(flag(args, "--verifiers")
-        ? { verifiers: Number(flag(args, "--verifiers")) }
-        : {}),
-    });
-    telemetry.stageFinished("verify", {
-      verified: result.verified.length,
-      rejected: result.rejected.length,
-    });
-    return result;
-  }, reportUsage);
+  const verification = await keepingLedger("verify", persistLedger, () =>
+    withStage(telemetry, "verify", async () => {
+      const result = await verifyClaims({
+        claims,
+        // Rebound so a verifier that runs out of budget is reported against the
+        // verify stage rather than mislabelled as investigate.
+        model: makeVerifierModel({
+          ...modelOptions,
+          log: (message: string) => telemetry.log("verify", "info", message),
+        }),
+        readLine: lineReaderFor(tree),
+        pathKind: pathKindFor(tree),
+        log: (message) => telemetry.log("verify", "info", message),
+        onProgress: (done, total) => {
+          telemetry.progress("verify", done, total);
+          reportUsage();
+          void telemetry.flush();
+        },
+        shouldStop: () => telemetry.cancelRequested(),
+        ...(flag(args, "--verifiers")
+          ? { verifiers: Number(flag(args, "--verifiers")) }
+          : {}),
+      });
+      telemetry.stageFinished("verify", {
+        verified: result.verified.length,
+        rejected: result.rejected.length,
+      });
+      return result;
+    }, reportUsage),
+  );
 
   const summary = summariseVerification(verification);
   process.stdout.write(
@@ -705,27 +1041,64 @@ async function investigateRun(ctx: {
   // is not — the one output this engine must never produce.
   telemetry.throwIfCancelled("closure");
 
-  const closure = await withStage(telemetry, "closure", () => {
-    const result = toAuditFindings({ verified: verification.verified });
-    // Findings go up as they are settled, so the UI can show them long before
-    // the PDF exists.
-    //
-    // BEFORE the closure gate, not after it. The gate throws, and everything
-    // after a throw does not run — so a single not-determinable finding with no
-    // closure path discarded every finding in the run, including the ones that
-    // verified cleanly. An agent-knowledge audit finished investigate 9/9,
-    // verified 83 of 84 claims over 67 minutes, and persisted NOTHING because
-    // the 84th had no closure path. The comment above this loop already said
-    // findings should arrive as they settle; the ordering was what prevented it.
-    //
-    // The gate still fails the run, which is right: a bare "not determinable"
-    // hands the risk back to the client. What changes is that the evidence
-    // survives the refusal. A failed run's findings are already treated as
-    // partial downstream, and its report is not released.
-    settleClosure(result, (found) => telemetry.finding(found));
-    telemetry.stageFinished("closure", { findings: result.findings.length });
-    return result;
-  }, reportUsage);
+  // The gate inside throws on purpose, and before the ledger was kept on the
+  // way out that throw was the last thing the run did: no access-log.json, no
+  // usage.json, and a renderer that refused a coverage figure of zero. The
+  // evidence now survives the refusal the same way the findings do.
+  const closure = await keepingLedger("closure", persistLedger, () =>
+    withStage(telemetry, "closure", () => {
+      const result = toAuditFindings({ verified: verification.verified });
+      // Findings go up as they are settled, so the UI can show them long before
+      // the PDF exists.
+      //
+      // BEFORE the closure gate, not after it. The gate throws, and everything
+      // after a throw does not run — so a single not-determinable finding with no
+      // closure path discarded every finding in the run, including the ones that
+      // verified cleanly. An agent-knowledge audit finished investigate 9/9,
+      // verified 83 of 84 claims over 67 minutes, and persisted NOTHING because
+      // the 84th had no closure path. The comment above this loop already said
+      // findings should arrive as they settle; the ordering was what prevented it.
+      //
+      // The gate still fails the run, which is right: a bare "not determinable"
+      // hands the risk back to the client. What changes is that the evidence
+      // survives the refusal. A failed run's findings are already treated as
+      // partial downstream, and its report is not released.
+      settleClosure(result, (found) => telemetry.finding(found));
+      telemetry.stageFinished("closure", { findings: result.findings.length });
+      return result;
+    }, reportUsage),
+  );
+
+  // The sweep's defect candidates, behind the model's findings (OGE-2746).
+  //
+  // A model finding on a line the sweep also matched wins: it has been read,
+  // verified and closed, and the pattern that would have pointed at the same
+  // line adds nothing but a second, weaker entry. Everything else the sweep
+  // matched is added at `inferred` with `source: sweep`, and sent up like any
+  // other finding so the dashboard and findings.json agree.
+  const sweep = readSweep(out);
+  // The rev on the evidence is the one the excerpts were READ at, taken from
+  // the artifact. A sweep over another revision is refused rather than
+  // re-stamped: its lines and excerpts describe a tree that is not this one.
+  if (sweep && sweep.rev !== subject.rev)
+    throw new CliError(
+      `${join(out, "sweep.json")} was swept at revision ${sweep.rev ?? "(none)"}; this tree is at ` +
+        `${subject.rev ?? "(none)"}. Its excerpts and line numbers describe a different tree. ` +
+        `Re-run audit sweep over this tree before investigating.`,
+    );
+  const merged = sweep
+    ? mergeSweepFindings(closure.findings, toSweepFindings(sweep.signals, sweep.rev))
+    : { findings: closure.findings, added: 0, displaced: 0 };
+  if (sweep) {
+    for (const found of merged.findings.slice(closure.findings.length)) telemetry.finding(found);
+    telemetry.log(
+      "closure",
+      "info",
+      `sweep: ${merged.added} candidate(s) added at inferred, ${merged.displaced} on lines the model already settled`,
+    );
+  } else {
+    telemetry.log("closure", "warn", "no sweep.json in the run directory; findings are the model's alone");
+  }
 
   // What the investigation managed to ask, persisted for the maturity table.
   // A question that ran and found nothing is evidence; a question that never
@@ -752,15 +1125,18 @@ async function investigateRun(ctx: {
   // that spent eighteen minutes and then died at closure recorded no cost at
   // all, and the page showed nothing, which reads as free rather than unknown.
   //
-  // What remains here is worth keeping — usage.json on disk, and one last
-  // authoritative total for a run that completed.
+  // Nor is this any longer what puts usage.json on disk: `persistLedger` does
+  // that at every stage boundary, alongside the access log, for the same
+  // reason (OGE-2746). What remains here is one last authoritative total for
+  // a run that completed, written outside any `finally` so a failure to write
+  // it fails the run rather than being logged and passed over.
   const usage = buildUsageReport(meter, AUDIT_MODEL, rateCard);
   writeFileSync(join(out, "usage.json"), `${JSON.stringify(usage, null, 2)}\n`);
   telemetry.usage(usage);
 
   accessLog.writeTo(out);
   const findingsPath = join(out, "findings.json");
-  writeFileSync(findingsPath, `${JSON.stringify(closure.findings, null, 2)}\n`);
+  writeFileSync(findingsPath, `${JSON.stringify(merged.findings, null, 2)}\n`);
 
   // drain, not flush: this is the last chance these events have. A single
   // flush that lands in one of the box's outbound stalls loses closure and
@@ -774,10 +1150,13 @@ async function investigateRun(ctx: {
           `the audit is complete and its report is on disk, but Mission Control did not receive ` +
           `this run's findings\n`
         : "") +
-      `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n\n` +
+      `  access log ${join(out, "access-log.json")}\n  findings   ${findingsPath}\n` +
+      (sweep
+        ? `  sweep      ${merged.added} candidate(s) added, ${merged.displaced} displaced by a model finding on the same line\n\n`
+        : "  sweep      NOT RUN; findings are the model's alone\n\n") +
       renderUsage(usage, subject.loc).join("\n") +
       "\n\n" +
-      renderAsk(consolidateAsk(closure.findings)).join("\n") +
+      renderAsk(consolidateAsk(merged.findings)).join("\n") +
       "\n\n",
   );
   return 0;
@@ -1028,12 +1407,24 @@ async function runRender(args: string[]): Promise<number> {
     "audit analyze",
   );
 
-  const inventory = buildInventory(tree);
+  const inventory = buildInventory(tree, out);
   const accessLog = readAccessLog(out);
   const questionOutcomes = readQuestionOutcomes(out);
+  const sweep = readSweep(out);
+  // The merge lives in investigate, so a sweep.json written after the
+  // findings holds candidates the findings do not. File order is the record
+  // of that; the section says so rather than pointing at findings that are
+  // not there.
+  const sweepMerged = sweep ? sweepPredates(join(out, "sweep.json"), findingsPath) : true;
   const releaseBy = flag(args, "--release-by");
 
-  const { telemetry: renderTelemetry } = resolveRun(out);
+  const { telemetry: renderTelemetry } = resolveRun(out, subject.rev);
+  if (sweep && !sweepMerged)
+    renderTelemetry.log(
+      "render",
+      "warn",
+      "sweep.json is newer than findings.json; its candidates were not folded into the findings",
+    );
   const result = await withStage(renderTelemetry, "render", async () => {
     const rendered = await renderReport({
       input: {
@@ -1048,6 +1439,9 @@ async function runRender(args: string[]): Promise<number> {
         // Absent when the run record is missing: the renderer omits the maturity
         // table rather than rating every category on nothing.
         ...(questionOutcomes ? { questionOutcomes } : {}),
+        // Absent when no sweep ran: the section then says so, rather than the
+        // coverage figure passing as whole-tree when it is the model's alone.
+        ...(sweep ? { sweep, sweepMerged } : {}),
         excluded: inventory.excluded,
         ...(releaseBy
           ? {
@@ -1098,6 +1492,9 @@ async function runRender(args: string[]): Promise<number> {
 
   const lines = [
     `rendered ${findings.length} finding(s)`,
+    ...(sweep && !sweepMerged
+      ? ["  ! sweep.json is newer than the findings; its candidates are listed in the report as NOT folded in"]
+      : []),
     `  source     ${result.typstPath}`,
     result.pdfPath
       ? `  pdf        ${result.pdfPath}`
@@ -1125,6 +1522,7 @@ async function main(): Promise<number> {
   }
   if (command === "acquire") return runAcquire(args.slice(1));
   if (command === "inventory") return runInventory(args.slice(1));
+  if (command === "sweep") return runSweep(args.slice(1));
   if (command === "analyze") return runAnalyze(args.slice(1));
   if (command === "investigate") return runInvestigate(args.slice(1));
   if (command === "inject") return runInject(args.slice(1));

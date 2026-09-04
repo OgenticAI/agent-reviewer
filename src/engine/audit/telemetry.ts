@@ -62,6 +62,12 @@ export class RunCancelled extends Error {
 export const AUDIT_STAGES = [
   "acquire",
   "inventory",
+  // Between inventory and the model stages: it reads every file the inventory
+  // counted, with no model, and writes the same access log investigate then
+  // appends to (OGE-2746). Mission Control keeps a mirror of this list and
+  // drops any stage it does not know, so adding one here without adding it
+  // there makes the sweep invisible on the dashboard rather than wrong.
+  "sweep",
   "map",
   "analyze",
   "investigate",
@@ -530,6 +536,12 @@ export class AuditTelemetry {
     baseMs = 500,
     maxDelayMs = 30_000,
   ): Promise<{ events: number; failedFlushes: number }> {
+    // Nothing to deliver to. Events still queue with telemetry off (the
+    // in-memory record is what tests read), so without this the loop slept
+    // through every backoff, about three minutes, and then reported the run's
+    // own events as LOST. Found the first time a local `audit sweep` drained
+    // (OGE-2746); investigate had the same stall at its end.
+    if (!this.sink) return { events: 0, failedFlushes: 0 };
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       await this.flush();
       if (this.pending.length === 0) break;
@@ -541,8 +553,13 @@ export class AuditTelemetry {
     return this.outstanding();
   }
 
-  /** What flush could not deliver, for the operator's end-of-run summary. */
+  /**
+   * What flush could not deliver, for the operator's end-of-run summary.
+   * Nothing, with telemetry off: an event nobody was going to send is not one
+   * that was lost.
+   */
   outstanding(): { events: number; failedFlushes: number } {
+    if (!this.sink) return { events: 0, failedFlushes: 0 };
     return { events: this.pending.length, failedFlushes: this.undelivered };
   }
 }

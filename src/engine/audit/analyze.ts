@@ -28,6 +28,7 @@ import type { Adapter } from "../findings/adapters.js";
 import type { JobFindings } from "../findings/schema.js";
 import { gitleaksAdapter, npmAuditAdapter, osvScannerAdapter, semgrepAdapter } from "./analyzers.js";
 import { describeUnscanned, scanDependencyManifests } from "./dependencies.js";
+import { languageOf, walkTree } from "./tree.js";
 import type { Inventory } from "./inventory.js";
 
 const run = promisify(execFile);
@@ -77,9 +78,21 @@ export const SEMGREP: AnalyzerSpec = {
   command: "semgrep",
   args: (root) => [
     "--json",
-    // OUR ruleset, named explicitly. Never `--config auto`, which resolves
+    // OUR rulesets, named explicitly. Never `--config auto`, which resolves
     // against the registry at run time, and never a path inside the target.
+    //
+    // p/security-audit alone is not enough, and the gap is not small. Measured
+    // on a 2,177-file tree that is 42% C#: p/security-audit returned ZERO
+    // findings with zero parse errors, while p/csharp returned 7 on the same
+    // tree, including five instances of a token-expiry rule that corroborated a
+    // high-severity finding established by hand. The pack was reading the files
+    // and had nothing to say about them.
+    //
+    // So the language packs are added from what the tree actually contains. A
+    // pack for a language that is absent costs a registry fetch and finds
+    // nothing, which is why this is computed rather than fixed.
     "--config=p/security-audit",
+    ...languagePacks(root).map((pack) => `--config=${pack}`),
     // Stop semgrep honouring a .semgrepignore shipped inside the tree: a
     // codebase that excludes itself from review would scan clean by its own
     // instruction, which is the audit equivalent of marking your own homework.
@@ -93,8 +106,36 @@ export const SEMGREP: AnalyzerSpec = {
   // semgrep's registry rulesets span many languages, but not evenly. What this
   // claims is only that it CAN produce findings for these; how well is a
   // question the report answers with its own numbers, not with this list.
+  //
+  // csharp earns its place here only because `languagePacks` now adds p/csharp.
+  // Under p/security-audit alone it produced nothing on a 900-file C# tree, and
+  // listing it then would have reported those files as deterministically
+  // covered by a pack that had no rules for them.
   reach: ["typescript", "javascript", "python", "go", "java", "ruby", "php", "csharp"],
 };
+
+/**
+ * Registry packs for the languages this tree actually contains.
+ *
+ * Keyed off the tree rather than fixed, so a repository gets the rules for what
+ * it is written in. The general pack still runs alongside these.
+ */
+export function languagePacks(root: string): string[] {
+  const byLanguage = new Set<string>();
+  for (const file of walkTree(root)) byLanguage.add(languageOf(file.path));
+  const packs: string[] = [];
+  const add = (language: string, pack: string) => {
+    if (byLanguage.has(language)) packs.push(pack);
+  };
+  add("csharp", "p/csharp");
+  add("java", "p/java");
+  add("python", "p/python");
+  add("go", "p/golang");
+  add("ruby", "p/ruby");
+  add("php", "p/php");
+  if (byLanguage.has("typescript") || byLanguage.has("javascript")) packs.push("p/javascript");
+  return packs;
+}
 
 export const SECRET_SCAN: AnalyzerSpec = {
   job: "secret-scan",

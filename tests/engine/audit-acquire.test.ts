@@ -284,6 +284,99 @@ describe("acquiring by clone", () => {
   });
 });
 
+describe("pinning a ref", () => {
+  // A repository whose default branch is NOT the branch that deploys. This is
+  // the shape that produced the incident: `develop` is served by default and
+  // months behind `production`, so an unpinned acquire reads the dormant one
+  // and the subject gave no hint of it.
+  function twoBranchOrigin(): { origin: string; developHead: string; productionHead: string } {
+    const origin = join(scratch, "two-branch");
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "-C", origin, ...args])
+        .toString()
+        .trim();
+    plantCodebase(origin);
+    execFileSync("git", ["init", "--quiet", "-b", "develop"], { cwd: origin });
+    git("add", "-A");
+    git("commit", "-qm", "on develop");
+    const developHead = git("rev-parse", "HEAD");
+    git("checkout", "--quiet", "-b", "production");
+    writeFileSync(join(origin, "shipped.ts"), "export const shipped = true;\n");
+    git("add", "-A");
+    git("commit", "-qm", "on production");
+    const productionHead = git("rev-parse", "HEAD");
+    git("tag", "v1.0.0");
+    // Leave the default branch selected, so a plain clone serves develop.
+    git("checkout", "--quiet", "develop");
+    return { origin, developHead, productionHead };
+  }
+
+  it("reads the ref that was asked for, not the default branch", async () => {
+    const { origin, productionHead } = twoBranchOrigin();
+    const subject = await acquire({ from: origin, into: join(scratch, "w1"), ref: "production" });
+    expect(subject.rev).toBe(productionHead);
+    expect(subject.requestedRef).toBe("production");
+  });
+
+  it.each(["production", "v1.0.0"])("resolves a branch or a tag: %s", async (ref, index) => {
+    const { origin, productionHead } = twoBranchOrigin();
+    const subject = await acquire({ from: origin, into: join(scratch, `w-ref-${index}`), ref });
+    expect(subject.rev).toBe(productionHead);
+  });
+
+  it("resolves a bare commit sha", async () => {
+    const { origin, developHead } = twoBranchOrigin();
+    const subject = await acquire({ from: origin, into: join(scratch, "w2"), ref: developHead });
+    expect(subject.rev).toBe(developHead);
+    expect(subject.requestedRef).toBe(developHead);
+  });
+
+  // The requested ref and the resolved sha are kept apart on purpose: a sha
+  // alone does not say which branch it came from, and that ambiguity is what
+  // made a review of a stale branch indistinguishable from a review of the
+  // deployed one.
+  it("records what was asked for beside what it resolved to", async () => {
+    const { origin, productionHead } = twoBranchOrigin();
+    const subject = await acquire({ from: origin, into: join(scratch, "w3"), ref: "production" });
+    expect(subject.requestedRef).toBe("production");
+    expect(subject.rev).toBe(productionHead);
+    expect(subject.rev).not.toBe(subject.requestedRef);
+    expect(subject.revProvenance).toContain("production");
+  });
+
+  // The half that matters more than the flag. An operator who forgets --ref
+  // must still end up with a subject that says which branch was read.
+  it("names the default branch when no ref was given", async () => {
+    const { origin, developHead } = twoBranchOrigin();
+    const subject = await acquire({ from: origin, into: join(scratch, "w4") });
+    expect(subject.rev).toBe(developHead);
+    expect(subject.requestedRef).toBeNull();
+    expect(subject.defaultBranch).toBe("develop");
+    expect(subject.revProvenance).toMatch(/default branch/i);
+    expect(subject.revProvenance).toContain("develop");
+  });
+
+  // Falling back to the default on a typo would reproduce the original failure
+  // exactly: a review of something other than what was asked for, with nothing
+  // saying so.
+  it("fails naming the ref rather than falling back to the default", async () => {
+    const { origin } = twoBranchOrigin();
+    await expect(
+      acquire({ from: origin, into: join(scratch, "w5"), ref: "no-such-branch" }),
+    ).rejects.toThrow(/no-such-branch/);
+  });
+
+  it("refuses a ref on an archive, which has no history to pin", async () => {
+    const staging = join(scratch, "arch-staging");
+    plantCodebase(join(staging, "repo"));
+    const archive = join(scratch, "repo.tar.gz");
+    execFileSync("tar", ["-czf", archive, "repo"], { cwd: staging });
+    await expect(
+      acquire({ from: archive, into: join(scratch, "w6"), ref: "production" }),
+    ).rejects.toThrow(/archive/i);
+  });
+});
+
 describe("clone failures read as instructions, not crashes", () => {
   const url = "https://bitbucket.org/acme/acme-web-app-v3";
 

@@ -38,6 +38,8 @@ function subject(over: Partial<Subject> = {}): Subject {
     origin: "bitbucket.org/acme/acme-web-app",
     name: "acme-web-app",
     rev: REV,
+    requestedRef: "main",
+    defaultBranch: "main",
     revProvenance: "clone — full history available",
     acquiredAt: "2026-08-24T12:00:00.000Z",
     files: 1000,
@@ -91,6 +93,38 @@ const SUMMARY = "This review read source only, and answered ten agreed questions
 const noMask = (text: string) => text;
 
 /* ── Escaping ─────────────────────────────────────────────────────────────── */
+
+describe("which branch the report says it read", () => {
+  // A commit alone does not say which branch it came from. The report has to
+  // carry that, and carry it loudest when nobody chose it.
+  it("names the branch when one was pinned", () => {
+    const out = renderTypst({
+      input: input({ subject: subject({ requestedRef: "production" }) }),
+      executiveSummary: SUMMARY,
+    });
+    expect(out).toMatch(/\*Branch:\*\s+production/);
+  });
+
+  it("says the default branch was taken when none was pinned", () => {
+    const out = renderTypst({
+      input: input({ subject: subject({ requestedRef: null, defaultBranch: "develop" }) }),
+      executiveSummary: SUMMARY,
+    });
+    expect(out).toMatch(/\*Branch:\*/);
+    expect(out).toContain("develop");
+    expect(out).toMatch(/no branch was specified/i);
+  });
+
+  // An older subject predates these fields entirely. "Not recorded" is honest;
+  // implying a branch was confirmed would not be.
+  it("admits it does not know on a subject that predates the field", () => {
+    const out = renderTypst({
+      input: input({ subject: subject({ requestedRef: null, defaultBranch: null }) }),
+      executiveSummary: SUMMARY,
+    });
+    expect(out).toMatch(/not recorded for this run/i);
+  });
+});
 
 describe("escaping text that came out of a client codebase", () => {
   // Typst reads these as syntax. A finding quoting an attribute or a shell

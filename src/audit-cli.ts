@@ -106,7 +106,7 @@ import { maskSecrets } from "./engine/tools/sanitize.js";
 
 const USAGE = `audit — codebase audit
 
-  audit acquire   --from <source> --into <dir> [--replace] [--started-by <email>]
+  audit acquire   --from <source> --into <dir> [--ref <branch|tag|sha>] [--replace] [--started-by <email>]
   audit inventory --tree <dir> [--out <dir>]
   audit analyze   --tree <dir> [--out <dir>]
   audit investigate --tree <dir> [--out <dir>] [--questions <yml>] [--verifiers <n>]
@@ -116,6 +116,9 @@ const USAGE = `audit — codebase audit
 
     <source>  a clone URL, host/owner/repo, a local path, or a .zip / .tar.gz
     --into    where the tree lands; refuses an existing directory
+    --ref     the branch, tag or commit to read. WITHOUT this the remote's
+              default branch is taken, which is frequently not the branch that
+              deploys; either way the subject records which was read
     --replace overwrite an existing directory instead of refusing
     --started-by who is running this, reported once to Mission Control
                  alongside the subject it resolves; falls back to the
@@ -257,6 +260,7 @@ async function runAcquire(args: string[]): Promise<number> {
     acquire({
       from,
       into,
+      ...(flag(args, "--ref") ? { ref: flag(args, "--ref") as string } : {}),
       replace: args.includes("--replace"),
     }).then((acquired) => {
       acquireTelemetry.stageFinished("acquire", {
@@ -286,6 +290,14 @@ async function runAcquire(args: string[]): Promise<number> {
       `acquired ${subject.origin}`,
       `  kind       ${subject.kind}`,
       `  revision   ${revLine}`,
+      // Named on its own line, and loudest when nothing was pinned. An operator
+      // who reads "ref  default branch (develop) — CONFIRM this is what deploys"
+      // has been told the thing that, unsaid, took a client meeting to surface.
+      `  ref        ${
+        subject.requestedRef
+          ? subject.requestedRef
+          : `default branch${subject.defaultBranch ? ` (${subject.defaultBranch})` : ""} — no --ref given; confirm this is what deploys`
+      }`,
       `  files      ${subject.files.toLocaleString()}`,
       `  lines      ${subject.loc.toLocaleString()}`,
       `  languages  ${languages || "(none detected)"}`,

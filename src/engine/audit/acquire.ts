@@ -39,6 +39,22 @@ export interface Subject extends TreeSummary {
   name: string;
   /** The pinned revision. `null` when the source carried no history. */
   rev: string | null;
+  /**
+   * What the operator ASKED for, kept apart from what it resolved to.
+   *
+   * A SHA alone does not say which branch it came from, and that ambiguity is
+   * what let a review of a stale default branch look identical to a review of
+   * the deploying one. `null` means no ref was named, in which case
+   * `defaultBranch` records what was taken instead.
+   */
+  requestedRef: string | null;
+  /**
+   * The branch the remote serves by default, recorded whether or not it was
+   * used. When `requestedRef` is null this is the branch that WAS read, and
+   * saying so is the whole point: a silent default is invisible until a client
+   * finds it.
+   */
+  defaultBranch: string | null;
   /** Why `rev` is what it is. Never blank — a missing revision is a fact to state. */
   revProvenance: string;
   acquiredAt: string;
@@ -231,7 +247,25 @@ export function describeCloneFailure(url: string, stderr: string): string {
   return `git clone failed for ${url}: ${stderr.trim().split("\n").slice(-2).join(" ")}`;
 }
 
-async function cloneRepository(from: string, into: string): Promise<string> {
+interface CloneResult {
+  /** The commit the tree is actually at. */
+  rev: string;
+  /** The branch the remote serves by default, before any checkout. */
+  defaultBranch: string | null;
+}
+
+/**
+ * Clone, then move to the requested ref if one was named.
+ *
+ * A plain `git clone` fetches every branch and tag, so one `checkout` covers a
+ * branch, a tag and any commit in history without a second network call and
+ * without the server needing to allow fetch-by-SHA.
+ *
+ * The checkout failure is deliberately NOT a fallback to the default branch.
+ * Silently reading something other than what was asked for is the failure this
+ * whole flag exists to prevent, so an unresolvable ref stops the run.
+ */
+async function cloneRepository(from: string, into: string, ref?: string): Promise<CloneResult> {
   const url = normaliseCloneUrl(from);
   try {
     await run("git", ["clone", "--quiet", url, into], { timeout: ACQUIRE_TIMEOUT_MS });
@@ -240,15 +274,44 @@ async function cloneRepository(from: string, into: string): Promise<string> {
     throw new AcquireError(describeCloneFailure(url, stderr));
   }
 
+  // Read before any checkout, so it records what the remote serves rather than
+  // wherever we have just moved to.
+  let defaultBranch: string | null = null;
+  try {
+    const head = await run("git", ["-C", into, "rev-parse", "--abbrev-ref", "HEAD"], {
+      timeout: ACQUIRE_TIMEOUT_MS,
+    });
+    defaultBranch = head.stdout.trim() || null;
+  } catch {
+    defaultBranch = null;
+  }
+
+  if (ref) {
+    try {
+      await run("git", ["-C", into, "checkout", "--quiet", ref], { timeout: ACQUIRE_TIMEOUT_MS });
+    } catch {
+      throw new AcquireError(
+        `${url} was cloned, but the ref "${ref}" does not exist in it. ` +
+          `Check the branch, tag or commit, or omit --ref to read the default branch` +
+          (defaultBranch ? ` (${defaultBranch}).` : "."),
+      );
+    }
+  }
+
   const { stdout } = await run("git", ["-C", into, "rev-parse", "HEAD"], {
     timeout: ACQUIRE_TIMEOUT_MS,
   });
-  return stdout.trim();
+  return { rev: stdout.trim(), defaultBranch };
 }
 
 /* ── Entry point ──────────────────────────────────────────────────────────── */
 
 export interface AcquireOptions {
+  /**
+   * The branch, tag or commit to read. Omitted means the remote's default
+   * branch, which is recorded rather than assumed.
+   */
+  ref?: string;
   /** A clone URL, `host/owner/repo`, or a path to a `.zip` / `.tar.gz`. */
   from: string;
   /** Where the tree lands. Must not already exist unless `replace` is set. */
@@ -270,14 +333,29 @@ export async function acquire(options: AcquireOptions): Promise<Subject> {
 
   const archive = isArchivePath(options.from);
   let rev: string | null = null;
+  let defaultBranch: string | null = null;
   let revProvenance: string;
 
   if (archive) {
     await extractArchive(resolve(options.from), into);
     revProvenance = "none — archive carries no history; re-acquire by clone for history signals";
+    if (options.ref) {
+      throw new AcquireError(
+        `--ref ${options.ref} was given, but ${options.from} is an archive and carries no history. ` +
+          `Acquire by clone to pin a ref.`,
+      );
+    }
   } else {
-    rev = await cloneRepository(options.from, into);
-    revProvenance = "clone — full history available";
+    const cloned = await cloneRepository(options.from, into, options.ref);
+    rev = cloned.rev;
+    defaultBranch = cloned.defaultBranch;
+    // Which branch was read is part of the provenance, not a detail. An
+    // unpinned acquire that stays silent about the default is how a review of a
+    // dormant branch reads exactly like a review of the deployed one.
+    revProvenance = options.ref
+      ? `clone — full history available; pinned to the requested ref "${options.ref}"`
+      : `clone — full history available; NO ref was requested, so the remote's default branch` +
+        `${defaultBranch ? ` ("${defaultBranch}")` : ""} was read. Confirm it is the branch that deploys.`;
   }
 
   const files = walkTree(into);
@@ -286,6 +364,8 @@ export async function acquire(options: AcquireOptions): Promise<Subject> {
     origin: options.from,
     name: basename(into),
     rev,
+    requestedRef: options.ref ?? null,
+    defaultBranch,
     revProvenance,
     acquiredAt: new Date().toISOString(),
     ...summariseTree(files),

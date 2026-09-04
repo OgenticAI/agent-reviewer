@@ -96,6 +96,20 @@ export interface ReportInput {
 }
 
 /**
+ * Which branch the revision came from, and whether anyone chose it.
+ *
+ * A missing field covers subjects written before these existed: an older run
+ * genuinely does not know, and saying so beats implying a branch was confirmed.
+ */
+function branchLine(subject: Subject): string {
+  if (subject.requestedRef) return subject.requestedRef;
+  if (subject.defaultBranch) {
+    return `${subject.defaultBranch} (the repository's default; no branch was specified for this review)`;
+  }
+  return "not recorded for this run";
+}
+
+/**
  * What to call the subject on the cover.
  *
  * `origin` is whatever was handed to acquire. For a remote clone that is a
@@ -417,6 +431,12 @@ export function renderTypst(options: RenderOptions): string {
     `*Subject:* ${escapeTypst(subjectLabel(input.subject))}`,
     "",
     `*Revision:* ${escapeTypst(input.subject.rev ?? `none — ${input.subject.revProvenance}`)}`,
+    "",
+    // A commit alone does not say which branch it came from. A reader who
+    // assumes it is the deployed one, when the remote's default was a branch
+    // dormant for months, is reading a report about a codebase that moved on.
+    // Loudest when nothing was pinned, because that is when it is wrong.
+    `*Branch:* ${escapeTypst(branchLine(input.subject))}`,
     "",
     `*Reviewed:* ${escapeTypst(input.subject.acquiredAt.slice(0, 10))}`,
     "",

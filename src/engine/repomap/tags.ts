@@ -17,9 +17,15 @@
  * bounded benefit — the value of this feature is the ranking, budgeting, and
  * injection, all of which are language-agnostic and sit downstream of a `Tag[]`.
  * The extractor is isolated behind `extractTags()` precisely so a tree-sitter
- * backend can replace it later without touching rank/render. Non-TS/JS files
- * contribute nothing today rather than erroring.
+ * backend can replace it later without touching rank/render.
+ *
+ * C# joined TS/JS as a second regex backend (`csharp.ts`) because the subjects
+ * this engine audits are a .NET API plus a TypeScript client, and a map that
+ * covered only the client was empty for most of the code. Any other language
+ * contributes nothing today rather than erroring.
  */
+
+import { extractCSharpTags } from "./csharp.js";
 
 /** A definition or reference of a symbol, with enough to rank and render it. */
 export interface Tag {
@@ -35,6 +41,7 @@ export interface Tag {
 }
 
 const TS_JS_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
+const CSHARP_EXT = /\.cs$/;
 
 /** Definition patterns for TS/JS. Each captures the symbol name in group 1. */
 const DEF_PATTERNS: RegExp[] = [
@@ -61,10 +68,13 @@ const IDENTIFIER = /\b([A-Za-z_$][\w$]{2,})\b/g;
 /**
  * Extract def/ref tags from one file's source.
  *
- * Returns `[]` for anything that isn't TS/JS — the map is best-effort and a
- * language we can't parse simply contributes no symbols rather than failing.
+ * Returns `[]` for anything that isn't TS/JS or C# — the map is best-effort
+ * and a language we can't parse simply contributes no symbols rather than
+ * failing. The TS/JS path below is unchanged by the C# backend and a test pins
+ * its output, so the PR-review map cannot drift while the audit map grows.
  */
 export function extractTags(path: string, source: string): Tag[] {
+  if (CSHARP_EXT.test(path)) return extractCSharpTags(path, source);
   if (!TS_JS_EXT.test(path)) return [];
   const tags: Tag[] = [];
   const definedNames = new Set<string>();

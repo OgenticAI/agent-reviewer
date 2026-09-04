@@ -301,6 +301,63 @@ describe("code that was never in scope", () => {
     expect(deriveClosure("logs from the endpoint")?.blocker).toMatch(/log sample/i);
   });
 
+describe("call sites and third-party behaviour", () => {
+  // Both strings come from a run that died at the closure gate with the model
+  // spend already committed. The symbol names are substituted, because this
+  // repository is public and the originals came from a client tree; the
+  // sentence SHAPE is what the matcher keys on and that is preserved exactly.
+  const CALLERS =
+    "Code that calls INotificationService.SendAsync() - such as API controllers, " +
+    "command handlers, or application services - to verify whether they check the " +
+    "boolean return value and provide user notifications when it returns false";
+  const VENDOR =
+    "The SDK's documentation or source code to confirm whether Client.CaptureEvent() " +
+    "can throw exceptions under failure conditions";
+
+  it("closes the call-site question the implementation entry could not", () => {
+    const closure = deriveClosure(CALLERS);
+    expect(closure).not.toBeNull();
+    expect(closure?.blocker).toMatch(/callers/i);
+    // The verifier already had the implementation; what it lacked was who calls it.
+    expect(closure?.access).toContain("INotificationService.SendAsync()");
+  });
+
+  it("treats third-party behaviour as our lookup, not a client ask", () => {
+    const closure = deriveClosure(VENDOR);
+    expect(closure).not.toBeNull();
+    expect(closure?.blocker).toMatch(/reviewer/i);
+    expect(closure?.blocker).not.toMatch(/^Client/);
+    expect(closure?.effortHours).toBe(0.5);
+  });
+
+  it.each(["the callers of the retry helper", "code that calls the token refresher"])(
+    "covers both ways a verifier asks for the call graph: %s",
+    (access) => {
+      expect(deriveClosure(access)?.blocker).toMatch(/callers/i);
+    },
+  );
+
+  // Same hazard as the block above: appended last so a deployed-state question
+  // that happens to mention calls or documentation is still answered with the
+  // right ask and the right estimate.
+  it("does not shadow the deployed-state entries", () => {
+    expect(deriveClosure("the deployed configuration for the service that calls Stripe")?.blocker)
+      .toMatch(/hosting console/i);
+    expect(deriveClosure("logs showing which caller hit the endpoint")?.blocker)
+      .toMatch(/log sample/i);
+  });
+
+  // The match is a plain substring test, so a word that CONTAINS an earlier
+  // token wins on that token. "the audit logger" carries "log" and is answered
+  // with a log sample rather than with its call sites. Pinned here because it
+  // is the documented consequence of first-match-wins, and because the fix if
+  // it ever bites is to make the entry more specific, never to reorder the
+  // deployed-state block.
+  it("gives an earlier token priority even inside a longer word", () => {
+    expect(deriveClosure("code that calls the audit logger")?.blocker).toMatch(/log sample/i);
+  });
+});
+
   // The gate has to keep its teeth. Some access genuinely has no catalogue
   // answer, and inventing an estimate for it is worse than refusing to render —
   // these hours get quoted and signed off.

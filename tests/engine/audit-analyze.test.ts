@@ -243,12 +243,31 @@ describe("the tree under audit cannot configure the tools", () => {
 /* ── skipping, with a reason ─────────────────────────────────────────────── */
 
 describe("a skipped analyzer says why", () => {
-  it("reports a missing lockfile as a precondition, without running anything", async () => {
+  // An empty tree genuinely has nothing to scan. The reason names every
+  // ecosystem that was looked for, because "no npm lockfile" over a .NET or Go
+  // tree reads as "there is nothing here" when nobody had looked.
+  it("names every ecosystem it looked for when it finds none", async () => {
     const job = await runAnalyzer(DEPENDENCY_AUDIT, scratch);
 
     expect(job.parsed).toBe(false);
     expect(job.findings).toEqual([]);
-    expect(job.reason).toMatch(/no npm lockfile/);
+    expect(job.reason).toMatch(/npm/i);
+    expect(job.reason).toMatch(/nuget/i);
+  });
+
+  // The case that motivated this: a tree full of dependencies in an ecosystem
+  // npm audit cannot answer for. The skip must carry the count, or the report
+  // implies zero advisories where the truth is zero looking.
+  it("counts what went unscanned when the ecosystem is not npm", async () => {
+    writeFileSync(
+      join(scratch, "Api.csproj"),
+      '<Project><ItemGroup><PackageReference Include="Serilog" Version="3.0.0" /></ItemGroup></Project>',
+    );
+    const job = await runAnalyzer(DEPENDENCY_AUDIT, scratch);
+
+    expect(job.parsed).toBe(false);
+    expect(job.reason).toMatch(/1 nuget package/i);
+    expect(job.reason).toMatch(/NOT checked/);
   });
 
   it("passes the precondition once a lockfile is present", () => {
@@ -322,7 +341,12 @@ describe("a skipped analyzer says why", () => {
   // tooling is missing is a test that fails on every properly set-up machine.
   it("runs the whole set without one failure taking down the others", async () => {
     const jobs = await runAnalyzers(scratch);
-    expect(jobs.map((j) => j.job).sort()).toEqual(["dependency-audit", "secret-scan", "semgrep"]);
+    expect(jobs.map((j) => j.job).sort()).toEqual([
+      "dependency-audit",
+      "dependency-audit-osv",
+      "secret-scan",
+      "semgrep",
+    ]);
     // Nothing throws, whether the tools are installed or not.
     expect(jobs.every((j) => Array.isArray(j.findings))).toBe(true);
   }, 120_000);

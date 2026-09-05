@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { maskSecrets } from "../../src/engine/tools/sanitize.js";
+
 import {
   escapeTypst,
   renderTypst,
@@ -586,6 +588,22 @@ describe("draft versus released", () => {
 /* ── The gates ────────────────────────────────────────────────────────────── */
 
 describe("the mask gate", () => {
+  // A .NET audit's hardcoded-credential finding quotes the shape of the fix.
+  // If the real masker fires on the placeholder, the report that says how to
+  // fix the defect can never be released.
+  it("lets a report that quotes placeholder connection strings through", () => {
+    const remediation = escapeTypst(
+      [
+        "Replace `Password=hunter2` with `Password=${DB_PASSWORD}` read from the environment,",
+        "or `Password=%DB_PASSWORD%` on Windows hosts; the pipeline clones with",
+        "`https://ci:${GIT_TOKEN}@git.example.com/acme/app.git`.",
+      ].join(" "),
+    );
+    expect(checkMask(remediation, (text) => maskSecrets(text, [])).clean).toBe(false);
+    const withoutLiteral = remediation.replace("Password=hunter2", "the literal password");
+    expect(checkMask(withoutLiteral, (text) => maskSecrets(text, [])).clean).toBe(true);
+  });
+
   it("is clean when masking changes nothing", () => {
     expect(checkMask("no secrets", noMask).clean).toBe(true);
   });
@@ -834,6 +852,27 @@ describe("naming the subject on the cover", () => {
     });
     expect(source).not.toMatch(/\*Subject:\* \.$/m);
     expect(source).toContain("*Subject:* acme-web-app");
+  });
+
+  // acquire strips the credential before it writes the subject, but a
+  // subject.json written before it did can still carry one, and the cover is
+  // the last place it should surface.
+  it("drops a credential left in an older subject's origin", () => {
+    const token = "EXAMPLE_TOKEN_0123456789";
+    const origin = `https://user:${token}@git.example.com/acme/app.git`;
+    expect(subjectLabel(subject({ origin }))).toBe("https://git.example.com/acme/app.git");
+    // The CLI's own shorthand, written by an acquire that redacted only URLs
+    // with a scheme.
+    expect(subjectLabel(subject({ origin: `user:${token}@git.example.com/acme/app` }))).toBe(
+      "git.example.com/acme/app",
+    );
+
+    const source = renderTypst({
+      input: input({ subject: subject({ origin }) }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).not.toContain(token);
+    expect(source).toContain("git.example.com/acme/app.git");
   });
 });
 

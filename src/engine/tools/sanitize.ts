@@ -67,6 +67,30 @@ const SECRET_VALUE_PATTERNS: RegExp[] = [
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
   /\blin_(?:api|oauth)_[A-Za-z0-9]{20,}/g, // Linear
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  // Credentials carried by a URL: `https://user:token@host/...`. A clone URL
+  // with a token in it is the ordinary way to hand a process read access, and
+  // git quotes it back in its own stderr. Only the userinfo is masked, so the
+  // host and path stay readable and the line still says which repo it was.
+  //
+  // What is NOT masked matters as much, because this list also gates a
+  // report's release (render.ts checkMask): a match there refuses the PDF.
+  // A remediation that quotes `https://user:${GIT_TOKEN}@...` is the fix,
+  // not a leak, so a value that starts like a placeholder (`${`, `%`, `{{`,
+  // `<...>`) is left alone, with or without the backslash the typst source
+  // puts in front of those characters. A bare user with no password is masked only when
+  // it looks like a token rather than a name: twenty characters or more with
+  // a digit in it. Usernames are words, `svc-account-readonly` included, and
+  // tokens are not; `ssh://git@host` and the Bitbucket sentinel username
+  // both stay readable.
+  /(?<=\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]*:(?!\\?[$%{<])[^\s/@]+(?=@)/gi,
+  /(?<=\b[a-z][a-z0-9+.-]*:\/\/)(?=[^\s/@:]*\d)[^\s/@:]{20,}(?=@)/gi,
+  // Connection-string passwords. Matched by the key, not the value, because
+  // the value has no shape of its own: `Password=hunter2;` in a logged
+  // connection string is a credential however short it is. The mask stops at
+  // the delimiter so the rest of the string (server, database) survives, and
+  // a placeholder value is passed over for the reason given above: a .NET
+  // audit's own remediation reads `Password=${DB_PASSWORD};`.
+  /(?<=\b(?:Password|Pwd|AccountKey|SharedAccessKey)=)(?!\\?[$%{<])[^;\s"'&]+/gi,
 ];
 
 /** Read the secret values we actually hold, longest first. */

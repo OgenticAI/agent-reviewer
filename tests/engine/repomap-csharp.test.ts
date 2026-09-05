@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { extractTags, type Tag } from "../../src/engine/repomap/tags.js";
 import { rankFiles } from "../../src/engine/repomap/rank.js";
+import { renderRepoMap } from "../../src/engine/repomap/render.js";
 
 /**
  * C# tag extraction for the repo map.
@@ -136,6 +137,51 @@ describe("C# member visibility and shape", () => {
     ].join("\n");
     const names = defs(extractTags("Order.cs", source)).map((t) => t.name);
     expect(names).toEqual(["Order", "Id", "Label", "Key", "Status"]);
+  });
+
+  it("names an expression-bodied member after itself, not after a generic call in its body", () => {
+    // `DbSet<Order> Orders => Set<Order>()` has nothing but `=>` between the
+    // member's type arguments and the body's; a type span that crossed it made
+    // the property a method named Set.
+    const source = [
+      "public class OrdersDbContext : DbContext",
+      "{",
+      "    public DbSet<Order> Orders => Set<Order>();",
+      "    public IReadOnlyList<Order> Active => _orders.OfType<Order>().ToList();",
+      "    public Task<Order> Get(int id) => _repo.Find<Order>(id);",
+      "}",
+    ].join("\n");
+    const names = defs(extractTags("OrdersDbContext.cs", source)).map((t) => t.name);
+    expect(names).toEqual(["OrdersDbContext", "Orders", "Active", "Get"]);
+    for (const bodyCall of ["Set", "OfType", "Find"]) {
+      expect(names).not.toContain(bodyCall);
+    }
+  });
+
+  it("finds a member whose attribute list sits on the same line", () => {
+    const source = [
+      "public class OrdersController : ControllerBase",
+      "{",
+      "    [Key] public int Id { get; set; }",
+      "    [JsonProperty(\"name\")] public string Name { get; set; }",
+      "    [HttpGet(\"{id}\")] public async Task<IActionResult> Get(int id) => Ok();",
+      "    [AllowAnonymous] public IActionResult Health() => Ok();",
+      "    [Authorize(Roles = \"Admin\")] public IActionResult Admin() => Ok();",
+      "    [Obsolete, Browsable(false)] public void Legacy() { }",
+      "    public IActionResult Plain() => Ok();",
+      "}",
+    ].join("\n");
+    const tags = extractTags("OrdersController.cs", source);
+    expect(defs(tags).map((t) => t.name)).toEqual([
+      "OrdersController", "Id", "Name", "Get", "Health", "Admin", "Legacy", "Plain",
+    ]);
+    // The def keeps the whole line, attribute included: the map is how a
+    // question about `[Authorize]` sees which actions carry it.
+    expect(defNamed(tags, "Health")!.signature).toContain("[AllowAnonymous]");
+    // Stripping the list for the def match does not cost the attribute refs.
+    for (const attribute of ["Key", "AllowAnonymous", "Authorize"]) {
+      expect(refNames(tags)).toContain(`${attribute}Attribute`);
+    }
   });
 
   it("skips a local function inside a method body", () => {
@@ -303,6 +349,33 @@ describe("C# comments and strings", () => {
     }
   });
 
+  it("does not let an interpolated raw string swallow the defs after it", () => {
+    // `$"""` begins with `$"`, which the regular-string branch used to claim:
+    // an empty string, then a quote left open to the end of the line, then the
+    // closing `"""` read as an opener that blanked the rest of the file.
+    const source = [
+      "public class Payloads",
+      "{",
+      "    public string Interpolated(int id) => $\"\"\"",
+      "        {\"id\": {id}}",
+      "        \"\"\";",
+      "    public void AfterInterpolated() { }",
+      "    public string Doubled(int id) => $$\"\"\"",
+      "        {\"id\": {{id}}}",
+      "        \"\"\";",
+      "    public void AfterDoubled() { }",
+      "}",
+      "public class Next { }",
+    ].join("\n");
+    const tags = extractTags("Payloads.cs", source);
+    expect(defs(tags).map((t) => t.name)).toEqual([
+      "Payloads", "Interpolated", "AfterInterpolated", "Doubled", "AfterDoubled", "Next",
+    ]);
+    // The literal's body is masked like any other string: `id` in a JSON key
+    // is not a symbol.
+    expect(refs(tags).some((t) => t.line === 4 || t.line === 8)).toBe(false);
+  });
+
   it("does not let a char literal holding a quote swallow the rest of the file", () => {
     const source = [
       "public class Chars",
@@ -391,6 +464,71 @@ describe("C# ranking, end to end", () => {
     const rankOf = (path: string) => ranked.findIndex((r) => r.path === path);
     expect(rankOf("Api/OrdersController.cs")).toBeLessThan(rankOf("Util/StringHelper.cs"));
     expect(rankOf("Services/OrderService.cs")).toBeLessThan(rankOf("Util/StringHelper.cs"));
+  });
+});
+
+describe("C# minimal-hosting Program.cs", () => {
+  const program = [
+    "var builder = WebApplication.CreateBuilder(args);",
+    "builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)",
+    "    .AddJwtBearer(o => { o.Authority = cfg.Authority; });",
+    "builder.Services.AddAuthorization(o => o.AddPolicy(\"Admin\", p => p.RequireRole(\"Admin\")));",
+    "builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin()));",
+    "builder.Services.AddScoped<IOrderRepository, OrderRepository>();",
+    "var app = builder.Build();",
+    "app.UseCors();",
+    "app.UseAuthorization();",
+    "app.UseAuthentication();",
+    "app.UseMiddleware<TenantMiddleware>();",
+    "app.MapGet(\"/health\", () => Results.Ok()).AllowAnonymous();",
+    "app.MapPost(\"/orders\", (OrderDto dto, IOrderService svc) => svc.Create(dto));",
+    "app.MapGroup(\"/admin\").RequireAuthorization(\"Admin\");",
+    "app.Run();",
+  ].join("\n");
+
+  it("treats each host-shaping statement as a def named by its method, and nothing else", () => {
+    const tags = extractTags("Program.cs", program);
+    expect(defs(tags).map((t) => t.name)).toEqual([
+      "AddAuthentication", "AddAuthorization", "AddCors", "AddScoped",
+      "UseCors", "UseAuthorization", "UseAuthentication", "UseMiddleware",
+      "MapGet", "MapPost", "MapGroup",
+    ]);
+    // The signature is the statement itself: the middleware order and the
+    // CORS policy are only visible if the map shows the line, not the name.
+    expect(defNamed(tags, "UseAuthorization")!.signature).toBe("app.UseAuthorization();");
+    expect(defNamed(tags, "AddCors")!.signature).toContain("AllowAnyOrigin");
+  });
+
+  it("reaches the rendered map, which drops files with no defs", () => {
+    const tags = [
+      ...extractTags("Program.cs", program),
+      ...extractTags("Services/OrderRepository.cs", "public class OrderRepository : IOrderRepository { }"),
+    ];
+    const ranked = rankFiles({ tags, seeds: [] });
+    const rendered = renderRepoMap({ ranked, tags, diffTokens: 0 });
+    expect(rendered.text).toContain("Program.cs:");
+    expect(rendered.text).toContain("app.UseAuthorization();");
+  });
+
+  it("does not turn the same calls inside a classic Startup class into defs", () => {
+    // Inside a type body the calls already sit under a method def; a second
+    // def per line would list ConfigureServices a dozen times.
+    const source = [
+      "public class Startup",
+      "{",
+      "    public void ConfigureServices(IServiceCollection services)",
+      "    {",
+      "        services.AddAuthorization();",
+      "        services.AddScoped<IOrderRepository, OrderRepository>();",
+      "    }",
+      "    public void Configure(IApplicationBuilder app)",
+      "    {",
+      "        app.UseAuthorization();",
+      "    }",
+      "}",
+    ].join("\n");
+    const names = defs(extractTags("Startup.cs", source)).map((t) => t.name);
+    expect(names).toEqual(["Startup", "ConfigureServices", "Configure"]);
   });
 });
 

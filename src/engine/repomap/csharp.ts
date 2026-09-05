@@ -77,8 +77,14 @@ const CS_BCL_NOISE = new Set([
 const MODS = "(?:(?:public|private|protected|internal|static|abstract|sealed|partial|virtual|override|async|unsafe|extern|new|readonly|ref|required|volatile|file)\\s+)*";
 /** Constructor modifiers. `new` is left out: `new Order(1)` on its own line is a call. */
 const CTOR_MODS = "(?:(?:public|private|protected|internal|static|extern|unsafe)\\s+)+";
-/** A type expression: `Task<List<Order?>>`, `int[]`, `Order?`, `IFoo.Bar` (explicit impl). */
-const TYPE = "([A-Za-z_][\\w.]*(?:<[^()]*>)?(?:\\[\\])*\\??)";
+/**
+ * A type expression: `Task<List<Order?>>`, `int[]`, `Order?`, `IFoo.Bar` (explicit impl).
+ * The generic span stops at `=` and `;` as well as at a paren. On
+ * `DbSet<Order> Orders => Set<Order>();` nothing but `=>` separates the
+ * member's `<` from the body's, and a span that crossed it made the property a
+ * method named after the body's call.
+ */
+const TYPE = "([A-Za-z_][\\w.]*(?:<[^()=;]*>)?(?:\\[\\])*\\??)";
 const NAME = "([A-Za-z_]\\w*)";
 /** An optionally qualified member name, capturing only the last segment. */
 const QUALIFIED_NAME = "(?:[A-Za-z_]\\w*\\.)*([A-Za-z_]\\w*)";
@@ -121,6 +127,26 @@ const CS_IDENTIFIER = /\b([A-Za-z_]\w{2,})\b/g;
 const CS_USING = /^\s*(?:global\s+)?using\s+(?:static\s+)?([A-Za-z_][\w.]+)\s*;/;
 /** An attribute list opens with `[`, optionally targeted (`[return: NotNull]`). */
 const CS_ATTRIBUTE_OPEN = /\[\s*(?:(?:assembly|module|return|field|method|param|property|type|event)\s*:\s*)?([A-Z]\w*)/g;
+/**
+ * Attribute lists in front of a member on the same line. `[Key] public int Id`
+ * is the usual style in entity and DTO files, which are the files whose
+ * property names the map keeps, and every member pattern is anchored at the
+ * modifiers, so the lists are stripped before a pattern runs. String arguments
+ * are already masked, so a `]` in a route template cannot end a list early.
+ */
+const CS_LEADING_ATTRIBUTES = /^\s*(?:\[[^\]]*\]\s*)+/;
+/**
+ * A top-level statement that shapes the host: `builder.Services.AddX(...)`,
+ * `app.UseX(...)`, `app.MapX(...)`. A minimal-hosting Program.cs is nothing
+ * but these. With no type or member on any line it had no defs, and render
+ * keeps only files with defs, so the one file a review of an ASP.NET Core API
+ * starts from was dropped: the auth scheme, the middleware order, the CORS
+ * policy and every endpoint. Each such line is a def named by the method, so a
+ * question that says "authorization" seeds the file and the map shows the
+ * line. Only outside any type body: the same calls inside a classic
+ * Startup.ConfigureServices already sit under a method def.
+ */
+const CS_TOP_LEVEL_CALL = /^\s*(?:app|builder(?:\.Services)?|services)\.((?:Map|Use|Add|Configure)\w*)\b/;
 
 /**
  * Blank out comments, string and char literals, and preprocessor lines,
@@ -183,12 +209,20 @@ export function maskCSharp(source: string): string {
       continue;
     }
 
-    // Raw string literal: three or more quotes, closed by the same count.
-    if (c === '"' && next === '"' && source[i + 2] === '"') {
+    // Raw string literal: three or more quotes, closed by the same count, with
+    // any number of `$` in front for interpolation. The prefix is checked here,
+    // before the regular-string branch, because `$"""` begins with `$"` and
+    // that branch would take it: `$""` masked as an empty string, the third
+    // quote opening a literal that ran to the end of the line, and the closing
+    // `"""` then read as an opener that blanked the rest of the file.
+    let dollars = 0;
+    while (source[i + dollars] === "$") dollars += 1;
+    const rawAt = i + dollars;
+    if (source[rawAt] === '"' && source[rawAt + 1] === '"' && source[rawAt + 2] === '"') {
       let quotes = 0;
-      while (source[i + quotes] === '"') quotes += 1;
+      while (source[rawAt + quotes] === '"') quotes += 1;
       const closer = '"'.repeat(quotes);
-      const close = source.indexOf(closer, i + quotes);
+      const close = source.indexOf(closer, rawAt + quotes);
       const end = close === -1 ? n : close + quotes;
       blank(i, end);
       i = end;
@@ -356,6 +390,17 @@ export function extractCSharpTags(path: string, source: string): Tag[] {
         });
       }
       if (def.kind === "type" && def.isBody) frames.push({ depth: depthAtStart, opened: false });
+    } else if (frames.length === 0 && depthAtStart === 0) {
+      const call = CS_TOP_LEVEL_CALL.exec(masked);
+      if (call) {
+        tags.push({
+          path,
+          name: call[1]!,
+          kind: "def",
+          line: i + 1,
+          signature: rawLines[i]!.trim().slice(0, 200),
+        });
+      }
     }
 
     for (const ch of masked) {
@@ -400,8 +445,9 @@ interface MatchedDef {
 }
 
 function matchDef(masked: string): MatchedDef | undefined {
+  const line = masked.replace(CS_LEADING_ATTRIBUTES, "");
   for (const pattern of CS_DEF_PATTERNS) {
-    const m = pattern.regex.exec(masked);
+    const m = pattern.regex.exec(line);
     if (!m) continue;
     const name = m[pattern.nameGroup]!;
     if (CS_KEYWORDS.has(name)) return undefined;
@@ -412,7 +458,7 @@ function matchDef(masked: string): MatchedDef | undefined {
     }
     // A namespace is not a body for depth purposes: block-scoped `namespace X {`
     // holds types, not members, and file-scoped `namespace X;` holds nothing.
-    const isBody = pattern.kind === "type" && !/^\s*namespace\b/.test(masked);
+    const isBody = pattern.kind === "type" && !/^\s*namespace\b/.test(line);
     return { name, kind: pattern.kind, isBody };
   }
   return undefined;

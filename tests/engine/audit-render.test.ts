@@ -18,7 +18,11 @@ import {
 } from "../../src/engine/audit/render.js";
 import { severityFor, SECURITY_QUESTIONS } from "../../src/engine/audit/severity.js";
 import type { AuditFinding } from "../../src/engine/audit/finding.js";
-import type { VerifiedClaim } from "../../src/engine/audit/verify.js";
+import {
+  describeVerification,
+  type VerifiedClaim,
+  type VerificationSummary,
+} from "../../src/engine/audit/verify.js";
 import type { Coverage } from "../../src/engine/audit/inventory.js";
 import type { Subject } from "../../src/engine/audit/acquire.js";
 import type { SweepArtifact } from "../../src/engine/audit/sweep-findings.js";
@@ -210,6 +214,108 @@ describe("Coverage, generated from the run", () => {
     });
     expect(source).toMatch(/carried no version history/);
     expect(source).toMatch(/no history-derived/);
+  });
+});
+
+describe("what verification threw away, in Coverage", () => {
+  function verification(over: Partial<VerificationSummary> = {}): VerificationSummary {
+    return {
+      examined: 75,
+      verified: 12,
+      inferred: 9,
+      notDeterminable: 0,
+      rejected: 54,
+      rejectedBy: {
+        "quote-absent": 45,
+        "quote-ambiguous": 0,
+        "line-beyond-eof": 7,
+        "file-unreadable": 2,
+        "not-a-line-reference": 0,
+        refuted: 0,
+      },
+      corrected: 6,
+      dropped: 3,
+      droppedBy: {
+        "quote-absent": 2,
+        "quote-ambiguous": 1,
+        "line-beyond-eof": 0,
+        "file-unreadable": 0,
+        "not-a-line-reference": 0,
+      },
+      ...over,
+    };
+  }
+
+  // The number an operator saw at the terminal is the number on the page:
+  // the report prints the same line the CLI does, from the same function.
+  it("prints the same single line the CLI printed, under Coverage", () => {
+    const summary = verification();
+    const source = renderTypst({ input: input({ verification: summary }), executiveSummary: SUMMARY });
+
+    expect(source.indexOf("= Coverage")).toBeLessThan(source.indexOf("== Claims and verification"));
+    expect(source.indexOf("== Claims and verification")).toBeLessThan(source.indexOf("= Summary of Findings"));
+    expect(source).toContain(escapeTypst(describeVerification(summary)));
+    expect(source).toContain(`examined ${summary.examined} claim`);
+  });
+
+  // A count the run never recorded is not printed as zero.
+  it("omits the line on a run that left no record", () => {
+    const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
+    expect(source).not.toContain("== Claims and verification");
+    expect(source).not.toMatch(/claims rejected/);
+  });
+
+  // The line printed is where the quoted text is; the line the claim gave is
+  // kept beside it, so a reader can see the citation was moved and how far.
+  it("says on the evidence line when a citation was moved, and from where", () => {
+    const moved = finding({
+      confidence: "inferred",
+      evidence: [{ path: "src/orders.ts", rev: REV, line: 82, corrected: { citedLine: 42, beyondEof: false } }],
+    });
+    const overran = finding({
+      id: "config-precedence-deadbeef",
+      confidence: "inferred",
+      evidence: [{ path: "src/orders.ts", rev: REV, line: 82, corrected: { citedLine: 253, beyondEof: true } }],
+    });
+    const source = renderTypst({ input: input({ findings: [moved, overran] }), executiveSummary: SUMMARY });
+
+    expect(source).toMatch(/src\/orders\.ts:82 \(the claim cited line 42; the quoted text is at line 82\)/);
+    expect(source).toMatch(/cited line 253, past the end of the file/);
+    for (const line of source.split("\n").filter((l) => l.includes("the claim cited line"))) {
+      expect(line).not.toContain("—");
+    }
+  });
+
+  it("prints an unmoved citation as it always did", () => {
+    const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
+    expect(source).toMatch(/^- src\/startup\.ts:42$/m);
+  });
+
+  // A citation the claim gave and the check could not find is named on the
+  // page, under its own heading and after the evidence, so a reader can see
+  // the finding's author cited something that is not there without taking
+  // it for something the finding rests on. No quote: the text was not found.
+  it("names a dropped citation under its own heading, after the evidence and without a quote", () => {
+    const withDropped = finding({
+      confidence: "inferred",
+      dropped: [
+        { path: "src/orders.ts", line: 10, reason: "quote-absent" },
+        { path: "src/orders.ts", line: 900, reason: "quote-ambiguous", occurrences: 3 },
+      ],
+    });
+    const source = renderTypst({ input: input({ findings: [withDropped] }), executiveSummary: SUMMARY });
+
+    expect(source.indexOf("*Evidence*")).toBeLessThan(source.indexOf("*Cited and not relied on*"));
+    expect(source).toMatch(/^- src\/orders\.ts:10 \(the quoted text is nowhere in the file\)$/m);
+    expect(source).toMatch(/^- src\/orders\.ts:900 \(the quoted text is at 3 lines of the file/m);
+    for (const line of source.split("\n").filter((l) => l.includes("src/orders.ts:"))) {
+      expect(line).not.toContain("—");
+    }
+  });
+
+  it("prints no such heading for a finding that dropped nothing", () => {
+    const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
+    expect(source).not.toContain("Cited and not relied on");
   });
 });
 

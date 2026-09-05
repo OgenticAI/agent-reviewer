@@ -73,8 +73,11 @@ import {
 import {
   verifyClaims,
   summariseVerification,
+  describeVerification,
+  verificationCounts,
   type LineReader,
   type PathKind,
+  type VerificationSummary,
 } from "./engine/audit/verify.js";
 import {
   toAuditFindings,
@@ -1022,9 +1025,13 @@ async function investigateRun(ctx: {
           ? { verifiers: Number(flag(args, "--verifiers")) }
           : {}),
       });
+      // The breakdown goes up with the totals. A dashboard that shows "54
+      // rejected" and nothing else leaves the operator to guess whether the
+      // investigation invented 54 citations or misnumbered them, and the two
+      // call for different fixes.
       telemetry.stageFinished("verify", {
         verified: result.verified.length,
-        rejected: result.rejected.length,
+        ...verificationCounts(summariseVerification(result)),
       });
       return result;
     }, reportUsage),
@@ -1033,13 +1040,21 @@ async function investigateRun(ctx: {
   const summary = summariseVerification(verification);
   process.stdout.write(
     `  verified   ${summary.verified} · inferred ${summary.inferred} · ` +
-      `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n`,
+      `not-determinable ${summary.notDeterminable} · rejected ${verification.rejected.length}\n` +
+      `  ${describeVerification(summary)}\n`,
   );
 
   // Verification stops mid-list on a cancel, so the claim set here is partial.
   // Rendering a report from it would produce a document that looks complete and
   // is not — the one output this engine must never produce.
   telemetry.throwIfCancelled("closure");
+
+  // What verification kept and threw away, persisted for the report's
+  // coverage section. Before closure, whose gate throws on purpose: a run
+  // refused there still has this to show for its verify stage, the same way
+  // the ledger survives. Findings alone cannot reconstruct it, because a
+  // rejected claim leaves no finding.
+  writeFileSync(join(out, "verification.json"), `${JSON.stringify(summary, null, 2)}\n`);
 
   // The gate inside throws on purpose, and before the ledger was kept on the
   // way out that throw was the last thing the run did: no access-log.json, no
@@ -1300,6 +1315,47 @@ function readQuestionOutcomes(outDir: string): QuestionOutcome[] | undefined {
 }
 
 /**
+ * What verification kept and threw away, if the run left a record, and
+ * whether that record belongs to the findings being rendered.
+ *
+ * Optional for the same reason `readQuestionOutcomes` is: an older run never
+ * wrote it, and the report then omits the line rather than printing a count
+ * it does not have. A run that reaches render without it is not wrong about
+ * anything it prints; it is silent about one thing.
+ *
+ * `paired` is the same mtime rule `sweepPredates` applies to sweep.json.
+ * verification.json is written before the closure gate, on purpose, so a run
+ * refused there still has its verify stage on record; but that run writes no
+ * findings.json, and with --out reused across runs the next render would put
+ * the refused run's "examined 75, rejected 54" above the previous run's
+ * findings, and its "a rejected claim does not appear in this report" would
+ * be about a different set of claims. Every investigate run writes
+ * verification.json before findings.json, so a verification.json that is
+ * NEWER than the findings is from a run that never got that far. Unreadable
+ * stats pair, as they do for the sweep: the caller has the findings open, so
+ * that is a race, not an answer.
+ */
+export function readVerificationSummary(
+  outDir: string,
+  findingsPath: string,
+): { summary: VerificationSummary; paired: boolean } | undefined {
+  const path = join(outDir, "verification.json");
+  let summary: VerificationSummary;
+  try {
+    summary = JSON.parse(readFileSync(path, "utf8")) as VerificationSummary;
+  } catch {
+    return undefined;
+  }
+  let paired = true;
+  try {
+    paired = statSync(path).mtimeMs <= statSync(findingsPath).mtimeMs;
+  } catch {
+    paired = true;
+  }
+  return { summary, paired };
+}
+
+/**
  * Plant known defects in a tree, for recall calibration (OGE-2433).
  *
  * Destructive, and deliberately so — it rewrites source files in place. Point
@@ -1411,6 +1467,7 @@ async function runRender(args: string[]): Promise<number> {
   const accessLog = readAccessLog(out);
   const questionOutcomes = readQuestionOutcomes(out);
   const sweep = readSweep(out);
+  const verification = readVerificationSummary(out, findingsPath);
   // The merge lives in investigate, so a sweep.json written after the
   // findings holds candidates the findings do not. File order is the record
   // of that; the section says so rather than pointing at findings that are
@@ -1424,6 +1481,12 @@ async function runRender(args: string[]): Promise<number> {
       "render",
       "warn",
       "sweep.json is newer than findings.json; its candidates were not folded into the findings",
+    );
+  if (verification && !verification.paired)
+    renderTelemetry.log(
+      "render",
+      "warn",
+      "verification.json is newer than the findings; it is from a run that wrote no findings, and the report omits it",
     );
   const result = await withStage(renderTelemetry, "render", async () => {
     const rendered = await renderReport({
@@ -1439,6 +1502,11 @@ async function runRender(args: string[]): Promise<number> {
         // Absent when the run record is missing: the renderer omits the maturity
         // table rather than rating every category on nothing.
         ...(questionOutcomes ? { questionOutcomes } : {}),
+        // Absent on a run that predates the record, and on a record from a
+        // later run that wrote no findings: the line is omitted rather than
+        // counted from findings, which cannot see a rejected claim, and rather
+        // than printed over findings it does not describe.
+        ...(verification?.paired ? { verification: verification.summary } : {}),
         // Absent when no sweep ran: the section then says so, rather than the
         // coverage figure passing as whole-tree when it is the model's alone.
         ...(sweep ? { sweep, sweepMerged } : {}),

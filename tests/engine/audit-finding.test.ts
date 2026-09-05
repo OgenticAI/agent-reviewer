@@ -131,6 +131,55 @@ describe("3 — verified has to be earned", () => {
     expect(checkVerifiedIsEarned(verified({ confidence: "inferred", verifiers: 0 }))).toBeNull();
     expect(checkVerifiedIsEarned(notDeterminable({ verifiers: 0 }))).toBeNull();
   });
+
+  // A citation the check had to relocate was written from memory. The verify
+  // stage caps such a claim at inferred as it goes; this is the same rule where
+  // the report is admitted, so a finding that slipped past the first cannot
+  // pass the second.
+  it("fails a verified finding whose citation was moved, however many verifiers agreed", () => {
+    const moved = verified({
+      verifiers: 9,
+      refutations: 0,
+      evidence: [{ path: "src/media/upload.ts", rev: REV, line: 128, quote: "rawToken", corrected: { citedLine: 88, beyondEof: false } }],
+    });
+    expect(checkVerifiedIsEarned(moved)?.code).toBe("unearned-verified");
+    expect(checkVerifiedIsEarned(moved)?.detail).toMatch(/moved/);
+  });
+
+  it("allows a moved citation on an inferred finding, which is what the cap produces", () => {
+    const moved = verified({
+      confidence: "inferred",
+      evidence: [{ path: "src/media/upload.ts", rev: REV, line: 128, quote: "rawToken", corrected: { citedLine: 88, beyondEof: true } }],
+    });
+    expect(checkVerifiedIsEarned(moved)).toBeNull();
+    expect(validateFinding(moved, REV)).toEqual([]);
+  });
+
+  // A citation the check could not find at all was invented, which is worse
+  // than one it had to relocate; a finding that kept `verified` with one of
+  // those on its record slipped past a rule the moved case already enforces.
+  it("fails a verified finding that dropped a citation, whatever held beside it", () => {
+    const dropped = verified({
+      verifiers: 9,
+      refutations: 0,
+      dropped: [{ path: "src/media/upload.ts", line: 12, reason: "quote-absent" }],
+    });
+    expect(checkVerifiedIsEarned(dropped)?.code).toBe("unearned-verified");
+    expect(checkVerifiedIsEarned(dropped)?.detail).toMatch(/could not find/);
+  });
+
+  it("allows a dropped citation on an inferred finding, which is what the cap produces", () => {
+    const dropped = verified({
+      confidence: "inferred",
+      dropped: [{ path: "src/media/upload.ts", line: 12, reason: "quote-ambiguous", occurrences: 3 }],
+    });
+    expect(checkVerifiedIsEarned(dropped)).toBeNull();
+    expect(validateFinding(dropped, REV)).toEqual([]);
+  });
+
+  it("does not count an empty record as a dropped citation", () => {
+    expect(checkVerifiedIsEarned(verified({ dropped: [] }))).toBeNull();
+  });
 });
 
 describe("4 — citations are against the revision actually audited", () => {

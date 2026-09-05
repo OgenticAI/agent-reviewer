@@ -78,6 +78,7 @@ export const AUDIT_ARTIFACTS: ReadonlySet<string> = new Set([
   "analyzers.json",
   "findings.json",
   "questions.json",
+  "verification.json",
   "usage.json",
   "recall.jsonl",
   "report.typ",

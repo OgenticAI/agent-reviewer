@@ -56,6 +56,8 @@ import {
   questionsWithoutFindings,
   summariseInvestigation,
   type Claim,
+  type QuestionRunResult,
+  type StandingClaim,
 } from "./engine/audit/investigate.js";
 import { ModelCallFailures } from "./engine/audit/model-failures.js";
 import {
@@ -104,6 +106,7 @@ import { existsSync } from "node:fs";
 import {
   AuditTelemetry,
   RunCancelled,
+  idListDetail,
   type AuditStage,
 } from "./engine/audit/telemetry.js";
 import { sinkFromEnv } from "./audit-telemetry-http.js";
@@ -847,6 +850,128 @@ async function runInvestigate(args: string[]): Promise<number> {
   }
 }
 
+/* ── The investigate row the release gate reads (OGE-2711) ────────────────── */
+
+/**
+ * The investigate stage's account of itself, in the shape Mission Control
+ * stores and the release gate reads.
+ *
+ * Six counts on the stage row, and the names of the questions that produced
+ * nothing beside them. The gate reads `questions` and `questionsWithFindings`
+ * for coverage and `modelCallFailures` for lost calls; the other three are the
+ * dashboard's. The names go in the row's detail because `counts` is numbers
+ * only, and a gate that can say "3 of 9 produced nothing" but not WHICH three
+ * sends the operator to the log to find out.
+ */
+export interface InvestigateAccount {
+  counts: {
+    questions: number;
+    claims: number;
+    filesOpened: number;
+    filesInLedger: number;
+    modelCallFailures: number;
+    questionsWithFindings: number;
+  };
+  questionsWithoutFindings: string[];
+}
+
+/**
+ * Build the account at a point in the run.
+ *
+ * `standing` is the claims still alive at that point. Left out, it is every
+ * claim the parser kept, which is all the investigate stage knows when it
+ * finishes. After verify it is what verify let through, and that is the number
+ * the gate has to see: a question that ran out of budget and answered from
+ * memory keeps every recalled citation at parse (each has a path) and loses
+ * every one at verify's anchor check. Counted at parse alone, a run that did
+ * that on every question reported full coverage and passed the gate with no
+ * findings behind it. The gate's own fallback, distinct question
+ * prefixes among the findings, is a post-verify number; this makes the
+ * reported one agree with it.
+ */
+export function investigateAccount(input: {
+  results: QuestionRunResult[];
+  standing?: ReadonlyArray<StandingClaim>;
+  filesOpened: number;
+  filesInLedger: number;
+  modelCallFailures: number;
+}): InvestigateAccount {
+  const summary = summariseInvestigation(input.results);
+  const without = questionsWithoutFindings(input.results, input.standing);
+  return {
+    counts: {
+      questions: summary.questions,
+      claims: summary.claims,
+      filesOpened: input.filesOpened,
+      filesInLedger: input.filesInLedger,
+      modelCallFailures: input.modelCallFailures,
+      questionsWithFindings: summary.questions - without.length,
+    },
+    questionsWithoutFindings: without,
+  };
+}
+
+function sameAccount(a: InvestigateAccount, b: InvestigateAccount): boolean {
+  return (
+    (Object.keys(a.counts) as Array<keyof InvestigateAccount["counts"]>).every(
+      (key) => a.counts[key] === b.counts[key],
+    ) &&
+    a.questionsWithoutFindings.length === b.questionsWithoutFindings.length &&
+    a.questionsWithoutFindings.every((id, i) => id === b.questionsWithoutFindings[i])
+  );
+}
+
+/**
+ * Sends the account as the investigate stage's finished row, whole, every time.
+ *
+ * The row goes out twice on a run that lost something: once when investigate
+ * finishes, and again after verify with the failure total and the coverage
+ * brought up to date. The dashboard replaces a stage's counts wholesale on a
+ * re-sent finish, so a re-send carrying one field would wipe the other five
+ * and the gate, reading a row with no `questions`, would skip its coverage
+ * check without saying so. Every send therefore goes through here, with the
+ * whole account, and a send that changes nothing is not made: the dashboard
+ * takes a re-send's timestamp as the stage's finish, which is a price worth
+ * paying only when the row is actually different.
+ *
+ * Exported, like `ledgerPersister`, so the contract can be pinned without a
+ * model: both sends carry all six keys and the detail, and the second is made
+ * only when something moved.
+ */
+export class InvestigateRow {
+  private last: InvestigateAccount | undefined;
+
+  constructor(private readonly telemetry: AuditTelemetry) {}
+
+  /** The account last sent, for building the next one from the same file counts. */
+  sent(): InvestigateAccount | undefined {
+    return this.last;
+  }
+
+  /** Send, unless nothing the row carries has changed. Returns whether it went. */
+  send(account: InvestigateAccount): boolean {
+    if (this.last && sameAccount(this.last, account)) return false;
+    const empty = account.questionsWithoutFindings;
+    const namedBefore = this.last?.questionsWithoutFindings.join(",");
+    // For the person reading the log. The row carries the same names as JSON
+    // for the gate; this line is the one a human sees while the run is going.
+    if (empty.length > 0 && empty.join(",") !== namedBefore) {
+      this.telemetry.log(
+        "investigate",
+        "warn",
+        `${empty.length} of ${account.counts.questions} question(s) produced no standing claim: ${empty.join(", ")}`,
+      );
+    }
+    this.telemetry.stageFinished(
+      "investigate",
+      { ...account.counts },
+      idListDetail("questionsWithoutFindings", empty),
+    );
+    this.last = account;
+    return true;
+  }
+}
+
 async function investigateRun(ctx: {
   args: string[];
   tree: string;
@@ -959,9 +1084,9 @@ async function investigateRun(ctx: {
   );
 
   meter.enter("investigate");
-  // Kept outside the stage so the same counts can be re-sent after verify
-  // with the failure total brought up to date; see the re-emit below.
-  let investigateCounts: Record<string, number> = {};
+  // The stage row the release gate reads. Sent when investigate finishes and
+  // again after verify, both times whole; see `InvestigateRow`.
+  const row = new InvestigateRow(telemetry);
   const results = await keepingLedger("investigate", persistLedger, () =>
     withStage(telemetry, "investigate", async () => {
       const runs = await investigate({
@@ -992,48 +1117,32 @@ async function investigateRun(ctx: {
       const unusable = modelUnusableFrom(runs);
       if (unusable) throw new CliError(`investigate: ${unusable}`);
 
-      // Which questions came out with nothing to verify, by name. The count
-      // below goes on the stage row; the names go in the log, because the
-      // release gate can say "3 of 9 questions produced nothing" from the
-      // row alone but can only say WHICH three from here.
-      const empty = questionsWithoutFindings(runs);
-      if (empty.length > 0) {
-        telemetry.log(
-          "investigate",
-          "warn",
-          `${empty.length} of ${runs.length} question(s) produced no kept claim: ${empty.join(", ")}`,
-        );
-      }
-
-      const summary = summariseInvestigation(runs);
-      investigateCounts = {
-        questions: summary.questions,
-        claims: summary.claims,
-        // The model's own reads. The ledger's size is coverage, reported by
-        // render from the union; here it would say the model read the sweep's
-        // files.
-        filesOpened: modelLog.opened().size,
-        filesInLedger: accessLog.opened().size,
-        // What the release gate reads (OGE-2711). A run that lost calls to
-        // the API, or that answered from a fraction of its questions, has
-        // "finished" in exactly the shape of one that did neither, and these
-        // two numbers are how the gate tells them apart. The failure count
-        // is what it is SO FAR; verify adds to it and re-sends this row.
-        modelCallFailures: failures.count(),
-        questionsWithFindings: summary.questionsWithFindings,
-      };
-      telemetry.stageFinished("investigate", investigateCounts);
+      // What the release gate reads (OGE-2711). A run that lost calls to the
+      // API, or that answered from a fraction of its questions, has "finished"
+      // in exactly the shape of one that did neither, and the failure count
+      // and the coverage are how the gate tells them apart. Both are what they
+      // are SO FAR: verify adds failures and takes claims away, and re-sends.
+      row.send(
+        investigateAccount({
+          results: runs,
+          // The model's own reads. The ledger's size is coverage, reported by
+          // render from the union; here it would say the model read the
+          // sweep's files.
+          filesOpened: modelLog.opened().size,
+          filesInLedger: accessLog.opened().size,
+          modelCallFailures: failures.count(),
+        }),
+      );
       return runs;
     }, reportUsage),
   );
 
   const investigation = summariseInvestigation(results);
   const claims: Claim[] = results.flatMap((r) => r.claims);
-  const investigateFailures = failures.count();
   process.stdout.write(
     `  claims     ${claims.length} kept, ${investigation.dropped} dropped\n` +
       `  questions  ${investigation.questionsWithFindings} of ${investigation.questions} produced a kept claim\n` +
-      `  model      ${investigateFailures} call(s) failed\n` +
+      `  model      ${failures.count()} call(s) failed\n` +
       `  files      ${modelLog.opened().size} opened by the model; ${accessLog.opened().size} in the run's ledger\n`,
   );
 
@@ -1080,25 +1189,34 @@ async function investigateRun(ctx: {
       `  ${describeVerification(summary)}\n`,
   );
 
-  // Verify's failed calls, added to the investigate row (OGE-2711).
+  // The investigate row, settled (OGE-2711).
   //
-  // The release gate reads one row for the run's model-call failures, and it
-  // is the investigate row: that is the stage record every run has, and the
-  // gate's contract names it. But the count is meant to cover verify too, and
-  // verify has not run when that row is first sent. So the row is sent again,
-  // same counts with the failure total brought up to date, and only when the
-  // total actually moved. The dashboard replaces a stage's counts wholesale on
-  // a re-sent finish, which is why the whole object goes back rather than the
-  // one field; it also takes the re-send's timestamp as the stage's finish,
-  // which is the price of putting the number where the gate looks, and it is
-  // paid only on a run the gate is going to block anyway.
-  if (failures.count() > investigateFailures) {
-    investigateCounts = { ...investigateCounts, modelCallFailures: failures.count() };
-    telemetry.stageFinished("investigate", investigateCounts);
-    process.stdout.write(
-      `  model      ${failures.count()} call(s) failed across investigate and verify\n`,
-    );
-    await telemetry.flush();
+  // The release gate reads one row for the run's lost calls and its coverage,
+  // and it is the investigate row: the stage record every run has, and the one
+  // the gate's contract names. Verify changes both numbers after that row has
+  // gone out. It adds its own failed calls to the count, and it takes claims
+  // away: a question answered from memory after the budget ran out keeps its
+  // recalled citations at parse and loses them all here, so the coverage the
+  // gate needs is the post-verify one. The row is sent again with both brought
+  // up to date, whole, and only when something moved. On a cancelled run the
+  // verify list is partial and this understates coverage, which is the right
+  // direction for a run somebody stopped.
+  const opened = row.sent();
+  if (opened) {
+    const settled = investigateAccount({
+      results,
+      standing: verification.verified.map((entry) => entry.claim),
+      filesOpened: opened.counts.filesOpened,
+      filesInLedger: opened.counts.filesInLedger,
+      modelCallFailures: failures.count(),
+    });
+    if (row.send(settled)) {
+      process.stdout.write(
+        `  questions  ${settled.counts.questionsWithFindings} of ${settled.counts.questions} produced a finding after verify\n` +
+          `  model      ${settled.counts.modelCallFailures} call(s) failed across investigate and verify\n`,
+      );
+      await telemetry.flush();
+    }
   }
 
   // Verification stops mid-list on a cancel, so the claim set here is partial.

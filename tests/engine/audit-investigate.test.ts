@@ -484,6 +484,38 @@ describe("which questions produced a kept claim", () => {
     expect(summary.questionsWithFindings).toBe(1);
     expect(questionsWithoutFindings(results)).toEqual([]);
   });
+
+  // The parser keeps any claim with a path. A question that ran out of budget
+  // and answered from memory keeps every recalled citation here and loses every
+  // one at verify. Asked again with what verify let through, the same question
+  // is named as having produced nothing, which is what the release gate needs
+  // to hear about it.
+  it("names a question whose every kept claim later fell, when asked with the survivors", async () => {
+    const results = await investigate({
+      questions: [question({ id: "held" }), question({ id: "recalled" })],
+      model: stubModel(cited),
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+    expect(questionsWithoutFindings(results)).toEqual([]);
+
+    const survivors = results.flatMap((r) => r.claims).filter((c) => c.questionId === "held");
+    expect(questionsWithoutFindings(results, survivors)).toEqual(["recalled"]);
+  });
+
+  it("names every question when nothing survived", async () => {
+    const results = await investigate({
+      questions: [question({ id: "a" }), question({ id: "b" })],
+      model: stubModel(cited),
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+    expect(questionsWithoutFindings(results, [])).toEqual(["a", "b"]);
+  });
 });
 
 /* ── An unreadable reply should say what it was ───────────────────────────── */

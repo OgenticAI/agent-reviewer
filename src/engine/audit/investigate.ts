@@ -515,20 +515,44 @@ export function modelUnusableFrom(results: QuestionRunResult[]): string | null {
 }
 
 /**
- * The questions that came out with nothing to verify (OGE-2711).
+ * A claim still standing, at whatever point the question is asked.
+ *
+ * Structural on purpose: before verify the standing claims are the results'
+ * own `claims`; after verify they are the ones verify let through, which the
+ * verify module carries wrapped. Both have a question id, and that is all
+ * coverage needs.
+ */
+export interface StandingClaim {
+  questionId: string;
+}
+
+/**
+ * The questions that came out with nothing (OGE-2711).
  *
  * A question whose every claim was dropped, and one whose run failed, and one
- * the model answered with an empty list, all look the same from here: no kept
- * claim. That is the right thing to count. The claims total already says how
- * much the stage produced; this says how much of the question set it produced
- * it FROM, because ten claims on one question and none on the other nine is a
- * report about one question wearing the cover of ten.
+ * the model answered with an empty list, all look the same from here: no
+ * standing claim. That is the right thing to count. The claims total already
+ * says how much the stage produced; this says how much of the question set it
+ * produced it FROM, because ten claims on one question and none on the other
+ * nine is a report about one question wearing the cover of ten.
+ *
+ * `standing` defaults to every claim the parser kept, which is what this stage
+ * knows. It is asked again after verify with the claims verify let through,
+ * because a question that hit its budget and answered from memory keeps every
+ * recalled citation here (each has a path, so the parser keeps it) and loses
+ * every one of them at verify's anchor check. Counted here alone, a run that
+ * answered every question from memory would report full coverage and pass
+ * the release gate with no findings behind it.
  *
  * Named, not just counted, so the run record can say which ones.
  */
-export function questionsWithoutFindings(results: QuestionRunResult[]): string[] {
+export function questionsWithoutFindings(
+  results: QuestionRunResult[],
+  standing: ReadonlyArray<StandingClaim> = results.flatMap((result) => result.claims),
+): string[] {
+  const answered = new Set(standing.map((claim) => claim.questionId));
   return results
-    .filter((result) => result.claims.length === 0)
+    .filter((result) => !answered.has(result.questionId))
     .map((result) => result.questionId);
 }
 
@@ -542,14 +566,9 @@ export function summariseInvestigation(results: QuestionRunResult[]): {
   filesOpened: number;
 } {
   const opened = new Set(results.flatMap((result) => result.openedFiles));
-  const withFindings = new Set(
-    results
-      .filter((result) => result.claims.length > 0)
-      .map((result) => result.questionId),
-  );
   return {
     questions: results.length,
-    questionsWithFindings: withFindings.size,
+    questionsWithFindings: results.length - questionsWithoutFindings(results).length,
     claims: results.reduce((total, result) => total + result.claims.length, 0),
     dropped: results.reduce(
       (total, result) => total + result.dropped.length,

@@ -11,10 +11,18 @@ import {
   readSweep,
   readVerificationSummary,
   joinRun,
+  investigateAccount,
+  InvestigateRow,
 } from "../src/audit-cli.js";
 import { FileAccessLog } from "../src/engine/audit/inventory.js";
 import { UsageMeter, buildUsageReport, DEFAULT_RATE_CARD } from "../src/engine/audit/usage.js";
-import type { AuditStage } from "../src/engine/audit/telemetry.js";
+import {
+  AuditTelemetry,
+  type AuditEvent,
+  type AuditStage,
+  type TelemetrySink,
+} from "../src/engine/audit/telemetry.js";
+import type { QuestionRunResult } from "../src/engine/audit/investigate.js";
 
 /**
  * resolveStartedBy — who to attribute an audit's subject event to (OGE-2563).
@@ -348,5 +356,135 @@ describe("joinRun", () => {
   it("treats a subject with no history as a rev of its own", () => {
     expect(joinRun({ ...existing, rev: null }, null, path).write).toBe(false);
     expect(() => joinRun({ ...existing, rev: null }, "abc123", path)).toThrow();
+  });
+});
+
+/* ── The investigate row the release gate reads (OGE-2711) ────────────────── */
+
+describe("the investigate row", () => {
+  class Collector implements TelemetrySink {
+    readonly sent: AuditEvent[] = [];
+    async send(events: AuditEvent[]): Promise<void> {
+      this.sent.push(...events);
+    }
+  }
+
+  const GATE_KEYS = [
+    "questions",
+    "claims",
+    "filesOpened",
+    "filesInLedger",
+    "modelCallFailures",
+    "questionsWithFindings",
+  ];
+
+  function claimOn(questionId: string) {
+    return { questionId, statement: "s", evidence: [{ path: "src/a.ts", rev: "r", line: 1 }], absence: false };
+  }
+
+  function answered(questionId: string, claims = 1): QuestionRunResult {
+    return {
+      questionId,
+      claims: Array.from({ length: claims }, () => claimOn(questionId)),
+      dropped: [],
+      openedFiles: ["src/a.ts"],
+    };
+  }
+
+  function silent(questionId: string): QuestionRunResult {
+    return { questionId, claims: [], dropped: [], openedFiles: [] };
+  }
+
+  function setup() {
+    const sink = new Collector();
+    const telemetry = new AuditTelemetry({ runId: "run-1", sink, knownSecrets: [] });
+    const row = new InvestigateRow(telemetry);
+    const finishes = () =>
+      telemetry
+        .events()
+        .filter((e) => e.kind === "stage" && e.stage === "investigate" && e.status === "finished");
+    const warnings = () =>
+      telemetry.events().flatMap((e) => (e.kind === "log" && e.level === "warn" ? [e.message] : []));
+    return { telemetry, row, finishes, warnings };
+  }
+
+  const results = [answered("held", 2), answered("recalled"), silent("failed")];
+  const files = { filesOpened: 4, filesInLedger: 9 };
+
+  // The dashboard replaces counts wholesale. A row missing `questions` makes
+  // the gate skip its coverage check without saying so, so every send has to
+  // carry every key, and this is the test that notices when one stops.
+  it("carries all six counts and the names on its first send", () => {
+    const { row, finishes } = setup();
+    row.send(investigateAccount({ results, ...files, modelCallFailures: 0 }));
+
+    const [first] = finishes() as Array<{ counts: Record<string, number>; detail: string }>;
+    expect(Object.keys(first!.counts).sort()).toEqual([...GATE_KEYS].sort());
+    expect(first!.counts).toMatchObject({ questions: 3, claims: 3, questionsWithFindings: 2, ...files });
+    expect(JSON.parse(first!.detail)).toEqual({ questionsWithoutFindings: ["failed"] });
+  });
+
+  it("does not send the same row twice", () => {
+    const { row, finishes } = setup();
+    const account = investigateAccount({ results, ...files, modelCallFailures: 0 });
+    expect(row.send(account)).toBe(true);
+    expect(row.send(investigateAccount({ results, ...files, modelCallFailures: 0 }))).toBe(false);
+    expect(finishes()).toHaveLength(1);
+  });
+
+  it("re-sends the whole row, not the one field, when verify adds failures", () => {
+    const { row, finishes } = setup();
+    row.send(investigateAccount({ results, ...files, modelCallFailures: 0 }));
+    expect(row.send(investigateAccount({ results, ...files, modelCallFailures: 2 }))).toBe(true);
+
+    const [first, second] = finishes() as Array<{ counts: Record<string, number> }>;
+    expect(Object.keys(second!.counts).sort()).toEqual(Object.keys(first!.counts).sort());
+    expect(second!.counts).toEqual({ ...first!.counts, modelCallFailures: 2 });
+  });
+
+  // The starved run: every question answered from memory after its budget ran
+  // out, every citation kept at parse, every one rejected at verify. The first
+  // row says every question was covered. The settled row has to say what the
+  // gate's own fallback would say from the findings table: only what stood.
+  it("re-sends with the coverage verify left, naming the questions that lost everything", () => {
+    const { row, finishes, warnings } = setup();
+    const opened = investigateAccount({ results, ...files, modelCallFailures: 0 });
+    row.send(opened);
+
+    const survivors = results.flatMap((r) => r.claims).filter((c) => c.questionId === "held");
+    const settled = investigateAccount({ results, standing: survivors, ...files, modelCallFailures: 0 });
+    expect(row.send(settled)).toBe(true);
+
+    const [first, second] = finishes() as Array<{ counts: Record<string, number>; detail: string }>;
+    expect(second!.counts.questionsWithFindings).toBeLessThan(first!.counts.questionsWithFindings!);
+    expect(second!.counts.questionsWithFindings).toBe(1);
+    expect(second!.counts).toMatchObject({ questions: 3, claims: 3, ...files });
+    expect(JSON.parse(second!.detail).questionsWithoutFindings).toEqual(["recalled", "failed"]);
+    // A human reads the log; the names went there too, once per change.
+    expect(warnings()).toHaveLength(2);
+    expect(warnings()[1]).toMatch(/2 of 3 question\(s\).*recalled, failed/);
+  });
+
+  it("keeps the file counts the investigate stage measured on the settled row", () => {
+    const { row } = setup();
+    row.send(investigateAccount({ results, ...files, modelCallFailures: 0 }));
+    const opened = row.sent()!;
+    const settled = investigateAccount({
+      results,
+      standing: [],
+      filesOpened: opened.counts.filesOpened,
+      filesInLedger: opened.counts.filesInLedger,
+      modelCallFailures: 1,
+    });
+    expect(settled.counts).toMatchObject(files);
+    expect(settled.counts.questionsWithFindings).toBe(0);
+  });
+
+  it("says nothing about names when every question produced something", () => {
+    const { row, finishes, warnings } = setup();
+    row.send(investigateAccount({ results: [answered("a"), answered("b")], ...files, modelCallFailures: 0 }));
+    const [first] = finishes() as Array<{ detail: string }>;
+    expect(JSON.parse(first!.detail)).toEqual({ questionsWithoutFindings: [] });
+    expect(warnings()).toHaveLength(0);
   });
 });

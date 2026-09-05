@@ -91,7 +91,14 @@ export interface StageEvent {
   at: string;
   /** e.g. `{ questions: 9 }` — whatever the stage counts. */
   counts?: Record<string, number>;
-  /** Why it was skipped or how it failed. Required for both. */
+  /**
+   * Why it was skipped or how it failed. Required for both.
+   *
+   * On a finished stage it may carry what `counts` cannot: a JSON object
+   * holding a list of ids (OGE-2711). The dashboard stores it as text and
+   * reads it back as JSON when it parses, so it is built with `idListDetail`,
+   * which keeps it under the cap; a JSON detail the cap cut in half is prose.
+   */
   detail?: string;
 }
 
@@ -250,6 +257,35 @@ export function redactLine(text: string, knownSecrets: string[]): string {
 }
 
 /**
+ * A stage detail carrying a list of ids as JSON, kept under the cap.
+ *
+ * The cap is what makes "logs are not a transcript" mechanical, and it does
+ * not know JSON: a detail it truncates ends in the marker, and a truncated
+ * object does not parse, so the dashboard would read nothing from it. The
+ * list is therefore cut here, whole ids at a time from the end, until the
+ * object fits, and the object says how many it left out. A partial list that
+ * says it is partial is still a list; a truncated one is noise.
+ *
+ * Ids are the engine's own question names, never client material, so nothing
+ * here needs masking beyond what `stageFinished` applies anyway.
+ */
+export function idListDetail(key: string, ids: readonly string[]): string {
+  const render = (kept: readonly string[]): string =>
+    JSON.stringify(
+      kept.length === ids.length
+        ? { [key]: kept }
+        : { [key]: kept, [`${key}Omitted`]: ids.length - kept.length },
+    );
+  let kept = ids.length;
+  let detail = render(ids.slice(0, kept));
+  while (detail.length > MAX_LOG_CHARS && kept > 0) {
+    kept -= 1;
+    detail = render(ids.slice(0, kept));
+  }
+  return detail;
+}
+
+/**
  * Records what a run is doing, and hands it to a sink.
  *
  * Every method is synchronous and never throws. A stage calling `progress` is
@@ -299,7 +335,11 @@ export class AuditTelemetry {
     });
   }
 
-  stageFinished(stage: AuditStage, counts?: Record<string, number>): void {
+  stageFinished(
+    stage: AuditStage,
+    counts?: Record<string, number>,
+    detail?: string,
+  ): void {
     this.record({
       kind: "stage",
       runId: this.runId,
@@ -307,6 +347,7 @@ export class AuditTelemetry {
       status: "finished",
       at: this.at(),
       ...(counts ? { counts } : {}),
+      ...(detail !== undefined ? { detail: redactLine(detail, this.knownSecrets) } : {}),
     });
   }
 

@@ -282,6 +282,10 @@ export function toAuditFindings(options: ToFindingsOptions): ClosureResult {
       evidence: claim.evidence,
       verifiers: entry.verifiers,
       refutations: entry.refutations,
+      // What the claim cited and could not keep travels with it. Absent when
+      // nothing was dropped, so a finding's JSON does not grow a key for a
+      // thing that did not happen.
+      ...(entry.dropped && entry.dropped.length > 0 ? { dropped: entry.dropped } : {}),
     };
 
     if (confidence === "not-determinable") {

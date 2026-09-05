@@ -14,6 +14,8 @@ import {
   MIN_VERIFIERS,
   MIN_VOCABULARIES,
   REJECTION_CODES,
+  CITATION_CODES,
+  ANCHOR_WINDOW,
   type LineReader,
   type VerifierModel,
   type VerifierVerdict,
@@ -77,6 +79,20 @@ const DRIFT_QUOTE = "return repository.GetOrderById(id);";
 const driftTree: LineReader = (path, line) => {
   if (path !== "src/orders.ts" || line > DRIFT_TREE_LENGTH) return null;
   return line === DRIFT_LINE ? `    ${DRIFT_QUOTE}` : `// filler ${line}`;
+};
+
+/**
+ * A file with one ordinary line repeated in several places, far apart, the
+ * way `return null;` is in any file with more than one early exit. A claim
+ * about one of them cited from memory lands on none of them, and the nearest
+ * is not the one it meant.
+ */
+const REPEAT_TREE_LENGTH = 200;
+const REPEAT_LINES = [20, 61, 150];
+const REPEAT_QUOTE = "return null;";
+const repeatTree: LineReader = (path, line) => {
+  if (path !== "src/auth.ts" || line > REPEAT_TREE_LENGTH) return null;
+  return REPEAT_LINES.includes(line) ? `    ${REPEAT_QUOTE}` : `// filler ${line}`;
 };
 
 function verdict(over: Partial<VerifierVerdict> = {}): VerifierVerdict {
@@ -387,6 +403,7 @@ describe("a quote found outside the window", () => {
     const kept = result.verified[0]?.claim.evidence ?? [];
     expect(kept).toHaveLength(1);
     expect(kept[0]).toMatchObject({ line: DRIFT_LINE, quote: DRIFT_QUOTE });
+    expect(result.verified[0]?.dropped?.map((c) => c.line)).toEqual([12]);
     expect(result.verified[0]?.confidence).toBe("inferred");
   });
 
@@ -417,6 +434,11 @@ describe("a quote found outside the window", () => {
       "quote-absent": [
         drifted({ evidence: [{ path: "src/orders.ts", rev: REV, line: 12, quote: "await stripe.charges.create(payload)" }] }),
         drifted({ evidence: [{ path: "src/orders.ts", rev: REV, line: 30, quote: "return cache.get(rawToken)" }] }),
+      ],
+      // Every filler line carries the word; cited past the end, the window is
+      // empty and the whole file offers a hundred-odd lines to choose from.
+      "quote-ambiguous": [
+        drifted({ evidence: [{ path: "src/orders.ts", rev: REV, line: DRIFT_TREE_LENGTH + 5, quote: "// filler" }] }),
       ],
       "line-beyond-eof": [
         drifted({ evidence: [{ path: "src/orders.ts", rev: REV, line: DRIFT_TREE_LENGTH + 7, quote: "return cache.get(rawToken)" }] }),
@@ -479,7 +501,8 @@ describe("a quote found outside the window", () => {
     for (const code of REJECTION_CODES) {
       expect(line).toContain(`${code} ${summary.rejectedBy[code]}`);
     }
-    expect(line).toMatch(new RegExp(`corrected for line drift: ${summary.corrected}$`));
+    expect(line).toMatch(new RegExp(`corrected for line drift: ${summary.corrected}\\b`));
+    expect(line).toMatch(new RegExp(`citations dropped from kept claims: ${summary.dropped}\\b`));
     expect(line).not.toContain("—");
   });
 
@@ -497,6 +520,204 @@ describe("a quote found outside the window", () => {
     expect(counts.rejectedFileUnreadable).toBe(summary.rejectedBy["file-unreadable"]);
     expect(counts.correctedLineDrift).toBe(summary.corrected);
     for (const value of Object.values(counts)) expect(typeof value).toBe("number");
+  });
+});
+
+/* ── A quote the file holds more than once ────────────────────────────────── */
+
+describe("a quote the file holds at more than one line", () => {
+  function repeated(line: number, quote = REPEAT_QUOTE): Claim {
+    return claim({
+      questionId: "authorize-null",
+      statement: "The authorisation check returns null for an unknown caller.",
+      evidence: [{ path: "src/auth.ts", rev: REV, line, quote }],
+    });
+  }
+
+  // In the window the cited line is the anchor and the quote confirms it, so
+  // a repeated quote cited at one of its lines is exactly where it says.
+  it("holds at the cited line when that line is one of the occurrences", () => {
+    const cited = REPEAT_LINES[1]!;
+    const exact = repeated(cited);
+    expect(anchorClaim(exact, repeatTree).problems).toEqual([]);
+    expect(exact.evidence[0]?.line).toBe(cited);
+    expect(exact.evidence[0]?.corrected).toBeUndefined();
+  });
+
+  // Away from every occurrence the quote is the only anchor, and a quote at
+  // three lines names none of them. The nearest-first rule that is right in
+  // the window would move a claim about one function onto the same line in
+  // another, and the report would cite it at `inferred` as if it were found.
+  it("refuses to relocate it when the cited line is near none of them, and says how many there are", () => {
+    const cited = REPEAT_LINES[0]! - ANCHOR_WINDOW - 5;
+    const fromMemory = repeated(cited);
+    const report = anchorClaim(fromMemory, repeatTree);
+
+    expect(report.corrected).toEqual([]);
+    expect(report.held).toEqual([]);
+    expect(report.problems[0]).toMatchObject({ reason: "quote-ambiguous", occurrences: REPEAT_LINES.length });
+    expect(fromMemory.evidence[0]?.line).toBe(cited);
+    expect(fromMemory.evidence[0]?.corrected).toBeUndefined();
+  });
+
+  // The same rule for a one-word quote: `return` is on every one of those
+  // lines and more, and a citation it cannot place is not evidence.
+  it("treats a one-word quote the file holds several times the same way", () => {
+    const short = repeated(5, "return");
+    const problem = anchorClaim(short, repeatTree).problems[0];
+    expect(problem?.reason).toBe("quote-ambiguous");
+    expect(problem?.occurrences).toBeGreaterThanOrEqual(REPEAT_LINES.length);
+  });
+
+  // The whole-file pass is stricter than the window, not looser: a quote
+  // the file holds exactly once still moves, as the drift cases show.
+  it("still relocates a quote the file holds exactly once", () => {
+    const unique = repeated(5, DRIFT_QUOTE);
+    const once: LineReader = (path, line) =>
+      line === 100 && path === "src/auth.ts" ? `    ${DRIFT_QUOTE}` : repeatTree(path, line);
+    expect(anchorClaim(unique, once).corrected).toHaveLength(1);
+    expect(unique.evidence[0]?.line).toBe(100);
+  });
+
+  it("rejects a claim whose only citation is ambiguous, under its own code", async () => {
+    const result = await verifyClaims({
+      claims: [repeated(5)],
+      model: stubModel(verdict()),
+      readLine: repeatTree,
+      log: () => {},
+    });
+    expect(result.verified).toEqual([]);
+    expect(result.rejected[0]?.code).toBe("quote-ambiguous");
+    expect(summariseVerification(result).rejectedBy["quote-ambiguous"]).toBe(1);
+  });
+});
+
+/* ── A quote with no words in it ──────────────────────────────────────────── */
+
+describe("a quote with no words in it", () => {
+  // Punctuation matches every line, so within the window it is located by
+  // the cited line and nothing changes: the citation stays where it was.
+  it("holds at the cited line when that line exists", () => {
+    const brace = claim({ evidence: [{ path: "src/orders.ts", rev: REV, line: 50, quote: "}" }] });
+    expect(anchorClaim(brace, driftTree).problems).toEqual([]);
+    expect(brace.evidence[0]?.line).toBe(50);
+    expect(brace.evidence[0]?.corrected).toBeUndefined();
+  });
+
+  // Past the end of the file there is no line to anchor it, and a quote that
+  // would match every line of the file cannot choose one. It used to land on
+  // the last line and pass as line drift; a zero-signal quote never drifts.
+  it("is rejected past the end of the file rather than moved to the last line", () => {
+    const brace = claim({ evidence: [{ path: "src/orders.ts", rev: REV, line: DRIFT_TREE_LENGTH + 700, quote: "}" }] });
+    const report = anchorClaim(brace, driftTree);
+    expect(report.corrected).toEqual([]);
+    expect(report.problems[0]?.reason).toBe("line-beyond-eof");
+    expect(brace.evidence[0]?.line).toBe(DRIFT_TREE_LENGTH + 700);
+    expect(brace.evidence[0]?.corrected).toBeUndefined();
+  });
+});
+
+/* ── A citation dropped from a claim that was kept ────────────────────────── */
+
+describe("a claim that cited something the check could not find, beside something it could", () => {
+  const REAL = { path: "src/orders.ts", rev: REV, line: DRIFT_LINE, quote: DRIFT_QUOTE };
+  const INVENTED = { path: "src/orders.ts", rev: REV, line: 12, quote: "await stripe.charges.create(payload)" };
+
+  function mixed(): Claim {
+    return claim({
+      questionId: "ownership-check",
+      statement: "Orders are fetched by id with no ownership check.",
+      evidence: [INVENTED, REAL],
+    });
+  }
+
+  // The real citation is at its own correct line, so nothing is moved and the
+  // old cap did not apply; the claim reached `verified` with an invented
+  // citation silently filtered out, while a merely misnumbered one was capped.
+  it("is capped at inferred, however many verifiers could not refute it", async () => {
+    const result = await verifyClaims({
+      claims: [mixed()],
+      model: stubModel(verdict()),
+      readLine: driftTree,
+      verifiers: 3,
+      log: () => {},
+    });
+
+    expect(result.rejected).toEqual([]);
+    expect(result.verified[0]?.refutations).toBe(0);
+    expect(result.verified[0]?.claim.evidence.every((ref) => ref.corrected === undefined)).toBe(true);
+    expect(result.verified[0]?.confidence).toBe("inferred");
+  });
+
+  // Dropped, not forgotten: the citation leaves the evidence and goes on the
+  // record, so the finding can say what its author cited that was not there.
+  it("records the dropped citation by path, line and reason, and keeps it out of the evidence", async () => {
+    const result = await verifyClaims({
+      claims: [mixed()],
+      model: stubModel(verdict()),
+      readLine: driftTree,
+      log: () => {},
+    });
+    const kept = result.verified[0]!;
+
+    expect(kept.claim.evidence).toHaveLength(1);
+    expect(kept.claim.evidence[0]).toMatchObject({ path: REAL.path, line: REAL.line });
+    expect(kept.dropped).toEqual([{ path: INVENTED.path, line: INVENTED.line, reason: "quote-absent" }]);
+  });
+
+  it("leaves no record on a claim that dropped nothing", async () => {
+    const result = await verifyClaims({
+      claims: [claim({ evidence: [REAL] })],
+      model: stubModel(verdict()),
+      readLine: driftTree,
+      log: () => {},
+    });
+    expect(result.verified[0]?.dropped).toBeUndefined();
+    expect(result.verified[0]?.confidence).toBe("verified");
+  });
+
+  // The count an operator reads must not say "quote-absent 0" on a run whose
+  // every claim carried one invented citation. Dropped citations are counted
+  // by the same codes as rejections, apart from them.
+  it("is counted in the summary, by code, apart from the rejections", async () => {
+    const result = await verifyClaims({
+      claims: [
+        mixed(),
+        claim({ evidence: [REAL, { path: "src/missing.ts", rev: REV, line: 3, quote: "anything" }] }),
+        claim({ evidence: [INVENTED] }),
+      ],
+      model: stubModel(verdict()),
+      readLine: driftTree,
+      log: () => {},
+    });
+    const summary = summariseVerification(result);
+
+    expect(summary.rejected).toBe(1);
+    expect(summary.rejectedBy["quote-absent"]).toBe(1);
+    expect(summary.dropped).toBe(2);
+    expect(summary.droppedBy["quote-absent"]).toBe(1);
+    expect(summary.droppedBy["file-unreadable"]).toBe(1);
+    expect(Object.values(summary.droppedBy).reduce((n, c) => n + c, 0)).toBe(summary.dropped);
+    expect(summary.dropped).toBe(result.verified.reduce((n, entry) => n + (entry.dropped?.length ?? 0), 0));
+  });
+
+  it("appears on the one line and in the flat counts", async () => {
+    const result = await verifyClaims({
+      claims: [mixed()],
+      model: stubModel(verdict()),
+      readLine: driftTree,
+      log: () => {},
+    });
+    const summary = summariseVerification(result);
+    const line = describeVerification(summary);
+    const counts = verificationCounts(summary);
+
+    expect(line).toMatch(new RegExp(`citations dropped from kept claims: ${summary.dropped}\\b`));
+    for (const code of CITATION_CODES) {
+      expect(line).toContain(`${code} ${summary.droppedBy[code]}`);
+    }
+    expect(counts.droppedCitations).toBe(summary.dropped);
+    expect(counts.droppedQuoteAbsent).toBe(summary.droppedBy["quote-absent"]);
   });
 });
 
@@ -810,12 +1031,21 @@ describe("the run summary", () => {
       rejected: 1,
       rejectedBy: {
         "quote-absent": 1,
+        "quote-ambiguous": 0,
         "line-beyond-eof": 0,
         "file-unreadable": 0,
         "not-a-line-reference": 0,
         refuted: 0,
       },
       corrected: 0,
+      dropped: 0,
+      droppedBy: {
+        "quote-absent": 0,
+        "quote-ambiguous": 0,
+        "line-beyond-eof": 0,
+        "file-unreadable": 0,
+        "not-a-line-reference": 0,
+      },
     });
   });
 });

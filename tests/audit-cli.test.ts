@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   ledgerPersister,
   keepingLedger,
   readSweep,
+  readVerificationSummary,
   joinRun,
 } from "../src/audit-cli.js";
 import { FileAccessLog } from "../src/engine/audit/inventory.js";
@@ -243,6 +244,60 @@ describe("readSweep", () => {
   it("refuses a file that is not a sweep record", () => {
     writeFileSync(join(scratch, "sweep.json"), JSON.stringify({ runId: "not-a-sweep" }));
     expect(() => readSweep(scratch)).toThrow(/not a sweep record/);
+  });
+});
+
+/**
+ * readVerificationSummary: the record must belong to the findings.
+ *
+ * verification.json is written before the closure gate so a refused run
+ * keeps it, and a refused run writes no findings.json. With --out reused, the
+ * next render read the refused run's counts above the previous run's findings
+ * and said "a rejected claim does not appear in this report" about a claim
+ * set the report was not built from. Every investigate run writes
+ * verification.json before findings.json; one that is newer is from a run
+ * that never got that far.
+ */
+describe("readVerificationSummary", () => {
+  let scratch: string;
+  const record = { examined: 2, verified: 1, inferred: 0, notDeterminable: 0, rejected: 1 };
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "read-verification-"));
+  });
+  afterEach(() => {
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  function writeAt(name: string, content: string, secondsAgo: number): string {
+    const path = join(scratch, name);
+    writeFileSync(path, content);
+    const at = new Date(Date.now() - secondsAgo * 1000);
+    utimesSync(path, at, at);
+    return path;
+  }
+
+  it("is undefined when the run left no record", () => {
+    expect(readVerificationSummary(scratch, join(scratch, "findings.json"))).toBeUndefined();
+  });
+
+  it("pairs a record written before the findings, as every completed run writes them", () => {
+    writeAt("verification.json", JSON.stringify(record), 60);
+    const findings = writeAt("findings.json", "[]", 30);
+    expect(readVerificationSummary(scratch, findings)).toEqual({ summary: record, paired: true });
+  });
+
+  it("does not pair a record newer than the findings, which a refused run leaves behind", () => {
+    const findings = writeAt("findings.json", "[]", 60);
+    writeAt("verification.json", JSON.stringify(record), 30);
+    expect(readVerificationSummary(scratch, findings)).toMatchObject({ summary: record, paired: false });
+  });
+
+  // The caller has the findings open already, so a missing stat is a race,
+  // not an answer; the sweep's pairing rule makes the same call.
+  it("pairs when the findings cannot be stat'ed", () => {
+    writeAt("verification.json", JSON.stringify(record), 30);
+    expect(readVerificationSummary(scratch, join(scratch, "not-there.json"))?.paired).toBe(true);
   });
 });
 

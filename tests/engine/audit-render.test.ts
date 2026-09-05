@@ -227,12 +227,21 @@ describe("what verification threw away, in Coverage", () => {
       rejected: 54,
       rejectedBy: {
         "quote-absent": 45,
+        "quote-ambiguous": 0,
         "line-beyond-eof": 7,
         "file-unreadable": 2,
         "not-a-line-reference": 0,
         refuted: 0,
       },
       corrected: 6,
+      dropped: 3,
+      droppedBy: {
+        "quote-absent": 2,
+        "quote-ambiguous": 1,
+        "line-beyond-eof": 0,
+        "file-unreadable": 0,
+        "not-a-line-reference": 0,
+      },
       ...over,
     };
   }
@@ -280,6 +289,33 @@ describe("what verification threw away, in Coverage", () => {
   it("prints an unmoved citation as it always did", () => {
     const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
     expect(source).toMatch(/^- src\/startup\.ts:42$/m);
+  });
+
+  // A citation the claim gave and the check could not find is named on the
+  // page, under its own heading and after the evidence, so a reader can see
+  // the finding's author cited something that is not there without taking
+  // it for something the finding rests on. No quote: the text was not found.
+  it("names a dropped citation under its own heading, after the evidence and without a quote", () => {
+    const withDropped = finding({
+      confidence: "inferred",
+      dropped: [
+        { path: "src/orders.ts", line: 10, reason: "quote-absent" },
+        { path: "src/orders.ts", line: 900, reason: "quote-ambiguous", occurrences: 3 },
+      ],
+    });
+    const source = renderTypst({ input: input({ findings: [withDropped] }), executiveSummary: SUMMARY });
+
+    expect(source.indexOf("*Evidence*")).toBeLessThan(source.indexOf("*Cited and not relied on*"));
+    expect(source).toMatch(/^- src\/orders\.ts:10 \(the quoted text is nowhere in the file\)$/m);
+    expect(source).toMatch(/^- src\/orders\.ts:900 \(the quoted text is at 3 lines of the file/m);
+    for (const line of source.split("\n").filter((l) => l.includes("src/orders.ts:"))) {
+      expect(line).not.toContain("—");
+    }
+  });
+
+  it("prints no such heading for a finding that dropped nothing", () => {
+    const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
+    expect(source).not.toContain("Cited and not relied on");
   });
 });
 

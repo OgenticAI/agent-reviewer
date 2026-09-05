@@ -1315,21 +1315,44 @@ function readQuestionOutcomes(outDir: string): QuestionOutcome[] | undefined {
 }
 
 /**
- * What verification kept and threw away, if the run left a record.
+ * What verification kept and threw away, if the run left a record, and
+ * whether that record belongs to the findings being rendered.
  *
  * Optional for the same reason `readQuestionOutcomes` is: an older run never
  * wrote it, and the report then omits the line rather than printing a count
  * it does not have. A run that reaches render without it is not wrong about
  * anything it prints; it is silent about one thing.
+ *
+ * `paired` is the same mtime rule `sweepPredates` applies to sweep.json.
+ * verification.json is written before the closure gate, on purpose, so a run
+ * refused there still has its verify stage on record; but that run writes no
+ * findings.json, and with --out reused across runs the next render would put
+ * the refused run's "examined 75, rejected 54" above the previous run's
+ * findings, and its "a rejected claim does not appear in this report" would
+ * be about a different set of claims. Every investigate run writes
+ * verification.json before findings.json, so a verification.json that is
+ * NEWER than the findings is from a run that never got that far. Unreadable
+ * stats pair, as they do for the sweep: the caller has the findings open, so
+ * that is a race, not an answer.
  */
-function readVerificationSummary(outDir: string): VerificationSummary | undefined {
+export function readVerificationSummary(
+  outDir: string,
+  findingsPath: string,
+): { summary: VerificationSummary; paired: boolean } | undefined {
+  const path = join(outDir, "verification.json");
+  let summary: VerificationSummary;
   try {
-    return JSON.parse(
-      readFileSync(join(outDir, "verification.json"), "utf8"),
-    ) as VerificationSummary;
+    summary = JSON.parse(readFileSync(path, "utf8")) as VerificationSummary;
   } catch {
     return undefined;
   }
+  let paired = true;
+  try {
+    paired = statSync(path).mtimeMs <= statSync(findingsPath).mtimeMs;
+  } catch {
+    paired = true;
+  }
+  return { summary, paired };
 }
 
 /**
@@ -1444,7 +1467,7 @@ async function runRender(args: string[]): Promise<number> {
   const accessLog = readAccessLog(out);
   const questionOutcomes = readQuestionOutcomes(out);
   const sweep = readSweep(out);
-  const verification = readVerificationSummary(out);
+  const verification = readVerificationSummary(out, findingsPath);
   // The merge lives in investigate, so a sweep.json written after the
   // findings holds candidates the findings do not. File order is the record
   // of that; the section says so rather than pointing at findings that are
@@ -1458,6 +1481,12 @@ async function runRender(args: string[]): Promise<number> {
       "render",
       "warn",
       "sweep.json is newer than findings.json; its candidates were not folded into the findings",
+    );
+  if (verification && !verification.paired)
+    renderTelemetry.log(
+      "render",
+      "warn",
+      "verification.json is newer than the findings; it is from a run that wrote no findings, and the report omits it",
     );
   const result = await withStage(renderTelemetry, "render", async () => {
     const rendered = await renderReport({
@@ -1473,9 +1502,11 @@ async function runRender(args: string[]): Promise<number> {
         // Absent when the run record is missing: the renderer omits the maturity
         // table rather than rating every category on nothing.
         ...(questionOutcomes ? { questionOutcomes } : {}),
-        // Absent on a run that predates the record: the line is omitted rather
-        // than counted from findings, which cannot see a rejected claim.
-        ...(verification ? { verification } : {}),
+        // Absent on a run that predates the record, and on a record from a
+        // later run that wrote no findings: the line is omitted rather than
+        // counted from findings, which cannot see a rejected claim, and rather
+        // than printed over findings it does not describe.
+        ...(verification?.paired ? { verification: verification.summary } : {}),
         // Absent when no sweep ran: the section then says so, rather than the
         // coverage figure passing as whole-tree when it is the model's alone.
         ...(sweep ? { sweep, sweepMerged } : {}),

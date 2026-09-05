@@ -31,7 +31,7 @@
  */
 
 import type { Claim } from "./investigate.js";
-import type { Confidence, EvidenceRef } from "./finding.js";
+import type { Confidence, DroppedCitation, EvidenceRef } from "./finding.js";
 import { sanitizeUntrusted } from "../tools/sanitize.js";
 
 /** Minimum independent verifiers before `verified` may be claimed. */
@@ -67,6 +67,12 @@ export interface VerifiedClaim {
   needsAccess?: string;
   /** Distinct vocabularies searched across verifiers, for an absence claim. */
   vocabulariesTried: string[];
+  /**
+   * Present when the citation check dropped a quoted citation the claim gave.
+   * The claim stands on what held; this is the record of what did not, and it
+   * is what caps the claim at `inferred` and reaches the finding as `dropped`.
+   */
+  dropped?: DroppedCitation[];
 }
 
 /**
@@ -79,14 +85,28 @@ export interface VerifiedClaim {
  * failures of the investigation, and a reader deciding whether to trust the
  * remaining 21 needs to know which one they are looking at.
  */
-export type RejectionCode = AnchorProblem["reason"] | "refuted";
+export type RejectionCode = CitationCode | "refuted";
 
-/** Every code, in the order the summary line prints them. */
-export const REJECTION_CODES: readonly RejectionCode[] = [
+/**
+ * Why one quoted citation was not kept. A claim is rejected under the code of
+ * its first failed citation when nothing it cites holds; a claim that keeps
+ * something drops the failed citation under the same code, and the run counts
+ * those apart, because a dropped invention is still an invention.
+ */
+export type CitationCode = AnchorProblem["reason"];
+
+/** Every citation code, in the order the summary line prints them. */
+export const CITATION_CODES: readonly CitationCode[] = [
   "quote-absent",
+  "quote-ambiguous",
   "line-beyond-eof",
   "file-unreadable",
   "not-a-line-reference",
+];
+
+/** Every rejection code, in the order the summary line prints them. */
+export const REJECTION_CODES: readonly RejectionCode[] = [
+  ...CITATION_CODES,
   "refuted",
 ];
 
@@ -129,6 +149,11 @@ export type PathKind = (path: string) => "file" | "directory" | "missing";
  *                       Real evidence at a wrong address: corrected, and the
  *                       claim capped at `inferred`.
  * - `quote-absent`      the file is real and the quote is nowhere in it.
+ * - `quote-ambiguous`   the quote is at more than one line of the file and
+ *                       none of them is near the cited line. Real text, but
+ *                       no address: the gate cannot say which one the claim
+ *                       meant, and guessing the nearest moved a claim about
+ *                       one function onto a `return null;` in another.
  * - `line-beyond-eof`   the cited line is past the end of the file and the
  *                       quote is nowhere in it. A drift whose cited line was
  *                       past the end is still `line-drift`, flagged.
@@ -145,6 +170,7 @@ export type AnchorOutcome =
   | "holds"
   | "line-drift"
   | "quote-absent"
+  | "quote-ambiguous"
   | "line-beyond-eof"
   | "file-unreadable"
   | "not-a-line-reference";
@@ -152,6 +178,8 @@ export type AnchorOutcome =
 export interface AnchorProblem {
   ref: EvidenceRef;
   reason: Exclude<AnchorOutcome, "holds" | "line-drift">;
+  /** For `quote-ambiguous`: how many lines of the file carry the quote. */
+  occurrences?: number;
 }
 
 /** A citation moved to where its quote actually is, outside the window. */
@@ -226,9 +254,11 @@ function significantWords(text: string): string[] {
  * CHECKS AND CORRECTS. Where the quote is found within `ANCHOR_WINDOW` lines of
  * the line claimed, `ref.line` is rewritten to where it actually is, so the
  * report cites the truth rather than the model's arithmetic. Where it is found
- * anywhere else in the file, `ref.line` is rewritten the same way and the ref
- * is marked `corrected`, which is what caps the claim at `inferred`. The claim
- * is mutated in place; nothing else about it is touched.
+ * at exactly one other line of the file, `ref.line` is rewritten the same way
+ * and the ref is marked `corrected`, which is what caps the claim at
+ * `inferred`. Where it is found at several, nothing is rewritten: the check
+ * cannot say which one the claim meant, and the citation fails as ambiguous.
+ * The claim is mutated in place; nothing else about it is touched.
  *
  * The problems alone, for callers that only ask whether the claim may pass;
  * `anchorClaim` is the same check with the corrections and the survivors.
@@ -300,6 +330,10 @@ export function anchorClaim(
       held.push(ref);
       continue;
     }
+    if (found.kind === "quote-ambiguous") {
+      problems.push({ ref, reason: found.kind, occurrences: found.occurrences });
+      continue;
+    }
     problems.push({ ref, reason: found.kind });
   }
 
@@ -321,6 +355,7 @@ type Located =
   | { kind: "holds"; line: number }
   | { kind: "line-drift"; line: number; beyondEof: boolean }
   | { kind: "quote-absent" }
+  | { kind: "quote-ambiguous"; occurrences: number }
   | { kind: "line-beyond-eof" }
   | { kind: "file-unreadable" };
 
@@ -328,11 +363,23 @@ type Located =
  * Where the quote actually is.
  *
  * The window around the cited line is searched first, and a hit there `holds`.
- * Only when the window fails is the whole file read: a quote found anywhere
- * else is `line-drift`, and one found nowhere is absent. The two searches are
- * the same match at the same threshold; widening WHERE the gate looks does
- * not loosen WHAT it accepts, and a fabricated quote that passed the window
- * 0.0% of the time passes the whole file no more often per line.
+ * Only when the window fails is the whole file read: a quote found at exactly
+ * one other place is `line-drift`, one found at several is ambiguous, and one
+ * found nowhere is absent. The two searches are the same match at the same
+ * threshold; widening WHERE the gate looks does not loosen WHAT it accepts,
+ * and a fabricated quote that passed the window 0.0% of the time passes the
+ * whole file no more often per line.
+ *
+ * The window and the file are anchored differently, and that is why the
+ * second pass is stricter about what it will move. In the window the cited
+ * line is the anchor and the quote only confirms it, so a quote that several
+ * lines could satisfy still lands on the nearest one, which is the one the
+ * claim meant. In the whole file the quote is the only anchor there is. A
+ * quote at three lines of the file names none of them, and a quote of nothing
+ * but punctuation names every line: neither can place a citation, and the
+ * nearest-first rule that is right in the window would here move a claim
+ * about one function onto the same `return null;` in another, or a `}` past
+ * the end of the file onto its last line.
  *
  * A file that cannot be read at all is its own answer, and a cited line past
  * the end of a readable file is another: telling an operator the file was
@@ -344,7 +391,8 @@ function locateQuote(
   line: number,
   readLine: LineReader,
 ): Located {
-  const match = matcherFor(quote);
+  const wanted = significantWords(quote);
+  const match = matcherFor(wanted);
   const height = Math.min(quote.split("\n").length, ANCHOR_WINDOW + 1);
 
   const window = new Map<number, string>();
@@ -352,8 +400,13 @@ function locateQuote(
     const text = readLine(path, n);
     if (text !== null) window.set(n, text);
   }
-  const inWindow = searchLines(match, window, line, height);
-  if (inWindow !== null) return { kind: "holds", line: inWindow };
+  // Nearest first, so a correction moves the reference as little as the
+  // evidence allows, and an exact hit at the cited line never gets displaced.
+  const nearest = [...window.keys()].sort(
+    (a, b) => Math.abs(a - line) - Math.abs(b - line) || a - b,
+  );
+  const inWindow = matchingLines(match, window, nearest, height)[0];
+  if (inWindow !== undefined) return { kind: "holds", line: inWindow };
 
   // Read to the end, or to the guard. `null` from the reader is the end of
   // the file, so a file whose first line is `null` is one that could not be
@@ -373,30 +426,42 @@ function locateQuote(
 
   // Only a file read to its end can say the citation overran it.
   const beyondEof = reachedEnd && line > file.size;
-  const inFile = searchLines(match, file, line, height);
-  if (inFile !== null) return { kind: "line-drift", line: inFile, beyondEof };
+
+  // A quote with no words in it matched every line of the window, so an empty
+  // window is the only way it gets here, and the file has nothing to add: it
+  // would match every line of that too. What is left to say is whether the
+  // cited line was past the end.
+  if (wanted.length === 0) {
+    return { kind: beyondEof ? "line-beyond-eof" : "quote-absent" };
+  }
+
+  const ascending = [...file.keys()].sort((a, b) => a - b);
+  const inFile = matchingLines(match, file, ascending, height);
+  if (inFile.length === 1) {
+    return { kind: "line-drift", line: inFile[0]!, beyondEof };
+  }
+  if (inFile.length > 1) {
+    return { kind: "quote-ambiguous", occurrences: inFile.length };
+  }
   return { kind: beyondEof ? "line-beyond-eof" : "quote-absent" };
 }
 
 /**
- * The first line, nearest the cited one, at which the quote appears.
+ * Every line at which the quote appears, in the order the lines are given.
  *
- * Nearest first, so a correction moves the reference as little as the
- * evidence allows, and an exact hit at the cited line never gets displaced.
+ * Single lines first; only if no line holds the quote on its own are runs of
+ * consecutive lines tried. The window takes the first hit and the whole-file
+ * pass counts them, and it is one search for both so that what the window
+ * accepts and what the file accepts cannot drift apart.
  */
-function searchLines(
+function matchingLines(
   match: (text: string) => boolean,
   lines: Map<number, string>,
-  line: number,
+  order: number[],
   height: number,
-): number | null {
-  const nearest = [...lines.keys()].sort(
-    (a, b) => Math.abs(a - line) - Math.abs(b - line) || a - b,
-  );
-
-  for (const n of nearest) {
-    if (match(lines.get(n)!)) return n;
-  }
+): number[] {
+  const single = order.filter((n) => match(lines.get(n)!));
+  if (single.length > 0) return single;
 
   // A multi-line construct spreads its words across consecutive lines, so no
   // single line can hold 80% of them however close it is. Join before matching.
@@ -404,20 +469,23 @@ function searchLines(
   // for in two lines, never in four, so the extra text cannot be what lets a
   // fabricated quote through.
   for (let span = 2; span <= Math.max(height, 2); span++) {
-    for (const start of nearest) {
+    const starts: number[] = [];
+    for (const start of order) {
+      // Two runs that overlap are one construct seen from two starting lines,
+      // not two occurrences; counting both would call a unique quote ambiguous.
+      if (starts.some((taken) => Math.abs(taken - start) < span)) continue;
       const run: string[] = [];
       for (let n = start; n < start + span; n++) {
         const text = lines.get(n);
         if (text === undefined) break;
         run.push(text);
       }
-      if (run.length === span && match(run.join("\n"))) {
-        return start;
-      }
+      if (run.length === span && match(run.join("\n"))) starts.push(start);
     }
+    if (starts.length > 0) return starts;
   }
 
-  return null;
+  return [];
 }
 
 /**
@@ -427,8 +495,7 @@ function searchLines(
  * the quote again for each of them is the difference between a search that is
  * free and one that is not.
  */
-function matcherFor(quote: string): (text: string) => boolean {
-  const wanted = significantWords(quote);
+function matcherFor(wanted: string[]): (text: string) => boolean {
   // A quote of nothing but punctuation asserts nothing; let the verifiers judge.
   if (wanted.length === 0) return () => true;
 
@@ -440,7 +507,7 @@ function matcherFor(quote: string): (text: string) => boolean {
 }
 
 export function quoteAppearsAt(quote: string, line: string): boolean {
-  return matcherFor(quote)(line);
+  return matcherFor(significantWords(quote))(line);
 }
 
 /* ── Gate two: independent refutation attempts ────────────────────────────── */
@@ -637,6 +704,7 @@ export async function verifyClaims(
     try {
       // Gate one, free and deterministic: does the citation exist?
       const anchors = anchorClaim(claim, options.readLine, options.pathKind);
+      let dropped: DroppedCitation[] = [];
       for (const moved of anchors.corrected) {
         log(
           `[verify] ${claim.questionId}: citation moved ${moved.ref.path}:${moved.citedLine} -> ` +
@@ -649,7 +717,8 @@ export async function verifyClaims(
         const detail = anchors.problems
           .map(
             (problem) =>
-              `${problem.ref.path}:${problem.ref.line} ${problem.reason}`,
+              `${problem.ref.path}:${problem.ref.line} ${problem.reason}` +
+              (problem.occurrences === undefined ? "" : ` (at ${problem.occurrences} lines)`),
           )
           .join("; ");
         // The claim goes only when NOTHING it cites holds. A claim with one
@@ -672,6 +741,17 @@ export async function verifyClaims(
         }
         const failed = new Set(anchors.problems.map((problem) => problem.ref));
         claim.evidence = claim.evidence.filter((ref) => !failed.has(ref));
+        // Dropped, not forgotten. The failed citation leaves the evidence,
+        // where nothing may stand on it, and goes on the record instead: a
+        // run whose every claim carried one invented citation beside one real
+        // one used to print "quote-absent 0" and show every finding clean,
+        // because a citation that was only dropped was counted nowhere.
+        dropped = anchors.problems.map((problem) => ({
+          path: problem.ref.path,
+          line: problem.ref.line!,
+          reason: problem.reason,
+          ...(problem.occurrences === undefined ? {} : { occurrences: problem.occurrences }),
+        }));
         log(
           `[verify] ${claim.questionId}: ${anchors.problems.length} citation(s) dropped, ` +
             `${anchors.held.length} held: ${detail}`,
@@ -720,12 +800,18 @@ export async function verifyClaims(
       // its author never read the line. Inferred is the ceiling. After the
       // absence rule, so an absence claim nobody searched properly stays
       // not-determinable rather than being lifted to inferred here.
-      if (
-        confidence === "verified" &&
-        claim.evidence.some((ref) => ref.corrected !== undefined)
-      ) {
+      //
+      // A dropped citation caps the same way, and a fortiori: a line number
+      // recalled wrongly is one kind of memory, a quote that is nowhere in the
+      // file is another, and the second reached `verified` while the first
+      // was capped. The verifiers judged only the evidence that held, and
+      // what held is real; what they never saw is the citation the author
+      // made up, and a claim with one of those was not read from the file.
+      const moved = claim.evidence.some((ref) => ref.corrected !== undefined);
+      if (confidence === "verified" && (moved || dropped.length > 0)) {
         log(
-          `[verify] ${claim.questionId}: verified by the verifiers, capped at inferred: a citation was moved`,
+          `[verify] ${claim.questionId}: verified by the verifiers, capped at inferred: ` +
+            (moved ? "a citation was moved" : "a citation was dropped"),
         );
         confidence = "inferred";
       }
@@ -738,6 +824,7 @@ export async function verifyClaims(
         refutations: decision.refutations,
         ...(decision.needsAccess ? { needsAccess: decision.needsAccess } : {}),
         vocabulariesTried,
+        ...(dropped.length > 0 ? { dropped } : {}),
       });
     } finally {
       options.onProgress?.(index + 1, options.claims.length);
@@ -797,6 +884,14 @@ export interface VerificationSummary {
   rejectedBy: Record<RejectionCode, number>;
   /** Claims kept after a citation was moved to where its quote is. */
   corrected: number;
+  /**
+   * Quoted citations dropped from claims that were kept. Citations, not
+   * claims: a claim that gave three invented references beside one real one
+   * counts three here, and its one finding is capped at inferred.
+   */
+  dropped: number;
+  /** `dropped`, by why. The values sum to `dropped`. */
+  droppedBy: Record<CitationCode, number>;
 }
 
 export function summariseVerification(result: VerificationResult): VerificationSummary {
@@ -808,6 +903,12 @@ export function summariseVerification(result: VerificationResult): VerificationS
   ) as Record<RejectionCode, number>;
   for (const entry of result.rejected) rejectedBy[entry.code] += 1;
 
+  const droppedBy = Object.fromEntries(
+    CITATION_CODES.map((code) => [code, 0]),
+  ) as Record<CitationCode, number>;
+  const dropped = result.verified.flatMap((entry) => entry.dropped ?? []);
+  for (const citation of dropped) droppedBy[citation.reason] += 1;
+
   return {
     examined: result.verified.length + result.rejected.length,
     verified: count("verified"),
@@ -818,6 +919,8 @@ export function summariseVerification(result: VerificationResult): VerificationS
     corrected: result.verified.filter((entry) =>
       entry.claim.evidence.some((ref) => ref.corrected !== undefined),
     ).length,
+    dropped: dropped.length,
+    droppedBy,
   };
 }
 
@@ -831,12 +934,16 @@ export function summariseVerification(result: VerificationResult): VerificationS
  * compared across them. No em dash; hyphens and semicolons only.
  */
 export function describeVerification(summary: VerificationSummary): string {
-  const byCode = REJECTION_CODES.map(
+  const rejectedBy = REJECTION_CODES.map(
     (code) => `${code} ${summary.rejectedBy[code]}`,
   ).join(", ");
+  const droppedBy = CITATION_CODES.map(
+    (code) => `${code} ${summary.droppedBy[code]}`,
+  ).join(", ");
   return (
-    `claims rejected: ${summary.rejected} (${byCode}); ` +
-    `corrected for line drift: ${summary.corrected}`
+    `claims rejected: ${summary.rejected} (${rejectedBy}); ` +
+    `corrected for line drift: ${summary.corrected}; ` +
+    `citations dropped from kept claims: ${summary.dropped} (${droppedBy})`
   );
 }
 
@@ -852,10 +959,17 @@ export function verificationCounts(summary: VerificationSummary): Record<string,
   return {
     rejected: summary.rejected,
     rejectedQuoteAbsent: summary.rejectedBy["quote-absent"],
+    rejectedQuoteAmbiguous: summary.rejectedBy["quote-ambiguous"],
     rejectedLineBeyondEof: summary.rejectedBy["line-beyond-eof"],
     rejectedFileUnreadable: summary.rejectedBy["file-unreadable"],
     rejectedNotALineReference: summary.rejectedBy["not-a-line-reference"],
     rejectedRefuted: summary.rejectedBy.refuted,
     correctedLineDrift: summary.corrected,
+    droppedCitations: summary.dropped,
+    droppedQuoteAbsent: summary.droppedBy["quote-absent"],
+    droppedQuoteAmbiguous: summary.droppedBy["quote-ambiguous"],
+    droppedLineBeyondEof: summary.droppedBy["line-beyond-eof"],
+    droppedFileUnreadable: summary.droppedBy["file-unreadable"],
+    droppedNotALineReference: summary.droppedBy["not-a-line-reference"],
   };
 }

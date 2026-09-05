@@ -33,7 +33,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import type { AuditFinding, Confidence } from "./finding.js";
+import type { AuditFinding, Confidence, DroppedCitation } from "./finding.js";
 import { validateFindings, countByConfidence } from "./finding.js";
 import { consolidateAsk, renderAsk } from "./closure.js";
 import { COVERAGE_CAVEAT, type Coverage } from "./inventory.js";
@@ -302,6 +302,22 @@ function coverageSection(input: ReportInput): string[] {
   return lines;
 }
 
+/** Why a citation was dropped, in words a reader can act on. No em dash. */
+function droppedBecause(citation: DroppedCitation): string {
+  switch (citation.reason) {
+    case "quote-absent":
+      return "the quoted text is nowhere in the file";
+    case "quote-ambiguous":
+      return `the quoted text is at ${citation.occurrences ?? "several"} lines of the file and the cited line is not one of them`;
+    case "line-beyond-eof":
+      return "the cited line is past the end of the file and the quoted text is nowhere in it";
+    case "file-unreadable":
+      return "the file could not be read";
+    case "not-a-line-reference":
+      return "the reference is a directory or names no line";
+  }
+}
+
 /**
  * How many claims verification threw away, and why.
  *
@@ -322,7 +338,9 @@ function verificationSection(input: ReportInput): string[] {
       `Verification examined ${verification.examined} claim(s); ${describeVerification(verification)}. ` +
         "A rejected claim does not appear in this report. A claim corrected for line drift " +
         "does, with its citation moved to the line the quoted text is on and its confidence " +
-        "capped at inferred, because its author cited the line from memory rather than from the file.",
+        "capped at inferred, because its author cited the line from memory rather than from the file. " +
+        "A claim that cited something the check could not find keeps only the citations that held, " +
+        "is capped at inferred for the same reason, and names what was dropped under its evidence.",
     ),
     "",
   ];
@@ -522,6 +540,21 @@ function findingsSection(findings: AuditFinding[]): string[] {
             `the quoted text is at line ${ref.line})`
           : "";
         lines.push(`- ${escapeTypst(where + moved)}`);
+      }
+      lines.push("");
+    }
+
+    // What the claim cited and the check could not find, named. Under its own
+    // heading and not among the evidence, because nothing rests on it; but on
+    // the page, because a reader weighing the finding should know its author
+    // cited something that is not there. No quote is printed: the text was
+    // not found, and the report does not carry text the tree does not.
+    if (finding.dropped && finding.dropped.length > 0) {
+      lines.push("*Cited and not relied on*", "");
+      for (const citation of finding.dropped) {
+        lines.push(
+          `- ${escapeTypst(`${citation.path}:${citation.line} (${droppedBecause(citation)})`)}`,
+        );
       }
       lines.push("");
     }

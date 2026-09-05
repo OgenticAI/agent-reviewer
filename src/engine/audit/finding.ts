@@ -91,6 +91,35 @@ export interface EvidenceCorrection {
 }
 
 /**
+ * A quoted citation the claim gave and the citation check could not keep.
+ *
+ * It is not evidence, so it does not sit in `evidence`, where a reader and a
+ * verifier would take it for something the finding rests on. But a claim is
+ * not innocent of the citations it lost. One invented reference beside one
+ * real one used to leave no trace at all: the invented one was filtered out,
+ * the finding reached `verified` on the real one, and the count of
+ * fabrications printed zero. A claim that cited a quote which is nowhere in
+ * the file was written at least partly from memory, and that is the same
+ * reason a moved citation caps at `inferred`; the record here is what lets
+ * `checkVerifiedIsEarned` apply it and the report say what was dropped.
+ *
+ * No quote. The text was not found, and printing a quote the tree does not
+ * contain would put invented text in a client-facing report.
+ */
+export interface DroppedCitation {
+  path: string;
+  line: number;
+  reason:
+    | "quote-absent"
+    | "quote-ambiguous"
+    | "line-beyond-eof"
+    | "file-unreadable"
+    | "not-a-line-reference";
+  /** For `quote-ambiguous`: how many lines of the file carry the quote. */
+  occurrences?: number;
+}
+
+/**
  * What would settle a `not-determinable` finding.
  *
  * Required on every one of them. A bare "we could not determine this" hands the
@@ -121,6 +150,11 @@ export interface AuditFinding extends Finding {
   verifiers: number;
   /** How many of them refuted it. */
   refutations: number;
+  /**
+   * Citations the claim gave that the citation check could not keep. Present
+   * only when there were any. See `DroppedCitation` for why they are kept.
+   */
+  dropped?: DroppedCitation[];
 }
 
 /** One broken rule. `code` is stable; `detail` is for a human. */
@@ -206,12 +240,13 @@ export const MIN_VERIFIERS = 2;
  * Two independent attempts to break it, and none succeeded. One verifier is an
  * opinion; a single refutation means the claim is live, not settled.
  *
- * And every citation is where the claim said it was. A quote the citation
- * check had to go looking for was cited from memory, and the verifiers judged
- * a claim whose author had not read the line; that is supported at best, never
- * re-derived. The verify stage caps such a claim at `inferred` as it goes; this
- * is the same rule at the point where a report is admitted, so the two cannot
- * drift apart.
+ * And every citation is where the claim said it was, and every citation the
+ * claim gave was kept. A quote the citation check had to go looking for was
+ * cited from memory, and a quote it could not find at all was invented; in
+ * both the verifiers judged a claim whose author had not read the line, and
+ * that is supported at best, never re-derived. The verify stage caps such a
+ * claim at `inferred` as it goes; this is the same rule at the point where a
+ * report is admitted, so the two cannot drift apart.
  */
 export function checkVerifiedIsEarned(f: AuditFinding): Violation | null {
   if (f.confidence !== "verified") return null;
@@ -228,6 +263,14 @@ export function checkVerifiedIsEarned(f: AuditFinding): Violation | null {
       code: "unearned-verified",
       findingId: f.id,
       detail: `verified with ${moved} citation(s) moved from the line the claim gave; a citation the check had to relocate supports inferred at most`,
+    };
+  }
+  const dropped = f.dropped?.length ?? 0;
+  if (dropped > 0) {
+    return {
+      code: "unearned-verified",
+      findingId: f.id,
+      detail: `verified with ${dropped} citation(s) the claim gave and the check could not find; a claim that cited what is not there supports inferred at most`,
     };
   }
   return null;

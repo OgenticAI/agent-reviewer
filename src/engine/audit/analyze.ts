@@ -526,7 +526,14 @@ export async function withTreeConfigAside<T>(
 }
 
 /** The run context for a tree: one walk, shared by every analyzer. */
-export function analyzerContext(root: string, inventory: Inventory = buildInventory(root)): AnalyzerContext {
+// The run writes run.json, inventory.json and its siblings into --out, which
+// DEFAULTS to the tree. Walking the tree without naming that directory counts
+// the engine's own artifacts as subject files, so the read counts here and the
+// coverage denominator elsewhere disagree by whatever the run had written by
+// the time analyze started. Passing the root as the run directory skips those
+// names when they sit at the root and leaves a same-named file deeper in the
+// tree counted, which is the same rule the sweep and the inventory already use.
+export function analyzerContext(root: string, inventory: Inventory = buildInventory(root, root)): AnalyzerContext {
   return {
     inventory,
     languages: new Set(inventory.files.map((file) => file.language)),
@@ -810,14 +817,32 @@ export function analyzerLanguageCoverage(
     filesByLanguage.set(file.language, (filesByLanguage.get(file.language) ?? 0) + 1);
   }
 
+  // What each analyzer CAN produce a finding for, as a ceiling on what it is
+  // credited with reading. Both halves are needed and neither is sufficient.
+  //
+  // `scannedPaths` alone overclaims: semgrep's paths.scanned is every file it
+  // TARGETED, so a tree carrying Rust, Kotlin and Swift has all three listed
+  // even though no loaded pack holds a rule for them. Crediting from that made
+  // the coverage table assert deterministic reach over languages nothing
+  // examined, and then printed the parity sentence over it, which is the exact
+  // overclaim this measurement was added to remove.
+  //
+  // `reach` alone is the older bug: a declared list, true whether or not the
+  // tool ran. So a language is credited when the analyzer both declares it and
+  // is measured to have read a file of it.
+  const reachOf = new Map(specs.map((spec) => [spec.job, spec.reach]));
+
   // job -> language -> files read.
   const measured = new Map<string, Map<string, number>>();
   for (const job of jobs) {
     if (!job.parsed || !Array.isArray(job.scannedPaths)) continue;
+    const reach = reachOf.get(job.job);
+    const covers = (language: string): boolean =>
+      reach === "*" ? true : Array.isArray(reach) && reach.includes(language);
     const byLanguage = new Map<string, number>();
     for (const path of new Set(job.scannedPaths)) {
       const language = languageOf.get(path);
-      if (language === undefined) continue;
+      if (language === undefined || !covers(language)) continue;
       byLanguage.set(language, (byLanguage.get(language) ?? 0) + 1);
     }
     measured.set(job.job, byLanguage);

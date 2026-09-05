@@ -1098,8 +1098,12 @@ describe("analyzer reach, measured from what each tool read", () => {
 
   // npm audit reads the dependency tree, not the code. Crediting it to
   // TypeScript would report hundreds of source files as deterministically
-  // covered on a run where no code analyzer started at all.
-  it("does not credit the dependency audit to a source language it never read", () => {
+  // covered on a run where no code analyzer started at all, and crediting it to
+  // JSON is the same overclaim one language over: the lockfile's dependency
+  // graph was resolved, the JSON files themselves were not examined for
+  // defects. Its declared reach is empty and that is the ceiling, so it earns
+  // no language row while its own read count is still reported.
+  it("credits the dependency audit to no language, whatever it read", () => {
     const withLock = inventoryOf([...inventory.files, file("package-lock.json", "json")]);
     const jobs: JobFindings[] = [
       { job: "semgrep", parsed: false, findings: [], reason: "not installed" },
@@ -1108,7 +1112,31 @@ describe("analyzer reach, measured from what each tool read", () => {
     const coverage = analyzerLanguageCoverage(withLock, jobs);
 
     expect(coverage.typescript?.analyzers).toEqual([]);
-    expect(coverage.json?.analyzers).toEqual(["dependency-audit"]);
+    expect(coverage.json?.analyzers).toEqual([]);
+    // The read still happened and is still counted; what it does not do is buy
+    // a language row.
+    expect(coverage.json?.scanned["dependency-audit"]).toBe(0);
+  });
+
+  // The overclaim that motivated the ceiling. semgrep's paths.scanned lists
+  // every file it TARGETED, so a tree carrying languages no loaded pack holds a
+  // rule for had them all credited, and the parity sentence printed over the
+  // result. A language is credited only when the analyzer both declares it and
+  // is measured to have read a file of it.
+  it("credits only languages the analyzer both declares and was measured reading", () => {
+    const mixed = inventoryOf([
+      file("A.cs", "csharp"),
+      file("a.rs", "rust"),
+      file("a.kt", "kotlin"),
+    ]);
+    const jobs: JobFindings[] = [
+      { job: "semgrep", parsed: true, findings: [], scannedPaths: ["A.cs", "a.rs", "a.kt"] },
+    ];
+    const coverage = analyzerLanguageCoverage(mixed, jobs);
+
+    expect(coverage.csharp?.analyzers).toEqual(["semgrep"]);
+    expect(coverage.rust?.analyzers).toEqual([]);
+    expect(coverage.kotlin?.analyzers).toEqual([]);
   });
 
   it("does not credit an analyzer that failed to run", () => {

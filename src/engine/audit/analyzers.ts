@@ -23,6 +23,36 @@
 import { normalizeSeverity, type Finding } from "../findings/schema.js";
 import type { Adapter } from "../findings/adapters.js";
 
+/**
+ * What a tool's own report says about the scan, as distinct from its findings.
+ *
+ * A finding list answers "what did it flag". This answers "what did it read,
+ * and did it get through". The two were conflated once: a semgrep run whose
+ * rule pack failed to download returned `results: []`, which the adapter read
+ * as a clean scan of the whole tree. The report carried `paths.scanned: []`
+ * and two errors the adapter never looked at.
+ */
+export interface ScanMeta {
+  /** Paths the tool says it read, exactly as the tool printed them. */
+  scannedPaths: string[];
+  /** Trouble the tool reported while still producing a report. */
+  errors: string[];
+  /**
+   * A problem that means the report cannot be trusted at all: the rules never
+   * loaded, so an empty result is a scan that did not happen.
+   */
+  fatal: string | null;
+}
+
+/** How many per-file problems a job record keeps before summarising the rest. */
+export const MAX_RECORDED_ERRORS = 50;
+
+/** Keep a list of problems readable: the first fifty, then a count. */
+export function capErrors(errors: string[]): string[] {
+  if (errors.length <= MAX_RECORDED_ERRORS) return errors;
+  return [...errors.slice(0, MAX_RECORDED_ERRORS), `and ${errors.length - MAX_RECORDED_ERRORS} more`];
+}
+
 /* ── semgrep (`semgrep --json`) ───────────────────────────────────────────── */
 
 interface SemgrepResult {
@@ -75,6 +105,56 @@ export const semgrepAdapter: Adapter = {
     });
   },
 };
+
+interface SemgrepError {
+  level?: unknown;
+  type?: unknown;
+  message?: unknown;
+  path?: unknown;
+}
+
+/**
+ * What semgrep read and what stopped it.
+ *
+ * semgrep reports two kinds of error in the same list. One has a `path`: a
+ * file it could not fully parse, or one where too many rules timed out. The
+ * scan continued past it, so it is recorded and the report stands. The other
+ * has no path and is about the rules themselves: a pack that failed to
+ * download, a config that did not validate. Nothing was scanned under those
+ * rules, and the probe that motivated this showed the shape exactly: exit 7,
+ * `results: []`, `paths.scanned: []`, two errors. That is fatal here, because
+ * the alternative is reporting the tree clean on rules that never loaded.
+ */
+export function semgrepMeta(raw: string): ScanMeta | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const report = data as { results?: unknown; paths?: { scanned?: unknown }; errors?: unknown };
+  // The same test the adapter applies: no results list, not a semgrep report.
+  if (!Array.isArray(report.results)) return null;
+
+  const scanned = Array.isArray(report.paths?.scanned) ? report.paths.scanned : [];
+  const scannedPaths = scanned.filter((p): p is string => typeof p === "string");
+
+  const fatal: string[] = [];
+  const errors: string[] = [];
+  for (const entry of Array.isArray(report.errors) ? (report.errors as SemgrepError[]) : []) {
+    const type = typeof entry.type === "string" ? entry.type : "error";
+    const message = typeof entry.message === "string" ? entry.message.replace(/\s+/g, " ").trim() : "";
+    if (typeof entry.path === "string" && entry.path) {
+      errors.push(`${type} at ${entry.path}${message ? `: ${message}` : ""}`);
+    } else if (entry.level === "error") {
+      fatal.push(message || type);
+    } else {
+      errors.push(message ? `${type}: ${message}` : type);
+    }
+  }
+  return { scannedPaths, errors, fatal: fatal.length > 0 ? fatal.join("; ") : null };
+}
 
 /* ── gitleaks (`gitleaks detect --report-format json`) ────────────────────── */
 
@@ -227,6 +307,56 @@ export const npmAuditAdapter: Adapter = {
     );
   },
 };
+
+/**
+ * npm's error envelope, when `npm audit --json` could not reach a registry.
+ *
+ * It is valid JSON on stdout, `{"message": "...", "error": {...}}`, with no
+ * `vulnerabilities` key. The adapter rightly returns null for it, but "output
+ * this adapter does not recognise" blames the adapter for a network failure a
+ * reader could act on. This reads the envelope so the reason can say what npm
+ * said.
+ */
+export function npmAuditError(raw: string): string | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const envelope = data as { vulnerabilities?: unknown; message?: unknown; error?: unknown };
+  if (typeof envelope.vulnerabilities === "object" && envelope.vulnerabilities !== null) return null;
+  if (typeof envelope.message === "string" && envelope.message) return envelope.message;
+  if (typeof envelope.error === "object" && envelope.error !== null) {
+    const summary = (envelope.error as { summary?: unknown }).summary;
+    return typeof summary === "string" && summary ? summary : "npm reported an error without a message";
+  }
+  return null;
+}
+
+/**
+ * The manifests OSV read. Its report carries no error list, so `errors` is
+ * always empty here and `fatal` never set: a scanner that could not reach its
+ * database exits non-zero with nothing on stdout, which the runner reports
+ * from stderr.
+ */
+export function osvMeta(raw: string): ScanMeta | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const results = (data as { results?: unknown }).results;
+  if (!Array.isArray(results)) return null;
+  const scannedPaths = new Set<string>();
+  for (const result of results as OsvResult[]) {
+    if (typeof result.source?.path === "string") scannedPaths.add(result.source.path);
+  }
+  return { scannedPaths: [...scannedPaths], errors: [], fatal: null };
+}
 
 /**
  * Advisories from OSV, for the ecosystems npm cannot answer for.

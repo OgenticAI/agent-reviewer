@@ -89,12 +89,15 @@ function input(over: Partial<ReportInput> = {}): ReportInput {
     subject: subject(),
     findings: [finding()],
     coverage: coverage(),
-    analyzerJobs: [{ job: "semgrep", parsed: true, findings: [] }],
-    analyzerReach: { typescript: { files: 900, analyzers: ["semgrep"] } },
+    analyzerJobs: [{ job: "semgrep", parsed: true, findings: [], scannedPaths: SCANNED }],
+    analyzerReach: { typescript: { files: 900, analyzers: ["semgrep"], scanned: { semgrep: 900 } } },
     questionCount: 10,
     ...over,
   };
 }
+
+/** Nine hundred paths semgrep said it read, so the default input is a measured run. */
+const SCANNED = Array.from({ length: 900 }, (_, i) => `src/file-${i}.ts`);
 
 const SUMMARY = "This review read source only, and answered ten agreed questions.";
 const noMask = (text: string) => text;
@@ -512,17 +515,94 @@ describe("Automated Testing, generated from the run", () => {
   // The honest headline: a language nothing deterministic reached.
   it("names a language no analyzer reached, rather than implying parity", () => {
     const source = renderTypst({
-      input: input({ analyzerReach: { csharp: { files: 400, analyzers: [] } } }),
+      input: input({ analyzerReach: { csharp: { files: 400, analyzers: [], scanned: { semgrep: 0 } } } }),
       executiveSummary: SUMMARY,
     });
     expect(source).toMatch(/no automated analysis reached/i);
-    expect(source).toMatch(/csharp — 400 file/);
+    expect(source).toMatch(/csharp: 400 file/);
     expect(source).toMatch(/weaker signal/);
   });
 
-  it("says so plainly when everything ran", () => {
+  // A content scanner read the file, so it was not unreached, but it is not
+  // listed under the language either: the "all files" row carries it.
+  it("does not call a language unreached when a content scanner read it, and never lists all files as one", () => {
+    const source = renderTypst({
+      input: input({
+        analyzerReach: {
+          markdown: { files: 12, analyzers: [], scanned: { semgrep: 0, "secret-scan": 12 } },
+          "all files": { files: 912, analyzers: ["secret-scan"], scanned: { "secret-scan": 912 } },
+        },
+      }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).not.toMatch(/markdown: 12 file/);
+    expect(source).not.toMatch(/all files: /);
+    expect(source).toMatch(/\[all files\], \[912\], \[secret-scan 912\]/);
+  });
+
+  it("prints what each analyzer read, per language, from the tool's own count", () => {
+    const source = renderTypst({
+      input: input({
+        analyzerReach: {
+          typescript: { files: 900, analyzers: ["semgrep"], scanned: { semgrep: 812, "secret-scan": 900 } },
+        },
+      }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).toMatch(/What each analyzer read/);
+    expect(source).toMatch(/\[typescript\], \[900\], \[semgrep 812; secret-scan 900\]/);
+  });
+
+  it("prints the file count each analyzer read, and its version", () => {
+    const source = renderTypst({
+      input: input({
+        analyzerJobs: [{ job: "semgrep", parsed: true, findings: [], scannedPaths: SCANNED, toolVersion: "1.174.0" }],
+      }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).toMatch(/semgrep\* \(1\.174\.0\): ran, 0 finding\(s\); read 900 file\(s\)/);
+  });
+
+  // A subject that ships a .gitleaksignore would otherwise scan clean by its
+  // own instruction. Coverage names what was moved.
+  it("names the tree configuration moved aside for the scan", () => {
+    const source = renderTypst({
+      input: input({
+        analyzerJobs: [
+          { job: "secret-scan", parsed: true, findings: [], scannedPaths: SCANNED, neutralised: [".gitleaksignore", "client/.npmrc"] },
+        ],
+      }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).toMatch(/moved aside for the scan/);
+    expect(source).toContain(".gitleaksignore, client/.npmrc");
+  });
+
+  it("prints the problems a tool reported while scanning, and caps them", () => {
+    const errors = Array.from({ length: 8 }, (_, i) => `PartialParsing at src/odd-${i}.ts`);
+    const source = renderTypst({
+      input: input({ analyzerJobs: [{ job: "semgrep", parsed: true, findings: [], scannedPaths: SCANNED, errors }] }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).toContain("src/odd-0.ts");
+    expect(source).toMatch(/and 3 more problem\(s\)/);
+  });
+
+  it("says so plainly when everything ran and every analyzer measured its reach", () => {
     const source = renderTypst({ input: input(), executiveSummary: SUMMARY });
-    expect(source).toMatch(/Every configured analyzer ran/);
+    expect(source).toMatch(/Every configured analyzer ran over every language present, by its own count/);
+  });
+
+  // The parity sentence is a claim. A run that did not record what each tool
+  // read cannot make it, and the older records this renderer accepts did not.
+  it("does not claim parity when a run did not measure its reach", () => {
+    const source = renderTypst({
+      input: input({ analyzerJobs: [{ job: "semgrep", parsed: true, findings: [] }] }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).not.toMatch(/over every language present/);
+    expect(source).toMatch(/reach not measured on this run/);
+    expect(source).toMatch(/no parity is claimed/);
   });
 });
 

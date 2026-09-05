@@ -1,0 +1,11 @@
+# The gitleaks configuration the audit runs under.
+#
+# Passed explicitly with --config so gitleaks never reads a .gitleaks.toml
+# shipped inside the tree under audit. Probed on the installed version: a tree
+# config with `useDefault = false` turned every planted secret into zero
+# findings while the run still reported success. This file deliberately adds
+# nothing to the default rules; its whole job is to be ours.
+title = "OgenticAI audit"
+
+[extend]
+useDefault = true

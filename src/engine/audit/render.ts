@@ -38,6 +38,7 @@ import { validateFindings, countByConfidence } from "./finding.js";
 import { consolidateAsk, renderAsk } from "./closure.js";
 import { COVERAGE_CAVEAT, type Coverage } from "./inventory.js";
 import {
+  ALL_FILES,
   skippedAnalyzerNotes,
   type LanguageAnalyzerCoverage,
 } from "./analyze.js";
@@ -451,47 +452,100 @@ function sweepSection(input: ReportInput): string[] {
  * reached is named. This is the section a reader uses to judge how much the
  * rest of the report is worth, so it is assembled from the run record rather
  * than written from memory afterwards.
+ *
+ * Reach is printed as the tool measured it: files scanned, per analyzer and
+ * per language. The parity sentence ("every configured analyzer ran over every
+ * language present") is printed only when every analyzer that ran recorded
+ * what it read. A run that did not measure its reach cannot claim parity, and
+ * the older records this renderer still accepts did not measure it.
  */
 function automatedTestingSection(input: ReportInput): string[] {
   const lines = ["= Automated Testing", ""];
 
   for (const job of input.analyzerJobs) {
-    lines.push(
-      job.parsed
-        ? `- *${escapeTypst(job.job)}* — ran, ${job.findings.length} finding(s).`
-        : `- *${escapeTypst(job.job)}* — #strong[did not run]: ${escapeTypst(job.reason ?? "no reason recorded")}.`,
-    );
+    const name = `*${escapeTypst(job.job)}*${job.toolVersion ? ` (${escapeTypst(job.toolVersion)})` : ""}`;
+    if (!job.parsed) {
+      lines.push(`- ${name}: #strong[did not run]: ${escapeTypst(job.reason ?? "no reason recorded")}.`);
+    } else {
+      const reach = Array.isArray(job.scannedPaths)
+        ? `read ${job.scannedPaths.length} file(s)`
+        : "reach not measured on this run";
+      lines.push(`- ${name}: ran, ${job.findings.length} finding(s); ${reach}.`);
+    }
+    if (job.neutralised && job.neutralised.length > 0) {
+      lines.push(
+        `  - Configuration in the tree moved aside for the scan, so the subject could not silence it: ${job.neutralised.map(escapeTypst).join(", ")}.`,
+      );
+    }
+    for (const problem of (job.errors ?? []).slice(0, MAX_PROBLEMS_SHOWN)) {
+      lines.push(`  - Reported while scanning: ${escapeTypst(problem)}`);
+    }
+    const hidden = (job.errors ?? []).length - MAX_PROBLEMS_SHOWN;
+    if (hidden > 0) lines.push(`  - and ${hidden} more problem(s) recorded in analyzers.json`);
   }
   lines.push("");
 
-  const untouched = Object.entries(input.analyzerReach)
-    .filter(([, reach]) => reach.analyzers.length === 0 && reach.files > 0)
-    .sort(([a], [b]) => a.localeCompare(b));
+  const rows = Object.entries(input.analyzerReach).sort(([a], [b]) =>
+    a === ALL_FILES ? 1 : b === ALL_FILES ? -1 : a.localeCompare(b),
+  );
+  const measuredRows = rows.filter(([, reach]) => Object.keys(reach.scanned ?? {}).length > 0);
+  if (measuredRows.length > 0) {
+    lines.push(
+      "== What each analyzer read, by language",
+      "",
+      "Counted from each tool's own record of the files it read, not from what it",
+      "was configured to reach. The last row is the content scanners, which read",
+      "every file regardless of language.",
+      "",
+      "#table(",
+      "  columns: 3,",
+      "  [*Language*], [*Files*], [*Read by*],",
+    );
+    for (const [language, reach] of measuredRows) {
+      const read = Object.entries(reach.scanned ?? {})
+        .map(([job, count]) => `${escapeTypst(job)} ${count}`)
+        .join("; ");
+      lines.push(`  [${escapeTypst(language)}], [${reach.files}], [${read || "nothing"}],`);
+    }
+    lines.push(")", "");
+  }
+
+  const untouched = rows
+    .filter(([language]) => language !== ALL_FILES)
+    .filter(([, reach]) => reach.files > 0 && reach.analyzers.length === 0)
+    .filter(([, reach]) => Object.values(reach.scanned ?? {}).every((count) => count === 0));
 
   if (untouched.length > 0) {
     lines.push(
       "== Languages no automated analysis reached",
       "",
-      "No deterministic analyzer produced findings for these. They were reviewed by",
+      "No deterministic analyzer read a file in these. They were reviewed by",
       "reading only, which is a weaker signal and is stated here rather than implied.",
       "",
     );
     for (const [language, reach] of untouched) {
-      lines.push(`- ${escapeTypst(language)} — ${reach.files} file(s)`);
+      lines.push(`- ${escapeTypst(language)}: ${reach.files} file(s)`);
     }
     lines.push("");
   }
 
   const skips = skippedAnalyzerNotes(input.analyzerJobs);
+  const measured =
+    input.analyzerJobs.length > 0 && input.analyzerJobs.every((job) => Array.isArray(job.scannedPaths));
   if (skips.length === 0 && untouched.length === 0) {
     lines.push(
-      "Every configured analyzer ran over every language present.",
+      measured
+        ? "Every configured analyzer ran over every language present, by its own count of the files it read."
+        : "Every configured analyzer ran. Whether each reached every language present was not measured on this run, so no parity is claimed.",
       "",
     );
   }
 
   return lines;
 }
+
+/** Problems printed per analyzer before the rest is left to analyzers.json. */
+const MAX_PROBLEMS_SHOWN = 5;
 
 function findingsSection(findings: AuditFinding[]): string[] {
   const counts = countByConfidence(findings);

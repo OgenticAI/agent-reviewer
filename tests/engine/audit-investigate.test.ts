@@ -126,10 +126,39 @@ questions:
 });
 
 describe("handing over the deterministic findings", () => {
-  it("states a clean analyzer as a positive fact", () => {
+  it("states a clean analyzer as a positive fact for the files it read", () => {
+    const facts = renderAnalyzerFacts([
+      { job: "semgrep", parsed: true, findings: [], scannedPaths: ["a.ts", "b.ts", "c.ts"] },
+    ]);
+    expect(facts).toMatch(/scanned 3 files and reported nothing/);
+    expect(facts).toMatch(/positive fact for those files only/);
+  });
+
+  // The probe that motivated this: a rule pack that never loaded, zero files
+  // read, and a model told that was a positive fact about the tree.
+  it("states a clean result over zero files as unknown, never as clean", () => {
+    const facts = renderAnalyzerFacts([{ job: "semgrep", parsed: true, findings: [], scannedPaths: [] }]);
+    expect(facts).toMatch(/scanned 0 files/);
+    expect(facts).toMatch(/never as clean/);
+    expect(facts).not.toMatch(/positive fact/);
+  });
+
+  it("states a clean result with no record of what was read as unmeasured", () => {
     const facts = renderAnalyzerFacts([{ job: "semgrep", parsed: true, findings: [] }]);
-    expect(facts).toMatch(/ran and reported nothing/);
-    expect(facts).toMatch(/positive fact/);
+    expect(facts).toMatch(/did not record which files it read/);
+    expect(facts).not.toMatch(/positive fact/);
+  });
+
+  it("counts the files read alongside the findings", () => {
+    const facts = renderAnalyzerFacts([
+      {
+        job: "semgrep",
+        parsed: true,
+        findings: [{ path: "a.ts", message: "m", severity: "error", source: "semgrep" }],
+        scannedPaths: ["a.ts", "b.ts"],
+      },
+    ]);
+    expect(facts).toMatch(/1 finding\(s\) across 2 scanned files/);
   });
 
   // The whole reason `parsed` exists: a model reads silence as green.

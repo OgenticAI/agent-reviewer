@@ -116,6 +116,12 @@ const SYSTEM_PROMPT = [
  * `parsed: false` is stated as loudly as a finding. A model that reads silence
  * as "clean" will report a clean bill of health the run never earned, which is
  * the exact failure `JobFindings.parsed` exists to prevent.
+ *
+ * An empty result is a positive fact only for the files the tool read, so the
+ * count comes with it. A semgrep run whose rule pack failed to load reported
+ * nothing across zero files, and the first version of this told the model
+ * that was a positive fact about the whole tree. Zero files read is stated as
+ * unknown, and a job that did not record what it read is stated as unmeasured.
  */
 export function renderAnalyzerFacts(jobs: JobFindings[]): string {
   if (jobs.length === 0) return "No deterministic analysis was run.";
@@ -131,13 +137,26 @@ export function renderAnalyzerFacts(jobs: JobFindings[]): string {
       lines.push(`  Treat this as unknown, never as clean.`);
       continue;
     }
+    const read = Array.isArray(job.scannedPaths) ? job.scannedPaths.length : null;
     if (job.findings.length === 0) {
-      lines.push(
-        `- ${job.job}: ran and reported nothing. This is a positive fact.`,
-      );
+      if (read === null) {
+        lines.push(
+          `- ${job.job}: ran and reported nothing, but did not record which files it read.`,
+        );
+        lines.push(`  Treat its reach as unknown; this is not a clean bill for any file.`);
+      } else if (read === 0) {
+        lines.push(`- ${job.job}: ran and reported nothing, but scanned 0 files.`);
+        lines.push(`  Treat this as unknown, never as clean.`);
+      } else {
+        lines.push(
+          `- ${job.job}: scanned ${read} files and reported nothing. This is a positive fact for those files only.`,
+        );
+      }
       continue;
     }
-    lines.push(`- ${job.job}: ${job.findings.length} finding(s), including:`);
+    lines.push(
+      `- ${job.job}: ${job.findings.length} finding(s)${read === null ? "" : ` across ${read} scanned files`}, including:`,
+    );
     for (const finding of job.findings.slice(0, 20)) {
       lines.push(
         `    ${finding.path} [${finding.severity}] ${finding.message}`,

@@ -72,6 +72,27 @@ export interface JobFindings {
    * parse rather than recording them.
    */
   reason?: string;
+  /**
+   * The files the tool itself said it read, repo-relative (OGE-2428 follow-up).
+   *
+   * Reach used to be declared: an analyzer that ran was credited with every
+   * language its spec listed. One failed rule pack gave semgrep exit 7, zero
+   * results and zero scanned paths, and the job was still `parsed: true`, so
+   * the report credited it with the whole tree. Absent means the run did not
+   * measure it; an empty list means the tool reported reading nothing, which
+   * is not the same as clean.
+   */
+  scannedPaths?: string[];
+  /** Trouble the tool reported while still producing a report: parse failures, timeouts per file. */
+  errors?: string[];
+  /** The tool's version, so a finding can be reproduced against the same rules. */
+  toolVersion?: string;
+  /**
+   * Configuration files from the tree that were moved aside for the run,
+   * repo-relative. A subject that ships a `.gitleaksignore` or a `.semgrepignore`
+   * would otherwise scan clean by its own instruction.
+   */
+  neutralised?: string[];
 }
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {

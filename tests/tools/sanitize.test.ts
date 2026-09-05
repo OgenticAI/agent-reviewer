@@ -144,6 +144,34 @@ describe("maskSecrets", () => {
     expect(maskSecrets(url, [])).toBe(url);
   });
 
+  // A username is a word and a token is not. Masking on length alone took
+  // the service account's name out of a line that had no secret in it.
+  it.each([
+    "https://svc-account-readonly@git.example.com/acme/app.git",
+    "https://x-bitbucket-api-token-auth@bitbucket.org/acme/app.git",
+  ])("leaves a long username with no digit in it alone: %s", (url) => {
+    expect(maskSecrets(url, [])).toBe(url);
+  });
+
+  // The same list gates a report's release, and a remediation that shows the
+  // placeholder to use is the fix rather than the leak. Nothing that starts
+  // like a placeholder is a value.
+  it.each([
+    ["shell", "Server=db.example.com;Database=app;Password=${DB_PASSWORD};"],
+    ["windows", "Server=db.example.com;Password=%DB_PASSWORD%;"],
+    ["template", "Server=db.example.com;Password={{ secret }};"],
+    ["prose", "AccountKey=<from Key Vault>;EndpointSuffix=core.windows.net"],
+    ["url", "git clone https://user:${GIT_TOKEN}@git.example.com/acme/app.git"],
+  ])("leaves a %s placeholder where a password would go alone", (_kind, text) => {
+    expect(maskSecrets(text, [])).toBe(text);
+  });
+
+  it("still masks a literal value next to a placeholder", () => {
+    const out = maskSecrets("Password=${DB_PASSWORD}; was Password=EXAMPLE_PW_1;", []);
+    expect(out).toContain("Password=${DB_PASSWORD}");
+    expect(out).not.toContain("EXAMPLE_PW_1");
+  });
+
   it.each([
     ["Password", "Server=db.example.com;Database=app;User Id=svc;Password=EXAMPLE_PW_1;", "Database=app"],
     ["pwd", "server=db.example.com;uid=svc;pwd=EXAMPLE_PW_1;", "uid=svc"],

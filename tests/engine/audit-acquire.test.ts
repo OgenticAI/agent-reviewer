@@ -12,6 +12,7 @@ import {
   normaliseCloneUrl,
   redactUrl,
   describeCloneFailure,
+  parseSevenZipListing,
   unsafeArchiveEntries,
   writeSubject,
 } from "../../src/engine/audit/acquire.js";
@@ -91,6 +92,15 @@ describe("source classification", () => {
     );
     expect(normaliseCloneUrl("https://x.com/a/b")).toBe("https://x.com/a/b");
     expect(normaliseCloneUrl("git@bitbucket.org:acme/x.git")).toBe("git@bitbucket.org:acme/x.git");
+  });
+
+  // A scheme typed in capitals is still a scheme. Prefixed again it became
+  // `https://HTTPS://...`, which git refuses, quoting the URL back with
+  // whatever credential it carried.
+  it("does not prefix a scheme that is merely upper-case", () => {
+    expect(normaliseCloneUrl("HTTPS://git.example.com/acme/app")).toBe(
+      "HTTPS://git.example.com/acme/app",
+    );
   });
 });
 
@@ -281,8 +291,11 @@ describe("common export shapes", () => {
   }
 
   // The listing succeeds (names are not encrypted), so nothing upstream sees
-  // it coming; unzip then skips every entry and exits 5 with "unable to get
-  // password". Unmapped, that was an uncaught throw and no subject.json.
+  // it coming. Given the empty password acquire passes, unzip skips every
+  // encrypted entry with a warning that says so, whether or not a terminal
+  // is attached; without that flag it prompts on /dev/tty under an
+  // operator's shell and hangs. Unmapped, that was an uncaught throw and no
+  // subject.json.
   it("says an encrypted zip is password-protected and asks for an unencrypted export", async () => {
     const staging = stageProject();
     const archive = join(scratch, "locked.zip");
@@ -391,6 +404,82 @@ describe("common export shapes", () => {
     const attempt = acquire({ from: archive, into: join(scratch, "work") });
     await expect(attempt).rejects.toThrow(AcquireError);
     await expect(attempt).rejects.toThrow(/could not extract broken\.zip/);
+  });
+
+  // unzip echoes the entry's path in its error line. A tree with a crypto
+  // module in it, damaged in transfer, used to be diagnosed off that path as
+  // password-protected, and the client was asked to re-export unencrypted.
+  it("does not mistake a corrupt entry named Encrypted for a password prompt", async () => {
+    const staging = join(scratch, "staging");
+    mkdirSync(join(staging, "proj"), { recursive: true });
+    // Big enough that the middle of the zip file is inside this entry's data
+    // rather than in a header, and varied enough that deflate keeps it big.
+    let body = "";
+    for (let i = 0; i < 3000; i++) body += `${(i * 2654435761) % 4294967296}\n`;
+    writeFileSync(join(staging, "proj", "EncryptedVault.cs"), body);
+    const archive = join(scratch, "damaged.zip");
+    execFileSync("zip", ["-q", archive, "proj/EncryptedVault.cs"], { cwd: staging });
+    const bytes = readFileSync(archive);
+    const middle = Math.floor(bytes.length / 2);
+    for (let i = 0; i < 64; i++) bytes[middle + i] = (bytes[middle + i] as number) ^ 0xff;
+    writeFileSync(archive, bytes);
+
+    // The central directory at the end is intact, so the listing still passes
+    // and the failure comes from extraction, as it did for the real file.
+    expect(execFileSync("unzip", ["-Z1", archive]).toString()).toContain("proj/EncryptedVault.cs");
+
+    const attempt = acquire({ from: archive, into: join(scratch, "work") });
+    await expect(attempt).rejects.toThrow(AcquireError);
+    await expect(attempt).rejects.toThrow(/could not extract damaged\.zip/);
+    await expect(attempt).rejects.not.toThrow(/password-protected/);
+  });
+
+  // No 7-Zip binary can be assumed where the tests run, and the listing parse
+  // is the one line that decides whether every .7z is refused as unsafe: the
+  // technical listing opens with the archive's OWN record, whose Path is an
+  // absolute path on this machine. The parse is therefore checked against
+  // both shapes the listing takes, with and without that header block.
+  describe("the 7z listing parse", () => {
+    const entryBlocks = [
+      "Path = proj",
+      "Folder = +",
+      "",
+      "Path = proj/A.cs",
+      "Size = 12",
+      "Attributes = A",
+      "",
+    ].join("\n");
+
+    it("cuts the archive's own record away and keeps the entries", () => {
+      const listing = [
+        "7-Zip 24.09 (arm64) : Copyright (c) 1999-2024 Igor Pavlov : 2024-11-29",
+        "",
+        "Listing archive: /srv/exports/export.7z",
+        "",
+        "--",
+        "Path = /srv/exports/export.7z",
+        "Type = 7z",
+        "Physical Size = 220",
+        "",
+        "----------",
+        entryBlocks,
+      ].join("\n");
+      const entries = parseSevenZipListing(listing);
+      expect(entries).toEqual(["proj", "proj/A.cs"]);
+      // The relationship that matters: what the parse hands on passes the
+      // zip-slip check, and the archive's absolute path is not in it.
+      expect(unsafeArchiveEntries(entries)).toEqual([]);
+      expect(entries.some((e) => e.startsWith("/"))).toBe(false);
+    });
+
+    it("takes a listing with no header block whole", () => {
+      expect(parseSevenZipListing(entryBlocks)).toEqual(["proj", "proj/A.cs"]);
+    });
+
+    it("still refuses an entry that escapes, once the header is gone", () => {
+      const listing = ["--", "Path = /srv/exports/x.7z", "----------", "Path = ../escape.txt", ""].join("\n");
+      expect(unsafeArchiveEntries(parseSevenZipListing(listing))).toEqual(["../escape.txt"]);
+    });
   });
 });
 
@@ -622,6 +711,14 @@ describe("a credential in the clone URL never leaves the clone", () => {
       "https://git.example.com/acme/app.git",
     );
     expect(redactUrl(`file://user:${TOKEN}@/srv/mirror/app`)).toBe("file:///srv/mirror/app");
+    // The shorthand the CLI documents, `host/owner/repo`, takes a userinfo
+    // too, and normaliseCloneUrl turns it into a URL that git clones with
+    // the token. The operator's spelling stays; only the userinfo goes.
+    expect(redactUrl(`user:${TOKEN}@git.example.com/acme/app`)).toBe("git.example.com/acme/app");
+    expect(redactUrl(`${TOKEN}@git.example.com/acme/app`)).toBe("git.example.com/acme/app");
+    expect(redactUrl(`HTTPS://user:${TOKEN}@git.example.com/acme/app`)).toBe(
+      "HTTPS://git.example.com/acme/app",
+    );
     for (const plain of [
       "https://git.example.com/acme/app.git",
       "git@git.example.com:acme/app.git",
@@ -629,6 +726,22 @@ describe("a credential in the clone URL never leaves the clone", () => {
       "git.example.com/acme/app",
     ]) {
       expect(redactUrl(plain)).toBe(plain);
+    }
+  });
+
+  // The two functions must agree on what a URL is, or a shape one treats as
+  // a URL and the other as a path is exactly the one that leaks.
+  it("strips from every shape normaliseCloneUrl would clone, and nothing else", () => {
+    for (const from of [
+      `user:${TOKEN}@git.example.com/acme/app`,
+      `https://user:${TOKEN}@git.example.com/acme/app`,
+      `ssh://${TOKEN}@git.example.com/acme/app`,
+    ]) {
+      expect(normaliseCloneUrl(from)).not.toBe(normaliseCloneUrl(redactUrl(from)));
+      expect(redactUrl(from)).not.toContain(TOKEN);
+    }
+    for (const left of ["git@git.example.com:acme/app.git", "/srv/mirror/app", "./mirror"]) {
+      expect(redactUrl(left)).toBe(left);
     }
   });
 
@@ -655,6 +768,13 @@ describe("a credential in the clone URL never leaves the clone", () => {
     expect(subject.kind).toBe("clone");
     expect(subject.origin).toBe(`file://${origin}`);
     expect(JSON.stringify(subject)).not.toContain(TOKEN);
+
+    // git wrote the URL it cloned into the tree's own config, and the tree
+    // outlives the run. The remote is still there, pointed at the same
+    // repository minus the credential.
+    const config = readFileSync(join(into, ".git", "config"), "utf8");
+    expect(config).not.toContain(TOKEN);
+    expect(config).toContain(`url = file://${origin}`);
 
     const written = readFileSync(writeSubject(into, subject), "utf8");
     expect(written).not.toContain(TOKEN);
@@ -697,6 +817,56 @@ describe("a credential in the clone URL never leaves the clone", () => {
     expect(stdout).toMatch(/^acquired file:\/\//m);
     expect(stdout).toContain(`file://${origin}`);
     expect(stdout).not.toContain(TOKEN);
+  }, 60_000);
+
+  // The shorthand the CLI documents, with a token in it, cloned for real:
+  // git is pointed at a local origin through an `insteadOf` rewrite of the
+  // exact credentialed URL, so the clone succeeds the way it does against a
+  // host, and the token is then looked for everywhere the origin goes.
+  it("strips a token from the scheme-less shorthand, and the remote still checks out a ref", async () => {
+    const origin = join(scratch, "origin");
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "-C", origin, ...args])
+        .toString()
+        .trim();
+    plantCodebase(origin);
+    execFileSync("git", ["init", "--quiet", "-b", "develop"], { cwd: origin });
+    git("add", "-A");
+    git("commit", "-qm", "on develop");
+    git("checkout", "--quiet", "-b", "production");
+    writeFileSync(join(origin, "shipped.ts"), "export const shipped = true;\n");
+    git("add", "-A");
+    git("commit", "-qm", "on production");
+    const productionHead = git("rev-parse", "HEAD");
+    git("checkout", "--quiet", "develop");
+
+    const from = `user:${TOKEN}@git.example.com/acme/app`;
+    const saved = { ...process.env };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = `url.file://${origin}.insteadOf`;
+    process.env.GIT_CONFIG_VALUE_0 = normaliseCloneUrl(from);
+    const into = join(scratch, "work");
+    let subject;
+    try {
+      subject = await acquire({ from, into, ref: "production" });
+    } finally {
+      for (const key of ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    }
+
+    expect(subject.rev).toBe(productionHead);
+    expect(subject.origin).toBe("git.example.com/acme/app");
+    expect(JSON.stringify(subject)).not.toContain(TOKEN);
+    expect(readFileSync(writeSubject(into, subject), "utf8")).not.toContain(TOKEN);
+
+    // The checkout above ran after the remote URL was replaced with one no
+    // network could resolve, which is the proof that nothing after the clone
+    // needs the credential.
+    const config = readFileSync(join(into, ".git", "config"), "utf8");
+    expect(config).not.toContain(TOKEN);
+    expect(config).toContain("url = https://git.example.com/acme/app");
   }, 60_000);
 
   // The failure text is what an operator pastes into a chat when stuck. git

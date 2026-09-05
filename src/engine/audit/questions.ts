@@ -34,6 +34,20 @@ export interface Question {
   /** Identifiers to rank files by. Hints that boost, never filters that exclude. */
   seeds: string[];
   /**
+   * Sweep signal kinds this question should be seeded from, when it should.
+   *
+   * The sweep finds defect candidates deterministically, each with a path, a
+   * line and an excerpt, and before this field nothing carried them to the
+   * investigation: the model rediscovered what the sweep already knew, or
+   * missed it. Names are data, not a type. The sweep's kinds are being
+   * renamed and added to in another build, so a name here that the sweep does
+   * not know is warned about and skipped rather than refused, and a name the
+   * sweep learns later starts working without a change here.
+   *
+   * Absent means the question is not seeded from the sweep at all.
+   */
+  signals?: string[];
+  /**
    * True when "there is none" is a possible answer.
    *
    * Absence is the easiest claim to get wrong and the most damaging to retract,
@@ -108,6 +122,7 @@ export function parseQuestionSet(raw: string): QuestionSet {
       ask,
       ...(typeof q.why === "string" ? { why: q.why.trim() } : {}),
       seeds: asStringArray(q.seeds),
+      ...(q.signals === undefined ? {} : { signals: asStringArray(q.signals) }),
       absenceClaim: q.absence_claim === true,
     };
   });

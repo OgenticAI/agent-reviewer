@@ -27,7 +27,8 @@ import type { EvidenceRef } from "./finding.js";
 import type { Question } from "./questions.js";
 import { seedTextsFor } from "./questions.js";
 import { sanitizeUntrusted } from "../tools/sanitize.js";
-import type { JobFindings } from "../findings/schema.js";
+import { extractsTagsFrom } from "../repomap/tags.js";
+import type { FindingSeverity, JobFindings } from "../findings/schema.js";
 
 /** What one question run produced, before anything has been verified. */
 export interface Claim {
@@ -169,10 +170,247 @@ export function renderAnalyzerFacts(jobs: JobFindings[]): string {
   return lines.join("\n");
 }
 
+/* ── What the map covers ──────────────────────────────────────────────────── */
+
+/** A tree file as the prompt needs it: where it is and what language it is. */
+export interface TreeFileLike {
+  path: string;
+  language: string;
+}
+
+/**
+ * The map as the prompt receives it: the text, and the files the text names.
+ *
+ * `files` is what lets the prompt say what the map covers. A caller that has
+ * only text (a test stub, an older map renderer) may pass a bare string, and
+ * the prompt then says the map's coverage was not computed rather than
+ * inventing a figure.
+ */
+export interface PromptMap {
+  text: string;
+  files?: string[];
+}
+
+/** One language's share of the tree, and how much of it the map names. */
+export interface LanguageScope {
+  language: string;
+  /** Files of this language in the tree. */
+  files: number;
+  /** Files of this language the map names. */
+  mapped: number;
+  /** Whether the tag extractor reads this language at all. */
+  extracted: boolean;
+}
+
+export interface MapScope {
+  /** Files the map names, out of the tree's in-scope files. */
+  mapped: number;
+  total: number;
+  /** Largest language first, then by name, so the model reads the bulk of the tree first. */
+  languages: LanguageScope[];
+}
+
+/**
+ * How much of the tree the map covers, honestly, by language.
+ *
+ * A language counts as extracted when the extractor reads its files, decided
+ * per file by the extractor's own predicate rather than by a list copied
+ * here. C# was added to the extractor this week; a copied list would already
+ * have been wrong once.
+ */
+export function describeMapScope(
+  files: ReadonlyArray<TreeFileLike>,
+  mappedPaths: ReadonlyArray<string>,
+): MapScope {
+  const mapped = new Set(mappedPaths);
+  const byLanguage = new Map<string, LanguageScope>();
+  for (const file of files) {
+    const entry = byLanguage.get(file.language) ?? {
+      language: file.language,
+      files: 0,
+      mapped: 0,
+      extracted: false,
+    };
+    entry.files += 1;
+    if (mapped.has(file.path)) entry.mapped += 1;
+    if (extractsTagsFrom(file.path)) entry.extracted = true;
+    byLanguage.set(file.language, entry);
+  }
+  return {
+    mapped: files.filter((file) => mapped.has(file.path)).length,
+    total: files.length,
+    languages: [...byLanguage.values()].sort(
+      (a, b) => b.files - a.files || a.language.localeCompare(b.language),
+    ),
+  };
+}
+
+/**
+ * The sentence above the map that says what the map is.
+ *
+ * Without it, a thin map and an empty area read the same: the model saw no
+ * symbols under `src/payments/` and concluded there were none, when the map
+ * had simply run out of budget before it got there, or the language was one
+ * the extractor does not read. Absence claims were being drawn from silence.
+ * Stated whether or not the scope is known, because the instruction that an
+ * unmapped area is not an empty one is the part the model has to carry.
+ */
+export function renderMapScope(scope: MapScope | undefined): string {
+  const lines = ["MAP SCOPE"];
+  if (scope === undefined) {
+    lines.push("The map's coverage of the tree was not computed for this run.");
+  } else {
+    const shares = scope.languages
+      .map((l) => `${l.language} ${l.mapped} of ${l.files}${l.extracted ? "" : " (not read by the map)"}`)
+      .join("; ");
+    lines.push(`This map names ${scope.mapped} of ${scope.total} files in the tree. By language: ${shares || "none"}.`);
+    const unread = scope.languages.filter((l) => !l.extracted).map((l) => l.language);
+    lines.push(
+      unread.length > 0
+        ? `The map extractor does not read ${unread.join(", ")}, so those files contribute nothing here whatever they contain.`
+        : "The map extractor reads every language in this tree.",
+    );
+  }
+  lines.push(
+    "An area absent from the map is UNMAPPED, not empty. Use search_repo and list_files " +
+      "to look there before concluding that anything is missing.",
+  );
+  return lines.join("\n");
+}
+
+/* ── What the sweep found ─────────────────────────────────────────────────── */
+
+/**
+ * A sweep signal as this stage needs it. Structural, and `kind` is a plain
+ * string: the sweep's kind names are data here, because they are being renamed
+ * and added to in another build and a type would refuse a sweep.json written
+ * after this file was.
+ */
+export interface SweepSignalLike {
+  path: string;
+  line: number;
+  kind: string;
+  signalClass: "surface" | "defect";
+  excerpt: string;
+}
+
+/**
+ * Defect candidates per question, at most.
+ *
+ * Twelve is about a screen of lines: enough to hand the model every candidate
+ * a question usually has, few enough that it opens each one rather than
+ * skimming the list. The rest are still folded into findings.json by the merge
+ * at closure, so a candidate past the cap is not lost, only not seeded.
+ */
+export const SWEEP_SEED_LIMIT = 12;
+
+export interface SweepSeeds {
+  /** Defect-class signals of the question's kinds, ranked, capped at the limit. */
+  defects: SweepSignalLike[];
+  /** How many defect-class signals of those kinds there were before the cap. */
+  defectTotal: number;
+  /** Surface-class kinds the question named, counted rather than listed. */
+  surface: Array<{ kind: string; count: number; files: number }>;
+  /** Kinds the question named that the sweep does not know. Warned about by the caller. */
+  unknownKinds: string[];
+}
+
+/**
+ * Where a kind ranks, by consequence. Unknown kinds never get here: they are
+ * dropped before selection. Ties fall to path then line so two runs over an
+ * unchanged tree seed the same lines in the same order.
+ */
+const SEVERITY_RANK: Record<FindingSeverity, number> = { error: 0, warning: 1, info: 2, unknown: 3 };
+
+/**
+ * Pick what the sweep found that this question should open first.
+ *
+ * `severityOf` is the sweep's own ranking of a kind, or undefined for a name
+ * it does not know. Passed in rather than imported so this file does not
+ * depend on the table that owns the kinds, which another build is editing.
+ */
+export function selectSweepSeeds(
+  question: Question,
+  signals: ReadonlyArray<SweepSignalLike>,
+  severityOf: (kind: string) => FindingSeverity | undefined,
+): SweepSeeds {
+  const named = question.signals ?? [];
+  const unknownKinds = named.filter((kind) => severityOf(kind) === undefined);
+  const wanted = new Set(named.filter((kind) => severityOf(kind) !== undefined));
+
+  const defects = signals
+    .filter((signal) => signal.signalClass === "defect" && wanted.has(signal.kind))
+    .sort(
+      (a, b) =>
+        SEVERITY_RANK[severityOf(a.kind)!] - SEVERITY_RANK[severityOf(b.kind)!] ||
+        a.path.localeCompare(b.path) ||
+        a.line - b.line,
+    );
+
+  const surfaceByKind = new Map<string, { count: number; files: Set<string> }>();
+  for (const signal of signals) {
+    if (signal.signalClass !== "surface" || !wanted.has(signal.kind)) continue;
+    const bucket = surfaceByKind.get(signal.kind) ?? { count: 0, files: new Set<string>() };
+    bucket.count += 1;
+    bucket.files.add(signal.path);
+    surfaceByKind.set(signal.kind, bucket);
+  }
+
+  return {
+    defects: defects.slice(0, SWEEP_SEED_LIMIT),
+    defectTotal: defects.length,
+    surface: [...surfaceByKind]
+      .map(([kind, b]) => ({ kind, count: b.count, files: b.files.size }))
+      .sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind)),
+    unknownKinds,
+  };
+}
+
+/**
+ * The block that hands the candidates over.
+ *
+ * The excerpt is shown so the model knows what it is looking for, and the
+ * instruction says not to cite it. The verifier re-reads every cited line, and
+ * a citation copied from this block would pass that check while the model had
+ * read nothing: exactly the answered-from-memory failure the tools exist to
+ * end. Empty when there is nothing to hand over, so a question with no
+ * candidates gets no block rather than an empty heading that reads as "the
+ * sweep found nothing here".
+ */
+export function renderSweepSeeds(seeds: SweepSeeds | undefined): string {
+  if (seeds === undefined || (seeds.defects.length === 0 && seeds.surface.length === 0)) return "";
+
+  const lines = ["THE SWEEP FOUND"];
+  if (seeds.defects.length > 0) {
+    lines.push(
+      "A deterministic pass over every file matched these lines. They are candidates, not " +
+        "findings. Open each file FIRST with read_file and cite what you read there, at the line " +
+        "numbers the tool shows you. Never cite an excerpt from this list as evidence.",
+    );
+    for (const signal of seeds.defects) {
+      lines.push(`- ${signal.path}:${signal.line} [${signal.kind}] ${signal.excerpt}`);
+    }
+    if (seeds.defectTotal > seeds.defects.length) {
+      lines.push(`(${seeds.defectTotal - seeds.defects.length} more of these kinds were matched and are not listed.)`);
+    }
+  }
+  if (seeds.surface.length > 0) {
+    const counts = seeds.surface
+      .map((row) => `${row.kind} ${row.count} line(s) across ${row.files} file(s)`)
+      .join("; ");
+    lines.push(`The sweep also counted, as surface rather than defects: ${counts}.`);
+  }
+  return lines.join("\n");
+}
+
 export interface PromptInput {
   question: Question;
   repoMap: string;
+  /** What the map covers. Undefined is stated as unknown, never as complete. */
+  mapScope?: MapScope;
   analyzerFacts: string;
+  /** What the sweep matched for this question, if a sweep ran and the question names kinds. */
+  sweepSeeds?: SweepSeeds;
 }
 
 /**
@@ -181,17 +419,23 @@ export interface PromptInput {
  * Every piece of text that came from the tree under audit is sanitised first.
  * A codebase can carry an instruction addressed to the reviewer — in an HTML
  * comment, in zero-width characters, in a hidden attribute — and those are
- * dangerous precisely because a human reading the file sees nothing.
+ * dangerous precisely because a human reading the file sees nothing. The
+ * sweep's excerpts and paths are lines from that tree and get the same
+ * treatment.
  */
 export function buildUserPrompt(input: PromptInput): string {
   return [
     `QUESTION (${input.question.id})`,
     input.question.ask,
     "",
+    renderMapScope(input.mapScope),
+    "",
     "REPOSITORY MAP",
     sanitizeUntrusted(input.repoMap),
     "",
     sanitizeUntrusted(input.analyzerFacts),
+    "",
+    sanitizeUntrusted(renderSweepSeeds(input.sweepSeeds)),
     "",
     input.question.absenceClaim
       ? 'This question may legitimately answer "there is none". If so, say which vocabularies you searched.'
@@ -398,8 +642,27 @@ export function parseClaims(
 export interface InvestigateOptions {
   questions: Question[];
   model: InvestigateModel;
-  /** Ranked repo map for one question, seeded from that question's own text. */
-  repoMapFor(seedTexts: string[]): string;
+  /**
+   * Ranked repo map for one question, seeded from that question's own text.
+   *
+   * A `PromptMap` says which files it names, and the prompt then states what
+   * the map covers per language. A bare string is accepted for callers that
+   * have nothing more, and the prompt says the coverage was not computed.
+   */
+  repoMapFor(seedTexts: string[]): string | PromptMap;
+  /**
+   * Every in-scope file with its language: the inventory. Needed for the map
+   * scope statement; without it the prompt says the scope is unknown.
+   */
+  treeFiles?: ReadonlyArray<TreeFileLike>;
+  /**
+   * What the sweep found, when it ran. `severityOf` is the sweep's own rank
+   * for a kind, undefined for a kind it does not know; see `selectSweepSeeds`.
+   */
+  sweep?: {
+    signals: ReadonlyArray<SweepSignalLike>;
+    severityOf(kind: string): FindingSeverity | undefined;
+  };
   analyzerJobs: JobFindings[];
   subjectRev: string | null;
   /** Where dropped claims are announced. Defaults to stderr. */
@@ -437,10 +700,33 @@ export async function investigate(
     // only on the success path would leave a progress bar permanently short of
     // its denominator on any run with a failed question.
     (async (): Promise<QuestionRunResult> => {
+      const rawMap = options.repoMapFor(seedTextsFor(question));
+      const map: PromptMap = typeof rawMap === "string" ? { text: rawMap } : rawMap;
+      const mapScope =
+        options.treeFiles !== undefined && map.files !== undefined
+          ? describeMapScope(options.treeFiles, map.files)
+          : undefined;
+
+      let sweepSeeds: SweepSeeds | undefined;
+      if (options.sweep !== undefined && question.signals !== undefined) {
+        sweepSeeds = selectSweepSeeds(question, options.sweep.signals, options.sweep.severityOf);
+        // Warned, not refused. The sweep's kinds are being renamed in another
+        // build, and a taxonomy naming a kind this sweep does not know yet
+        // should still run; the log says which names did nothing.
+        if (sweepSeeds.unknownKinds.length > 0) {
+          log(
+            `[investigate] ${question.id}: sweep signal kind(s) not known to this sweep, ignored: ` +
+              sweepSeeds.unknownKinds.join(", "),
+          );
+        }
+      }
+
       const userPrompt = buildUserPrompt({
         question,
-        repoMap: options.repoMapFor(seedTextsFor(question)),
+        repoMap: map.text,
+        mapScope,
         analyzerFacts,
+        sweepSeeds,
       });
 
       let response: InvestigateResponse;

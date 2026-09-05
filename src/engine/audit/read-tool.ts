@@ -27,6 +27,7 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 
 import type { FileAccessLog } from "./inventory.js";
 import type { ReviewTool, ToolResult } from "../tools/registry.js";
+import { makeRepoSearchTools } from "../tools/repo.js";
 
 /**
  * Biggest file handed to the model, in bytes.
@@ -159,4 +160,34 @@ export function makeReadTool(options: ReadToolOptions): ReviewTool {
       return { content: `${path}: ${result.reason}`, isError: true };
     },
   };
+}
+
+/**
+ * The investigator's whole toolset: `read_file`, plus `search_repo` and
+ * `list_files` from the pull-request path, all recording into the same log.
+ *
+ * Until this existed the investigator had `read_file` and nothing else. The
+ * repo map names the top-ranked files and the model has to guess the rest,
+ * and a guessed path that misses costs a turn and teaches nothing. Under a
+ * turn cap that is how a question ends up answered from memory: the last run
+ * over a large subject opened 2.2% of its files. The PR reviewer has had
+ * search and listing since OGE-1555; the audit simply never bound them.
+ *
+ * The reader stays the audit's own. The PR `read_file` returns a 100-line
+ * window and refuses files over 64KB, which suits a diff review and starves an
+ * audit whose verifier re-reads whole files by line number.
+ *
+ * What each call puts in the ledger is decided in `makeRepoSearchTools`: a
+ * listing records nothing, a search records each file it returned a line
+ * from. `FileAccessLog` is passed straight through as the recorder because it
+ * already has the record signature the tools expect; there is no adapter to
+ * forget.
+ *
+ * Handed to the investigation stage only. The verifier keeps `read_file`
+ * alone: it is given one claim and one cited location, and a verifier that
+ * can search is a verifier that goes looking for a better argument instead of
+ * testing the one it was given.
+ */
+export function makeInvestigateTools(options: ReadToolOptions): ReviewTool[] {
+  return [makeReadTool(options), ...makeRepoSearchTools(options.root, options.log)];
 }

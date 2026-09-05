@@ -52,6 +52,7 @@ export function buildRepoMap(args: BuildRepoMapArgs): RenderedMap {
   });
 }
 
-export { TagCache } from "./tags.js";
+export { TagCache, extractsTagsFrom } from "./tags.js";
 export type { RepoFile, Tag } from "./tags.js";
+export { mapBudgetForTree, MAX_AUDIT_MAP_TOKENS, DEFAULT_MAP_TOKENS } from "./render.js";
 export type { RenderedMap } from "./render.js";

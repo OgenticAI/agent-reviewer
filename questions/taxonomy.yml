@@ -24,6 +24,18 @@
 # Those are the easiest to get wrong and the most damaging to retract, so the
 # verification stage re-tests them against several vocabularies before "no" is
 # allowed to stand.
+#
+# `signals` names the sweep's signal kinds this question should be seeded
+# from. The sweep reads every file and matches defect candidates with a path,
+# a line and an excerpt; the investigation opens the matching files first and
+# cites what it reads there. Surface kinds (routes, attributes, by-id fetches)
+# are handed over as one line of counts, never listed. Kept conservative: a
+# kind belongs on a question only when a match is direct evidence for the
+# question's own ask, because a candidate seeded onto the wrong question is
+# read by a model asking the wrong thing about it. A kind on no question
+# still reaches findings.json through the closure merge; it is only not
+# seeded. A name the sweep does not know is warned about and skipped, so a
+# rename on the sweep side never breaks a run.
 
 version: 1
 name: baseline
@@ -41,6 +53,11 @@ questions:
       behaviour. When the load order puts a checked-in file after the
       environment's own, production runs on whatever the repository says.
     seeds: [appsettings, config, environment, dotenv, ConfigurationBuilder, process.env]
+    # config-precedence: a test or environment settings file loaded where it
+    # can override production is this question's own ask.
+    # debug-enabled: a debug flag or developer exception page left on is a
+    # configuration value that applies in production and should not.
+    signals: [config-precedence, debug-enabled]
 
   - id: authn-completeness
     ask: >
@@ -50,6 +67,10 @@ questions:
       A login button that resolves to a stub is a feature the product claims and
       does not have. This is about completeness, not correctness.
     seeds: [login, signin, oauth, sso, token, session, verify, provider]
+    # unvalidated-token: a token decoded without its signature checked is an
+    # authentication path that is wired but not complete.
+    # insecure-cookie: the session cookie's flags are part of the same path.
+    signals: [unvalidated-token, insecure-cookie]
 
   - id: unauthenticated-side-effects
     ask: >
@@ -61,6 +82,10 @@ questions:
       too often. Look for the omission next to neighbours that are guarded —
       that pattern is an oversight, not a design.
     seeds: [AllowAnonymous, public, unauthenticated, anonymous, webhook, callback]
+    # anonymous-endpoint: the defect this question exists to find.
+    # http-endpoint, authorization-check: surface counts, the denominator the
+    # anonymous endpoints are read against; summarised as one line.
+    signals: [anonymous-endpoint, http-endpoint, authorization-check]
 
   - id: secrets-and-data-at-rest
     ask: >
@@ -70,6 +95,11 @@ questions:
       Partial encryption reads as encryption. Record which fields are covered
       and which are not — never reproduce a value, only its location.
     seeds: [encrypt, decrypt, cipher, crypto, salt, key, secret, connectionString]
+    # weak-password-hash, weak-crypto: what protects the data, and whether it
+    # would hold.
+    # sensitive-field: surface, where the encryption question has to be asked;
+    # summarised as a count so the fields are located, never reproduced.
+    signals: [weak-password-hash, weak-crypto, sensitive-field]
 
   - id: deployment-provenance
     ask: >
@@ -99,6 +129,11 @@ questions:
       Tenancy holds only if every query is scoped. One predicate that treats an
       untagged row as belonging to everyone undoes the whole boundary.
     seeds: [tenant, organization, workspace, account, partition, scope]
+    # identity-from-request: a tenant or identity taken from a header the
+    # caller controls is the boundary resting on the caller's word.
+    # insecure-direct-object-reference: surface, the by-id fetches where an
+    # ownership check should sit; summarised as a count.
+    signals: [identity-from-request, insecure-direct-object-reference]
 
   - id: data-model-scale
     ask: >
@@ -118,6 +153,9 @@ questions:
       A dependency with no failure path is an outage with someone else's name
       on it.
     seeds: [client, sdk, api, http, retry, timeout, circuit, fallback]
+    # disabled-cert-validation: an outbound connection that accepts any
+    # certificate is a third-party dependency trusted on no evidence.
+    signals: [disabled-cert-validation]
 
   - id: observability
     ask: >

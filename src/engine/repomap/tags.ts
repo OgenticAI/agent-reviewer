@@ -43,6 +43,20 @@ export interface Tag {
 const TS_JS_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
 const CSHARP_EXT = /\.cs$/;
 
+/**
+ * Whether `extractTags` reads this path at all.
+ *
+ * The one place the extractor's language support is stated, exported so the
+ * audit prompt can say which of a tree's languages the map covers instead of
+ * letting the model infer it from silence. Kept as a predicate over the same
+ * patterns `extractTags` dispatches on, so adding a backend there cannot leave
+ * this answer behind: the prompt would then claim a language is unmapped
+ * while the map quietly covered it, or the reverse, which is worse.
+ */
+export function extractsTagsFrom(path: string): boolean {
+  return CSHARP_EXT.test(path) || TS_JS_EXT.test(path);
+}
+
 /** Definition patterns for TS/JS. Each captures the symbol name in group 1. */
 const DEF_PATTERNS: RegExp[] = [
   /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,

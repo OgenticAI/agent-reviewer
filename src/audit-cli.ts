@@ -70,6 +70,7 @@ import {
 import { sweepTree } from "./engine/audit/sweep.js";
 import {
   sweepArtifactFrom,
+  sweepSeverity,
   toSweepFindings,
   mergeSweepFindings,
   type SweepArtifact,
@@ -90,12 +91,14 @@ import {
   renderAsk,
 } from "./engine/audit/closure.js";
 import { loadQuestionSet } from "./engine/audit/questions.js";
-import { makeReadTool } from "./engine/audit/read-tool.js";
+import { makeInvestigateTools } from "./engine/audit/read-tool.js";
 import {
   buildRepoMap,
+  mapBudgetForTree,
   TagCache,
   type RepoFile,
 } from "./engine/repomap/index.js";
+import type { SignalKind } from "./engine/audit/sweep.js";
 import { makeInvestigateModel, makeVerifierModel,
   AUDIT_MODEL,
 } from "./audit-model.js";
@@ -699,6 +702,25 @@ export function readSweep(outDir: string): SweepArtifact | undefined {
 }
 
 /**
+ * The sweep's rank for a kind, or undefined for a name it does not know.
+ *
+ * The seeding treats kind names in the taxonomy as data, because the sweep's
+ * kinds are being renamed and added to in another build. The only complete
+ * list of them is the severity table in `sweep-findings.ts`, which that build
+ * owns and which answers an unknown name by throwing; this probe turns the
+ * throw into the undefined the seeding wants, so a name the sweep does not
+ * know yet is warned about and skipped rather than failing the run. Exported
+ * for the tests.
+ */
+export function knownSweepSeverity(kind: string): ReturnType<typeof sweepSeverity> | undefined {
+  try {
+    return sweepSeverity(kind as SignalKind);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Read every file in the tree, with no model (OGE-2746).
  *
  * Runs before the investigation so its reads are already in the ledger when
@@ -1003,7 +1025,24 @@ async function investigateRun(ctx: {
   // told the model had read every file whatever it had actually opened.
   const accessLog = openAccessLog(out);
   const modelLog = new TeeAccessLog(accessLog);
-  const readTool = makeReadTool({ root: tree, log: modelLog });
+  // `read_file` first, then `search_repo` and `list_files`, all through the
+  // tee. The investigator gets all three; the verifier is handed only the
+  // reader, and decides that for itself in `makeVerifierModel`.
+  const [readTool, ...searchTools] = makeInvestigateTools({ root: tree, log: modelLog });
+  if (readTool === undefined) throw new CliError("investigate: no read tool was built");
+
+  // The sweep's candidates, read BEFORE the investigation rather than at
+  // closure, because they are handed to the model as the lines to open first.
+  // The rev check moves up with it: a sweep over another revision describes a
+  // tree that is not this one, and refusing it here refuses it before any
+  // model call has been paid for.
+  const sweep = readSweep(out);
+  if (sweep && sweep.rev !== subject.rev)
+    throw new CliError(
+      `${join(out, "sweep.json")} was swept at revision ${sweep.rev ?? "(none)"}; this tree is at ` +
+        `${subject.rev ?? "(none)"}. Its excerpts and line numbers describe a different tree. ` +
+        `Re-run audit sweep over this tree before investigating.`,
+    );
 
   const anthropic = new Anthropic({ apiKey });
   // One meter for the whole run. audit-model.ts is the only place this path
@@ -1059,6 +1098,7 @@ async function investigateRun(ctx: {
   const modelOptions = {
     anthropic,
     readTool,
+    searchTools,
     meter,
     failures,
     log: (message: string) => telemetry.log("investigate", "info", message),
@@ -1078,9 +1118,16 @@ async function investigateRun(ctx: {
     return files;
   }, reportUsage);
 
+  // Sized to the tree, not left at the PR default. With no budget passed the
+  // map was capped at 1024 tokens whatever the tree held, which on a large
+  // subject named a dozen files; see `mapBudgetForTree` for the formula.
+  const mapBudget = mapBudgetForTree(inventory.files.length);
+
   process.stdout.write(
     `investigating ${subject.name} — ${questionSet.questions.length} question(s), ` +
-      `${inventory.files.length} file(s) in scope\n`,
+      `${inventory.files.length} file(s) in scope, map budget ${mapBudget} tokens` +
+      (sweep ? `, ${sweep.signals.length} sweep signal(s) to seed from` : ", no sweep to seed from") +
+      `\n`,
   );
 
   meter.enter("investigate");
@@ -1092,14 +1139,19 @@ async function investigateRun(ctx: {
       const runs = await investigate({
         questions: questionSet.questions,
         model: makeInvestigateModel(modelOptions),
+        // The whole rendered map, not its text: the prompt states which files
+        // and languages the map covers, and needs the list to do it.
         repoMapFor: (seedTexts) =>
           buildRepoMap({
             files: repoFiles,
             diffTouchedFiles: [],
             seedTexts,
             diffText: "",
+            baseTokens: mapBudget,
             cache,
-          }).text,
+          }),
+        treeFiles: inventory.files,
+        ...(sweep ? { sweep: { signals: sweep.signals, severityOf: knownSweepSeverity } } : {}),
         analyzerJobs: jobs,
         subjectRev: subject.rev,
         log: (message) => telemetry.log("investigate", "info", message),
@@ -1265,17 +1317,9 @@ async function investigateRun(ctx: {
   // verified and closed, and the pattern that would have pointed at the same
   // line adds nothing but a second, weaker entry. Everything else the sweep
   // matched is added at `inferred` with `source: sweep`, and sent up like any
-  // other finding so the dashboard and findings.json agree.
-  const sweep = readSweep(out);
-  // The rev on the evidence is the one the excerpts were READ at, taken from
-  // the artifact. A sweep over another revision is refused rather than
-  // re-stamped: its lines and excerpts describe a tree that is not this one.
-  if (sweep && sweep.rev !== subject.rev)
-    throw new CliError(
-      `${join(out, "sweep.json")} was swept at revision ${sweep.rev ?? "(none)"}; this tree is at ` +
-        `${subject.rev ?? "(none)"}. Its excerpts and line numbers describe a different tree. ` +
-        `Re-run audit sweep over this tree before investigating.`,
-    );
+  // other finding so the dashboard and findings.json agree. `sweep` was read
+  // and rev-checked at the top of this run, before the investigation it also
+  // seeds; the rev on the evidence is the one the excerpts were READ at.
   const merged = sweep
     ? mergeSweepFindings(closure.findings, toSweepFindings(sweep.signals, sweep.rev))
     : { findings: closure.findings, added: 0, displaced: 0 };

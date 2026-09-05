@@ -835,6 +835,22 @@ describe("naming the subject on the cover", () => {
     expect(source).not.toMatch(/\*Subject:\* \.$/m);
     expect(source).toContain("*Subject:* acme-web-app");
   });
+
+  // acquire strips the credential before it writes the subject, but a
+  // subject.json written before it did can still carry one, and the cover is
+  // the last place it should surface.
+  it("drops a credential left in an older subject's origin", () => {
+    const token = "EXAMPLE_TOKEN_0123456789";
+    const origin = `https://user:${token}@git.example.com/acme/app.git`;
+    expect(subjectLabel(subject({ origin }))).toBe("https://git.example.com/acme/app.git");
+
+    const source = renderTypst({
+      input: input({ subject: subject({ origin }) }),
+      executiveSummary: SUMMARY,
+    });
+    expect(source).not.toContain(token);
+    expect(source).toContain("git.example.com/acme/app.git");
+  });
 });
 
 describe("the cover date", () => {

@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
+import { maskSecrets } from "../tools/sanitize.js";
 import { summariseTree, walkTree, type TreeSummary } from "./tree.js";
 
 const run = promisify(execFile);
@@ -33,7 +34,12 @@ export type SourceKind = "clone" | "archive";
 
 export interface Subject extends TreeSummary {
   kind: SourceKind;
-  /** Exactly what the operator asked for, so a `-v3` repo is never reported as the live product. */
+  /**
+   * What the operator asked for, so a `-v3` repo is never reported as the
+   * live product. Verbatim except for one thing: a credential embedded in the
+   * URL is removed before it gets here (see `redactUrl`). Everything that
+   * reads a subject prints this field, and none of it needs the token.
+   */
   origin: string;
   /** Directory name of the acquired tree. */
   name: string;
@@ -57,6 +63,13 @@ export interface Subject extends TreeSummary {
   defaultBranch: string | null;
   /** Why `rev` is what it is. Never blank — a missing revision is a fact to state. */
   revProvenance: string;
+  /**
+   * The single top-level folder an archive wrapped its contents in, when one
+   * was lifted out of the way. Recorded because every path in the report is
+   * one segment shorter than the path in the file the client sent, and a
+   * reader comparing the two should be able to see why.
+   */
+  liftedWrapper?: string;
   acquiredAt: string;
 }
 
@@ -69,7 +82,13 @@ export class AcquireError extends Error {
 
 /* ── Source classification ────────────────────────────────────────────────── */
 
-const ARCHIVE_EXTENSIONS = [".zip", ".tar.gz", ".tgz", ".tar"];
+/**
+ * `.7z` is here because it is what a Windows shop's right-click menu makes;
+ * `.tar.xz` and `.tar.bz2` because that is how a release tarball tends to
+ * arrive. Refusing any of them as "not an archive" sends the client back to
+ * re-export, which costs a day for a format `tar` already reads.
+ */
+const ARCHIVE_EXTENSIONS = [".zip", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar", ".7z"];
 
 export function isArchivePath(from: string): boolean {
   const lower = from.toLowerCase();
@@ -91,6 +110,29 @@ export function normaliseCloneUrl(from: string): string {
   if (/^[^/]+@[^/]+:/.test(from)) return from;
   if (from.startsWith("/") || from.startsWith(".") || from.startsWith("~")) return from;
   return `https://${from}`;
+}
+
+/**
+ * The URL with any credential removed: `https://user:token@host/x` becomes
+ * `https://host/x`.
+ *
+ * A token in the clone URL is the ordinary way to give a one-off process
+ * read access, and it is the one input here that must never travel further
+ * than the `git clone` it was meant for. Left in, it lands in subject.json,
+ * in the telemetry event Mission Control stores, in the error text an
+ * operator pastes into a chat, and on the cover of the client's PDF. So the
+ * raw URL goes to git and nowhere else; everything that describes the
+ * acquisition sees this.
+ *
+ * The whole userinfo goes, username included, and nothing stands in for it.
+ * A placeholder would read as a value on a cover page, and the username
+ * alone is not worth keeping when it is sometimes the token (GitHub accepts a
+ * PAT as the user with no password). Only `scheme://userinfo@` is touched:
+ * the SCP form `git@host:owner/repo` names a user and carries no secret, and a
+ * local path has no host to strip anything from.
+ */
+export function redactUrl(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/]*@/i, "$1");
 }
 
 /* ── Archive safety ───────────────────────────────────────────────────────── */
@@ -145,16 +187,118 @@ function verifyContained(root: string): void {
 
 /* ── The two acquisition paths ────────────────────────────────────────────── */
 
-async function listArchive(archive: string): Promise<string[]> {
+const RUN_OPTIONS = { timeout: ACQUIRE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 };
+
+/**
+ * The 7-Zip binary, by the names it ships under: `7z` from p7zip, `7zz` from
+ * 7-Zip's own Linux and macOS builds. Neither is a dependency of this package
+ * and the error for a missing one names what to install.
+ */
+const SEVEN_ZIP_BINARIES = ["7z", "7zz"];
+
+type ArchiveFormat = "zip" | "tar" | "7z";
+
+function archiveFormat(archive: string): ArchiveFormat {
   const lower = archive.toLowerCase();
-  const { stdout } = lower.endsWith(".zip")
-    ? await run("unzip", ["-Z1", archive], { timeout: ACQUIRE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 })
-    : await run("tar", ["-tf", archive], { timeout: ACQUIRE_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 });
-  return stdout.split("\n").filter((line) => line.trim() !== "");
+  if (lower.endsWith(".zip")) return "zip";
+  if (lower.endsWith(".7z")) return "7z";
+  return "tar";
 }
 
-async function extractArchive(archive: string, into: string): Promise<void> {
-  const entries = await listArchive(archive);
+interface SpawnFailure {
+  code?: number | string;
+  stderr?: string;
+  stdout?: string;
+}
+
+function spawnFailure(error: unknown): SpawnFailure {
+  const e = error as SpawnFailure;
+  return {
+    code: e.code,
+    stderr: typeof e.stderr === "string" ? e.stderr : "",
+    stdout: typeof e.stdout === "string" ? e.stdout : "",
+  };
+}
+
+/** Run 7-Zip under whichever name is installed, or say that none is. */
+async function sevenZip(args: string[]): Promise<{ stdout: string }> {
+  for (const binary of SEVEN_ZIP_BINARIES) {
+    try {
+      return await run(binary, args, RUN_OPTIONS);
+    } catch (error) {
+      if (spawnFailure(error).code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  throw new AcquireError(
+    `this is a .7z archive and no 7-Zip binary (${SEVEN_ZIP_BINARIES.join(" or ")}) is on PATH. ` +
+      `Install p7zip, or ask for the export as a .zip or .tar.gz. Nothing was written.`,
+  );
+}
+
+async function listArchive(archive: string): Promise<string[]> {
+  switch (archiveFormat(archive)) {
+    case "zip": {
+      const { stdout } = await run("unzip", ["-Z1", archive], RUN_OPTIONS);
+      return stdout.split("\n").filter((line) => line.trim() !== "");
+    }
+    case "7z": {
+      // `-slt` prints one `Path = ...` record per entry, which is the only 7z
+      // listing that does not truncate or right-align names into columns.
+      const { stdout } = await sevenZip(["l", "-slt", "-ba", archive]);
+      return stdout
+        .split("\n")
+        .filter((line) => line.startsWith("Path = "))
+        .map((line) => line.slice("Path = ".length));
+    }
+    case "tar": {
+      const { stdout } = await run("tar", ["-tf", archive], RUN_OPTIONS);
+      return stdout.split("\n").filter((line) => line.trim() !== "");
+    }
+  }
+}
+
+/**
+ * Whether an extractor failed because the archive wants a password.
+ *
+ * unzip cannot ask for one without a terminal, so it skips every entry with
+ * "unable to get password" and exits 5; 7z says "Wrong password" or
+ * "encrypted". Either way the listing succeeded, so nothing upstream saw it
+ * coming, and left unmapped the run dies with a stack trace and no
+ * subject.json for a file that only needed re-exporting.
+ */
+function isPasswordFailure(failure: SpawnFailure): boolean {
+  const text = `${failure.stderr ?? ""}\n${failure.stdout ?? ""}`;
+  return (
+    failure.code === 5 ||
+    /unable to get password|incorrect password|wrong password|encrypted/i.test(text)
+  );
+}
+
+function describeExtractFailure(archive: string, error: unknown): AcquireError {
+  if (error instanceof AcquireError) return error;
+  const failure = spawnFailure(error);
+  const name = basename(archive);
+  if (isPasswordFailure(failure)) {
+    return new AcquireError(
+      `${name} is password-protected and cannot be extracted without a terminal to ask on. ` +
+        `Ask for an unencrypted export of the same code. Nothing was extracted.`,
+    );
+  }
+  const tail = `${failure.stderr ?? ""}`.trim().split("\n").slice(-2).join(" ");
+  return new AcquireError(
+    `could not extract ${name}${tail ? `: ${tail}` : ""}. ` +
+      `Check that the file is a complete, uncorrupted archive.`,
+  );
+}
+
+async function extractArchive(archive: string, into: string): Promise<string | undefined> {
+  let entries: string[];
+  try {
+    entries = await listArchive(archive);
+  } catch (error) {
+    throw describeExtractFailure(archive, error);
+  }
   const unsafe = unsafeArchiveEntries(entries);
   if (unsafe.length > 0) {
     throw new AcquireError(
@@ -163,32 +307,61 @@ async function extractArchive(archive: string, into: string): Promise<void> {
   }
 
   mkdirSync(into, { recursive: true });
-  const lower = archive.toLowerCase();
-  if (lower.endsWith(".zip")) {
-    await run("unzip", ["-q", archive, "-d", into], { timeout: ACQUIRE_TIMEOUT_MS });
-  } else {
-    await run("tar", ["-xf", archive, "-C", into], { timeout: ACQUIRE_TIMEOUT_MS });
+  try {
+    switch (archiveFormat(archive)) {
+      case "zip":
+        await run("unzip", ["-q", archive, "-d", into], RUN_OPTIONS);
+        break;
+      case "7z":
+        await sevenZip(["x", "-y", `-o${into}`, archive]);
+        break;
+      case "tar":
+        // One flag for gzip, xz and bzip2 alike: tar reads the magic bytes.
+        await run("tar", ["-xf", archive, "-C", into], RUN_OPTIONS);
+        break;
+    }
+  } catch (error) {
+    throw describeExtractFailure(archive, error);
   }
 
   verifyContained(into);
-  liftSingleWrapperDirectory(into);
+  return liftSingleWrapperDirectory(into);
 }
+
+/**
+ * What Finder adds to a zip and what the wrapper decision must see past.
+ *
+ * A right-click "Compress" on macOS writes `__MACOSX/` beside the folder and a
+ * `.DS_Store` inside it. Counted, they make a one-folder archive look like a
+ * two-entry one, the wrapper stays, and every path in the report gains a
+ * segment that was never part of the codebase.
+ */
+const ARCHIVE_DEBRIS: ReadonlySet<string> = new Set(["__MACOSX", ".DS_Store"]);
 
 /**
  * Archives usually wrap everything in one top-level folder. Left in place it
  * shifts every path in every finding by a segment that is an artefact of how
  * the file was made, not part of the codebase.
+ *
+ * Returns the name of the folder that was lifted, or nothing if there was no
+ * single wrapper to lift.
  */
-function liftSingleWrapperDirectory(root: string): void {
-  const entries = readdirSync(root, { withFileTypes: true });
+function liftSingleWrapperDirectory(root: string): string | undefined {
+  const entries = readdirSync(root, { withFileTypes: true }).filter(
+    (entry) => !ARCHIVE_DEBRIS.has(entry.name),
+  );
   const [only] = entries;
-  if (entries.length !== 1 || !only || !only.isDirectory()) return;
+  if (entries.length !== 1 || !only || !only.isDirectory()) return undefined;
 
   const wrapper = join(root, only.name);
   for (const child of readdirSync(wrapper)) {
+    // Debris can sit at both levels; a rename onto an existing directory
+    // fails, and the outer copy is worth nothing anyway.
+    if (ARCHIVE_DEBRIS.has(child)) rmSync(join(root, child), { recursive: true, force: true });
     renameSync(join(wrapper, child), join(root, child));
   }
   rmSync(wrapper, { recursive: true, force: true });
+  return only.name;
 }
 
 /**
@@ -233,7 +406,12 @@ function credentialHelpFor(url: string): string {
   );
 }
 
-export function describeCloneFailure(url: string, stderr: string): string {
+export function describeCloneFailure(rawUrl: string, rawStderr: string): string {
+  // The URL is the operator's, and the one place a token is expected to be;
+  // git's stderr quotes the URL back, token and all, on a not-found. Both are
+  // redacted here rather than by the caller so that no caller can forget.
+  const url = redactUrl(rawUrl);
+  const stderr = maskSecrets(rawStderr);
   if (/could not read Username|Authentication failed|terminal prompts disabled/i.test(stderr)) {
     return (
       `cannot authenticate to ${url}. ` +
@@ -266,12 +444,13 @@ interface CloneResult {
  * whole flag exists to prevent, so an unresolvable ref stops the run.
  */
 async function cloneRepository(from: string, into: string, ref?: string): Promise<CloneResult> {
-  const url = normaliseCloneUrl(from);
+  // The one line that may see a credential. Every message below uses `url`.
+  const rawUrl = normaliseCloneUrl(from);
+  const url = redactUrl(rawUrl);
   try {
-    await run("git", ["clone", "--quiet", url, into], { timeout: ACQUIRE_TIMEOUT_MS });
+    await run("git", ["clone", "--quiet", rawUrl, into], { timeout: ACQUIRE_TIMEOUT_MS });
   } catch (error) {
-    const stderr = typeof (error as { stderr?: string }).stderr === "string" ? (error as { stderr: string }).stderr : "";
-    throw new AcquireError(describeCloneFailure(url, stderr));
+    throw new AcquireError(describeCloneFailure(rawUrl, spawnFailure(error).stderr ?? ""));
   }
 
   // Read before any checkout, so it records what the remote serves rather than
@@ -335,9 +514,10 @@ export async function acquire(options: AcquireOptions): Promise<Subject> {
   let rev: string | null = null;
   let defaultBranch: string | null = null;
   let revProvenance: string;
+  let liftedWrapper: string | undefined;
 
   if (archive) {
-    await extractArchive(resolve(options.from), into);
+    liftedWrapper = await extractArchive(resolve(options.from), into);
     revProvenance = "none — archive carries no history; re-acquire by clone for history signals";
     if (options.ref) {
       throw new AcquireError(
@@ -361,12 +541,16 @@ export async function acquire(options: AcquireOptions): Promise<Subject> {
   const files = walkTree(into);
   return {
     kind: archive ? "archive" : "clone",
-    origin: options.from,
+    // Redacted here, at the source, so that nothing downstream has to know
+    // a credential was ever in the URL: subject.json, the telemetry event,
+    // the CLI summary and the report cover all print this field as-is.
+    origin: redactUrl(options.from),
     name: basename(into),
     rev,
     requestedRef: options.ref ?? null,
     defaultBranch,
     revProvenance,
+    ...(liftedWrapper !== undefined ? { liftedWrapper } : {}),
     acquiredAt: new Date().toISOString(),
     ...summariseTree(files),
   };

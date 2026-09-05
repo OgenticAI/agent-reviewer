@@ -49,7 +49,7 @@ import {
   type QuestionOutcome,
 } from "./maturity.js";
 import type { JobFindings } from "../findings/schema.js";
-import type { Subject } from "./acquire.js";
+import { redactUrl, type Subject } from "./acquire.js";
 import {
   skippedByReason,
   SWEEP_SOURCE,
@@ -153,13 +153,18 @@ function branchLine(subject: Subject): string {
  * The fallback is `name`, which acquire takes from the directory it cloned
  * into. That makes the cover of a locally-acquired report only as good as the
  * directory name, so acquire into something named after the subject.
+ *
+ * The origin is redacted again here even though acquire already did it: a
+ * subject.json written before acquire learned to can still carry a token in
+ * the URL, and this is the last line before it is typeset onto the cover.
  */
 export function subjectLabel(subject: Subject): string {
+  const origin = redactUrl(subject.origin);
   const remote =
-    /^(https?:\/\/|git@|ssh:\/\/)/.test(subject.origin) ||
-    subject.origin.includes(".org/") ||
-    subject.origin.includes(".com/");
-  return remote ? subject.origin : subject.name;
+    /^(https?:\/\/|git@|ssh:\/\/)/.test(origin) ||
+    origin.includes(".org/") ||
+    origin.includes(".com/");
+  return remote ? origin : subject.name;
 }
 
 /**
@@ -660,7 +665,9 @@ export function renderTypst(options: RenderOptions): string {
     "= Targets",
     "",
     ...renderTargets({
-      origin: escapeTypst(input.subject.origin),
+      // Same belt and braces as subjectLabel: the Targets section prints the
+      // origin in full, and an older subject.json may carry a credential.
+      origin: escapeTypst(redactUrl(input.subject.origin)),
       name: escapeTypst(subjectLabel(input.subject)),
       rev: input.subject.rev,
       revProvenance: escapeTypst(input.subject.revProvenance),

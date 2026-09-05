@@ -120,6 +120,41 @@ describe("maskSecrets", () => {
   it("leaves ordinary text alone", () => {
     expect(maskSecrets("225 passed in 12.4s", [])).toBe("225 passed in 12.4s");
   });
+
+  // A clone URL with a token in it is how a process is given read access, and
+  // git quotes it back in its own stderr. Masking only the userinfo keeps the
+  // host and path, so the line still says which repository it was about.
+  it("masks the credential in a URL and keeps the host and path", () => {
+    const token = "EXAMPLE_TOKEN_0123456789";
+    const out = maskSecrets(`fatal: repository 'https://user:${token}@git.example.com/acme/app.git/' not found`, []);
+    expect(out).not.toContain(token);
+    expect(out).not.toContain("user:");
+    expect(out).toContain(`${SECRET_MASK}@git.example.com/acme/app.git`);
+  });
+
+  it("masks a bare token used as the URL user, which some hosts accept", () => {
+    const token = "EXAMPLE_TOKEN_0123456789";
+    const out = maskSecrets(`cloning https://${token}@git.example.com/acme/app.git`, []);
+    expect(out).not.toContain(token);
+    expect(out).toContain(`https://${SECRET_MASK}@git.example.com`);
+  });
+
+  it("leaves a short username without a password alone", () => {
+    const url = "ssh://git@git.example.com/acme/app.git";
+    expect(maskSecrets(url, [])).toBe(url);
+  });
+
+  it.each([
+    ["Password", "Server=db.example.com;Database=app;User Id=svc;Password=EXAMPLE_PW_1;", "Database=app"],
+    ["pwd", "server=db.example.com;uid=svc;pwd=EXAMPLE_PW_1;", "uid=svc"],
+    ["AccountKey", "DefaultEndpointsProtocol=https;AccountName=acme;AccountKey=EXAMPLE_PW_1==;EndpointSuffix=core.windows.net", "AccountName=acme"],
+    ["SharedAccessKey", "Endpoint=sb://acme.example.net/;SharedAccessKeyName=root;SharedAccessKey=EXAMPLE_PW_1=", "SharedAccessKeyName=root"],
+  ])("masks a connection-string %s and keeps the rest of the string", (_key, text, kept) => {
+    const out = maskSecrets(text, []);
+    expect(out).not.toContain("EXAMPLE_PW_1");
+    expect(out).toContain(SECRET_MASK);
+    expect(out).toContain(kept);
+  });
 });
 
 describe("collectKnownSecrets", () => {

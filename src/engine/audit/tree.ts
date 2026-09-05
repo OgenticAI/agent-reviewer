@@ -28,6 +28,10 @@ export const SKIP_DIRS: ReadonlySet<string> = new Set([
   "vendor",
   ".venv",
   "__pycache__",
+  // What Finder's "Compress" writes beside the folder: resource forks and
+  // metadata for every file, under the file's own name. Counted, a C# tree
+  // arrives with each `A.cs` twinned by a `._A.cs` that is not C#.
+  "__MACOSX",
 ]);
 
 /** Extension → language. Unrecognised extensions are counted, just not named. */
@@ -179,6 +183,11 @@ export function walkTree(root: string, options: WalkOptions = {}): TreeFile[] {
         continue;
       }
       if (!entry.isFile()) continue;
+      // AppleDouble sidecars: `._A.cs` is the Finder's metadata for `A.cs`,
+      // and `languageOf` would file it as C# on the extension. A Finder zip
+      // of a repo carries one per file, so the denominator would double and
+      // half of it would be unreadable binary.
+      if (entry.name.startsWith("._")) continue;
       if (artifactDir !== null && rel === artifactDir && AUDIT_ARTIFACTS.has(entry.name)) continue;
 
       const { size } = statSync(absolute);

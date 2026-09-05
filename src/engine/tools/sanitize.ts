@@ -67,6 +67,19 @@ const SECRET_VALUE_PATTERNS: RegExp[] = [
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
   /\blin_(?:api|oauth)_[A-Za-z0-9]{20,}/g, // Linear
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  // Credentials carried by a URL: `https://user:token@host/...`. A clone URL
+  // with a token in it is the ordinary way to hand a process read access, and
+  // git quotes it back in its own stderr. Only the userinfo is masked, so the
+  // host and path stay readable and the line still says which repo it was.
+  // A user:password pair is always masked; a bare user only when it is long
+  // enough to be a token rather than a name, so `ssh://git@host` is left alone.
+  /(?<=\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]*:[^\s/@]+(?=@)/gi,
+  /(?<=\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]{12,}(?=@)/gi,
+  // Connection-string passwords. Matched by the key, not the value, because
+  // the value has no shape of its own: `Password=hunter2;` in a logged
+  // connection string is a credential however short it is. The mask stops at
+  // the delimiter so the rest of the string (server, database) survives.
+  /(?<=\b(?:Password|Pwd|AccountKey|SharedAccessKey)=)[^;\s"'&]+/gi,
 ];
 
 /** Read the secret values we actually hold, longest first. */

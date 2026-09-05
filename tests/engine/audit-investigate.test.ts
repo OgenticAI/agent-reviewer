@@ -15,6 +15,7 @@ import {
   parseClaims,
   renderAnalyzerFacts,
   summariseInvestigation,
+  questionsWithoutFindings,
   type InvestigateModel,
   replyExcerpt,
   REPLY_EXCERPT_CHARS,
@@ -402,10 +403,118 @@ describe("running the stage", () => {
 
     expect(summariseInvestigation(results)).toEqual({
       questions: 2,
+      questionsWithFindings: 2,
       claims: 2,
       dropped: 0,
       filesOpened: 1,
     });
+  });
+});
+
+/* ── How many questions the claims actually came from (OGE-2711) ──────────── */
+
+describe("which questions produced a kept claim", () => {
+  const cited = JSON.stringify({
+    claims: [{ statement: "s", evidence: [{ path: "src/a.ts", line: 1 }] }],
+  });
+  const uncited = JSON.stringify({
+    claims: [{ statement: "probably fine", evidence: [] }],
+  });
+
+  // A dropped claim is a sentence the model wrote. A question with only those
+  // has produced nothing to verify, and counting it as answered would let ten
+  // claims on one question read as a report on ten.
+  it("excludes a question whose only claims were dropped", async () => {
+    const results = await investigate({
+      questions: [question({ id: "cited" }), question({ id: "uncited" })],
+      model: {
+        investigate: async ({ question: q }) => ({ text: q.id === "cited" ? cited : uncited }),
+      },
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+
+    const summary = summariseInvestigation(results);
+    expect(summary.questions).toBe(2);
+    expect(summary.questionsWithFindings).toBe(1);
+    expect(summary.dropped).toBe(1);
+    expect(questionsWithoutFindings(results)).toEqual(["uncited"]);
+  });
+
+  it("excludes a question whose run failed", async () => {
+    const results = await investigate({
+      questions: [question({ id: "cited" }), question({ id: "failed" })],
+      model: {
+        investigate: async ({ question: q }) => {
+          if (q.id === "failed") throw new Error("model unavailable");
+          return { text: cited };
+        },
+      },
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+
+    expect(summariseInvestigation(results).questionsWithFindings).toBe(1);
+    expect(questionsWithoutFindings(results)).toEqual(["failed"]);
+  });
+
+  // Several kept claims on one question are still one question.
+  it("counts a question once however many claims it kept", async () => {
+    const two = JSON.stringify({
+      claims: [
+        { statement: "a", evidence: [{ path: "src/a.ts" }] },
+        { statement: "b", evidence: [{ path: "src/b.ts" }] },
+      ],
+    });
+    const results = await investigate({
+      questions: [question({ id: "busy" })],
+      model: stubModel(two),
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+
+    const summary = summariseInvestigation(results);
+    expect(summary.claims).toBe(2);
+    expect(summary.questionsWithFindings).toBe(1);
+    expect(questionsWithoutFindings(results)).toEqual([]);
+  });
+
+  // The parser keeps any claim with a path. A question that ran out of budget
+  // and answered from memory keeps every recalled citation here and loses every
+  // one at verify. Asked again with what verify let through, the same question
+  // is named as having produced nothing, which is what the release gate needs
+  // to hear about it.
+  it("names a question whose every kept claim later fell, when asked with the survivors", async () => {
+    const results = await investigate({
+      questions: [question({ id: "held" }), question({ id: "recalled" })],
+      model: stubModel(cited),
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+    expect(questionsWithoutFindings(results)).toEqual([]);
+
+    const survivors = results.flatMap((r) => r.claims).filter((c) => c.questionId === "held");
+    expect(questionsWithoutFindings(results, survivors)).toEqual(["recalled"]);
+  });
+
+  it("names every question when nothing survived", async () => {
+    const results = await investigate({
+      questions: [question({ id: "a" }), question({ id: "b" })],
+      model: stubModel(cited),
+      repoMapFor: () => "map",
+      analyzerJobs: [],
+      subjectRev: REV,
+      log: () => {},
+    });
+    expect(questionsWithoutFindings(results, [])).toEqual(["a", "b"]);
   });
 });
 

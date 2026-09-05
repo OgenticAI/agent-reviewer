@@ -4,6 +4,7 @@ import {
   AuditTelemetry,
   AUDIT_STAGES,
   MAX_LOG_CHARS,
+  idListDetail,
   redactLine,
   RunCancelled,
   type AuditEvent,
@@ -109,6 +110,66 @@ describe("the stage model", () => {
     expect(t.events()[0]).toMatchObject({
       status: "finished",
       counts: { files: 4187 },
+    });
+  });
+});
+
+/* ── A finished stage can name things, not only count them (OGE-2711) ────── */
+
+describe("a finished stage's detail", () => {
+  it("is carried beside the counts, redacted like any other line", () => {
+    const t = telemetry();
+    t.stageFinished("investigate", { questions: 2 }, `{"note":"${SECRET}"}`);
+    const event = t.events()[0] as { counts?: unknown; detail?: string };
+    expect(event.counts).toEqual({ questions: 2 });
+    expect(event.detail).not.toContain(SECRET);
+  });
+
+  it("is absent, not empty, when the stage has nothing to say", () => {
+    const t = telemetry();
+    t.stageFinished("verify", { verified: 3 });
+    expect(t.events()[0]).not.toHaveProperty("detail");
+  });
+});
+
+describe("an id list as a stage detail", () => {
+  // The dashboard reads the detail back as JSON. The cap cuts text, not
+  // objects, so a list that did not fit would come back as prose and the
+  // dashboard would read nothing from it.
+  it("is JSON the other side can parse, naming every id when they fit", () => {
+    const detail = idListDetail("questionsWithoutFindings", ["config-precedence", "auth-fallback"]);
+    expect(JSON.parse(detail)).toEqual({
+      questionsWithoutFindings: ["config-precedence", "auth-fallback"],
+    });
+  });
+
+  it("stays under the cap by leaving whole ids out, and says how many", () => {
+    const ids = Array.from({ length: 200 }, (_, i) => `question-with-a-long-name-${i}`);
+    const detail = idListDetail("questionsWithoutFindings", ids);
+    expect(detail.length).toBeLessThanOrEqual(MAX_LOG_CHARS);
+
+    const parsed = JSON.parse(detail) as {
+      questionsWithoutFindings: string[];
+      questionsWithoutFindingsOmitted: number;
+    };
+    // The kept ids are the first ones, whole, and the omission count closes
+    // the arithmetic: what is named plus what is not is what there was.
+    expect(parsed.questionsWithoutFindings).toEqual(ids.slice(0, parsed.questionsWithoutFindings.length));
+    expect(parsed.questionsWithoutFindings.length + parsed.questionsWithoutFindingsOmitted).toBe(ids.length);
+    expect(parsed.questionsWithoutFindings.length).toBeGreaterThan(0);
+  });
+
+  it("survives stageFinished without being truncated", () => {
+    const ids = Array.from({ length: 200 }, (_, i) => `q-${i}`);
+    const t = telemetry();
+    t.stageFinished("investigate", { questions: 200 }, idListDetail("questionsWithoutFindings", ids));
+    const { detail } = t.events()[0] as { detail: string };
+    expect(() => JSON.parse(detail)).not.toThrow();
+  });
+
+  it("is an empty list, still JSON, when every question produced something", () => {
+    expect(JSON.parse(idListDetail("questionsWithoutFindings", []))).toEqual({
+      questionsWithoutFindings: [],
     });
   });
 });

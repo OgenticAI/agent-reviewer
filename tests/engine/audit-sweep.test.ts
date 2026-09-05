@@ -2,7 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sweepTree, signalsIn, isTestPath, summariseSignals, MAX_SWEEP_BYTES } from "../../src/engine/audit/sweep.js";
+import {
+  sweepTree,
+  signalsIn,
+  isTestPath,
+  summariseSignals,
+  MAX_SWEEP_BYTES,
+  SWEEP_RULES,
+  type SignalKind,
+} from "../../src/engine/audit/sweep.js";
 import { FileAccessLog } from "../../src/engine/audit/inventory.js";
 
 let scratch: string;
@@ -14,6 +22,8 @@ function write(rel: string, text: string | Buffer): void {
   mkdirSync(join(full, ".."), { recursive: true });
   writeFileSync(full, text);
 }
+
+const kinds = (path: string, source: string): SignalKind[] => signalsIn(path, source).map((s) => s.kind);
 
 describe("visiting every file", () => {
   // The whole point. Coverage stops being a claim the report makes and becomes
@@ -90,30 +100,157 @@ describe("visiting every file", () => {
   });
 });
 
+/**
+ * One row per rule: the shape it exists to catch, and the nearest idiom that
+ * is safe and must NOT be caught. The negative is the calibration; a rule
+ * without one has only been shown to fire, never shown to stop.
+ */
+interface Fixture {
+  kind: SignalKind;
+  path: string;
+  fires: string;
+  quiet: string;
+}
+
+const FIXTURES: Fixture[] = [
+  // unvalidated-token
+  { kind: "unvalidated-token", path: "Auth.cs", fires: "var token = handler.ReadJwtToken(rawToken);", quiet: "var principal = handler.ValidateToken(rawToken, parameters, out var validated);" },
+  { kind: "unvalidated-token", path: "Auth.cs", fires: "var jwt = handler.ReadJsonWebToken(rawToken);", quiet: "var result = await handler.ValidateTokenAsync(rawToken, parameters);" },
+  { kind: "unvalidated-token", path: "auth.ts", fires: "const claims = jwt.decode(rawToken);", quiet: "const claims = jwt.verify(rawToken, secret);" },
+  // anonymous-endpoint
+  { kind: "anonymous-endpoint", path: "OrderController.cs", fires: "[AllowAnonymous]", quiet: "[Authorize]" },
+  { kind: "anonymous-endpoint", path: "Program.cs", fires: 'app.MapGet("/orders", GetOrders).AllowAnonymous();', quiet: 'app.MapGet("/orders", GetOrders).RequireAuthorization();' },
+  // authorization-check
+  { kind: "authorization-check", path: "OrderController.cs", fires: '[Authorize(Roles = "Admin")]', quiet: "[AllowAnonymous]" },
+  { kind: "authorization-check", path: "Program.cs", fires: 'app.MapPost("/orders", CreateOrder).RequireAuthorization();', quiet: 'app.MapPost("/orders", CreateOrder).AllowAnonymous();' },
+  // identity-from-request
+  { kind: "identity-from-request", path: "TenantMiddleware.cs", fires: 'var tenant = Request.Headers["X-Tenant-Id"];', quiet: 'var tenant = User.FindFirst("tenant")?.Value;' },
+  { kind: "identity-from-request", path: "tenant.ts", fires: 'const tenant = req.headers["x-tenant-id"];', quiet: "const tenant = req.user.tenantId;" },
+  // http-endpoint
+  { kind: "http-endpoint", path: "OrderController.cs", fires: '[HttpGet("{id}")]', quiet: "[ProducesResponseType(200)]" },
+  { kind: "http-endpoint", path: "OrderController.cs", fires: '[Route("api/orders")]', quiet: "[ApiController]" },
+  { kind: "http-endpoint", path: "Program.cs", fires: 'app.MapGet("/orders/{id}", GetOrderById);', quiet: 'app.MapGroup("/orders");' },
+  { kind: "http-endpoint", path: "app/orders/route.ts", fires: "export async function GET(request: Request) {", quiet: "export async function loadOrders() {" },
+  { kind: "http-endpoint", path: "orders.ts", fires: 'router.get("/orders", listOrders);', quiet: 'router.use("/orders", ordersRouter);' },
+  // raw-sql: statement shape, concatenated with input, not in a log call
+  { kind: "raw-sql", path: "OrderRepository.cs", fires: 'var sql = "SELECT * FROM Orders WHERE Id = " + orderId;', quiet: 'var sql = "SELECT * FROM Orders WHERE Id = @id";' },
+  { kind: "raw-sql", path: "OrderRepository.cs", fires: 'var rows = db.Orders.FromSqlRaw($"SELECT * FROM Orders WHERE Id = {orderId}");', quiet: 'var rows = db.Orders.FromSqlInterpolated($"SELECT * FROM Orders WHERE Id = {orderId}");' },
+  { kind: "raw-sql", path: "OrderRepository.cs", fires: 'db.Database.ExecuteSqlRaw($"EXEC ArchiveOrder {orderId}");', quiet: 'db.Database.ExecuteSqlRaw("EXEC ArchiveOrder {0}", orderId);' },
+  { kind: "raw-sql", path: "orders.py", fires: 'cursor.execute("SELECT * FROM orders WHERE id = %s" % order_id)', quiet: 'cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))' },
+  // weak-crypto
+  { kind: "weak-crypto", path: "Digest.cs", fires: "using var md5 = MD5.Create();", quiet: "using var sha = SHA256.Create();" },
+  { kind: "weak-crypto", path: "Digest.cs", fires: "using var sha = new SHA1Managed();", quiet: "using var sha = new SHA256Managed();" },
+  { kind: "weak-crypto", path: "Digest.cs", fires: "using var md5 = new MD5CryptoServiceProvider();", quiet: "using var aes = new AesCryptoServiceProvider();" },
+  { kind: "weak-crypto", path: "digest.ts", fires: 'const digest = createHash("md5").update(body).digest("hex");', quiet: 'const digest = createHash("sha256").update(body).digest("hex");' },
+  // disabled-cert-validation
+  { kind: "disabled-cert-validation", path: "Client.cs", fires: "ServicePointManager.ServerCertificateValidationCallback += (s, c, ch, e) => true;", quiet: "handler.SslProtocols = SslProtocols.Tls12;" },
+  { kind: "disabled-cert-validation", path: "client.ts", fires: "const agent = new https.Agent({ rejectUnauthorized: false });", quiet: "const agent = new https.Agent({ keepAlive: true });" },
+  // permissive-cors
+  { kind: "permissive-cors", path: "Program.cs", fires: "policy.AllowAnyOrigin().AllowAnyHeader();", quiet: 'policy.WithOrigins("https://app.example.com").AllowAnyHeader();' },
+  // config-precedence
+  { kind: "config-precedence", path: "Program.cs", fires: 'builder.Configuration.AddJsonFile("appsettings.Test.json", optional: true);', quiet: 'builder.Configuration.AddJsonFile($"appsettings.{env}.json", optional: true);' },
+  { kind: "config-precedence", path: "Dockerfile", fires: "COPY appsettings.Test.json appsettings.json", quiet: "COPY appsettings.json appsettings.json" },
+  // insecure-direct-object-reference
+  { kind: "insecure-direct-object-reference", path: "OrderService.cs", fires: "public Task<Order> GetOrderById(string orderId) => _store.GetItemByIdAsync<Order>(orderId);", quiet: "public Task<Order> GetByTenantId(string tenantId) => _store.Query<Order>().Where(o => o.TenantId == tenantId).FirstAsync();" },
+  // csrf-token-validated
+  { kind: "csrf-token-validated", path: "OrderController.cs", fires: "[ValidateAntiForgeryToken]", quiet: "[IgnoreAntiforgeryToken]" },
+  // debug-enabled
+  { kind: "debug-enabled", path: "Web.config", fires: '<compilation debug="true" targetFramework="4.8" />', quiet: '<compilation debug="false" targetFramework="4.8" />' },
+  { kind: "debug-enabled", path: "Program.cs", fires: "app.UseDeveloperExceptionPage();", quiet: "if (app.Environment.IsDevelopment()) app.UseDeveloperExceptionPage();" },
+  // insecure-cookie
+  { kind: "insecure-cookie", path: "Program.cs", fires: "options.Cookie.HttpOnly = false;", quiet: "options.Cookie.HttpOnly = true;" },
+  // weak-password-hash
+  { kind: "weak-password-hash", path: "PasswordHasher.cs", fires: "byte[] hash = SHA256.Create().ComputeHash(passwordBytes);", quiet: "byte[] hash = KeyDerivation.Pbkdf2(password, salt, KeyDerivationPrf.HMACSHA256, 100_000, 32);" },
+  // sensitive-field
+  { kind: "sensitive-field", path: "Patient.cs", fires: "public DateTime DateOfBirth { get; set; }", quiet: "public DateTime CreatedAt { get; set; }" },
+  // phi-in-log
+  { kind: "phi-in-log", path: "PatientService.cs", fires: '_logger.LogInformation("Loaded patient {Ssn}", patient.Ssn);', quiet: '_logger.LogInformation("SSN lookup for patient {Id}", patient.Id);' },
+  // hardcoded-secret
+  { kind: "hardcoded-secret", path: "appsettings.json", fires: '"ConnectionString": "Server=db;Database=orders;User Id=app;Password=Tr0ub4dor&3;"', quiet: '"ConnectionString": "Server=db;Database=orders;User Id=app;Password=${DB_PASSWORD};"' },
+  // insecure-deserialization
+  { kind: "insecure-deserialization", path: "Cache.cs", fires: "var formatter = new BinaryFormatter();", quiet: "var order = JsonSerializer.Deserialize<Order>(payload);" },
+  { kind: "insecure-deserialization", path: "orders.py", fires: "order = pickle.loads(payload)", quiet: "order = json.loads(payload)" },
+  // xxe
+  { kind: "xxe", path: "Import.cs", fires: "settings.DtdProcessing = DtdProcessing.Parse;", quiet: "settings.DtdProcessing = DtdProcessing.Prohibit;" },
+  // path-traversal
+  { kind: "path-traversal", path: "Files.cs", fires: "var full = Path.Combine(_root, fileName);", quiet: "var full = Path.Combine(_root, Path.GetFileName(fileName));" },
+  // ssrf
+  { kind: "ssrf", path: "Webhooks.cs", fires: 'var response = await client.GetAsync($"{callbackUrl}/notify");', quiet: 'var response = await client.GetAsync($"{_baseUrl}/orders/{orderId}");' },
+  // xss-sink
+  { kind: "xss-sink", path: "Order.tsx", fires: "<div dangerouslySetInnerHTML={{ __html: note }} />", quiet: "<div>{note}</div>" },
+  // token-in-web-storage
+  { kind: "token-in-web-storage", path: "session.ts", fires: 'localStorage.setItem("access_token", rawToken);', quiet: 'localStorage.setItem("theme", "dark");' },
+  // rate-limit-absent
+  { kind: "rate-limit-absent", path: "AuthController.cs", fires: '[HttpPost("login")]', quiet: '[EnableRateLimiting("auth")]\n[HttpPost("login")]' },
+];
+
+/**
+ * The standard each kind cites. Kept as a table here, independent of the
+ * rules, so a rule that drifts to the wrong category fails a test rather than
+ * reaching a report: the first cut cited Security Misconfiguration for SQL
+ * injection, which told the reader the wrong thing to fix.
+ */
+const STANDARDS: Record<SignalKind, { cwe: string; owasp?: string }> = {
+  "unvalidated-token": { cwe: "CWE-347", owasp: "API2:2023 Broken Authentication" },
+  "anonymous-endpoint": { cwe: "CWE-306", owasp: "API2:2023 Broken Authentication" },
+  "authorization-check": { cwe: "CWE-862", owasp: "API5:2023 Broken Function Level Authorization" },
+  "identity-from-request": { cwe: "CWE-639", owasp: "API1:2023 Broken Object Level Authorization" },
+  "http-endpoint": { cwe: "CWE-284" },
+  "raw-sql": { cwe: "CWE-89" },
+  "weak-crypto": { cwe: "CWE-327" },
+  "disabled-cert-validation": { cwe: "CWE-295", owasp: "API8:2023 Security Misconfiguration" },
+  "permissive-cors": { cwe: "CWE-942", owasp: "API8:2023 Security Misconfiguration" },
+  "config-precedence": { cwe: "CWE-15", owasp: "API8:2023 Security Misconfiguration" },
+  "insecure-direct-object-reference": { cwe: "CWE-639", owasp: "API1:2023 Broken Object Level Authorization" },
+  "csrf-token-validated": { cwe: "CWE-352" },
+  "debug-enabled": { cwe: "CWE-489", owasp: "API8:2023 Security Misconfiguration" },
+  "insecure-cookie": { cwe: "CWE-1004", owasp: "API8:2023 Security Misconfiguration" },
+  "weak-password-hash": { cwe: "CWE-916" },
+  "sensitive-field": { cwe: "CWE-311" },
+  "phi-in-log": { cwe: "CWE-532" },
+  "hardcoded-secret": { cwe: "CWE-798" },
+  "insecure-deserialization": { cwe: "CWE-502" },
+  xxe: { cwe: "CWE-611" },
+  "path-traversal": { cwe: "CWE-22" },
+  ssrf: { cwe: "CWE-918", owasp: "API7:2023 Server Side Request Forgery" },
+  "xss-sink": { cwe: "CWE-79" },
+  "token-in-web-storage": { cwe: "CWE-922" },
+  "rate-limit-absent": { cwe: "CWE-307", owasp: "API2:2023 Broken Authentication" },
+};
+
 describe("what the sweep can establish without a model", () => {
-  it("finds a token read without validation", () => {
-    const found = signalsIn("Auth.cs", "var token = handler.ReadJwtToken(rawToken);");
-    expect(found[0]?.kind).toBe("unvalidated-token");
-    expect(found[0]?.cwe).toBe("CWE-347");
-    expect(found[0]?.owasp).toMatch(/API2/);
+  it.each(FIXTURES)("finds $kind in: $fires", ({ kind, path, fires }) => {
+    expect(kinds(path, fires)).toContain(kind);
   });
 
-  it("finds an anonymous endpoint", () => {
-    expect(signalsIn("C.cs", "[AllowAnonymous]")[0]?.kind).toBe("anonymous-endpoint");
+  it.each(FIXTURES)("leaves the nearest safe idiom alone for $kind: $quiet", ({ kind, path, quiet }) => {
+    expect(kinds(path, quiet)).not.toContain(kind);
   });
 
-  it("finds a password hashed with a general-purpose digest", () => {
-    const found = signalsIn("Crypto.cs", "byte[] hash = SHA256.Create().ComputeHash(passwordBytes);");
-    expect(found[0]?.kind).toBe("weak-password-hash");
-    expect(found[0]?.cwe).toBe("CWE-916");
+  // A rule with a positive fixture and no negative has been shown to fire and
+  // never shown to stop. The rule table is exported so this can be checked
+  // against what actually ships rather than against a list kept by hand.
+  it("has at least one fixture pair for every rule of every kind", () => {
+    for (const kind of new Set(SWEEP_RULES.map((r) => r.kind))) {
+      const rules = SWEEP_RULES.filter((r) => r.kind === kind).length;
+      const fixtures = FIXTURES.filter((f) => f.kind === kind).length;
+      expect(fixtures, `${kind}: ${rules} rule(s), ${fixtures} fixture(s)`).toBeGreaterThanOrEqual(rules);
+    }
   });
 
-  it.each([
-    ["Program.cs", "builder.AllowAnyOrigin()", "permissive-cors"],
-    ["web.config", '<compilation debug="true" />', "debug-enabled"],
-    ["Startup.cs", 'config.AddJsonFile("appsettings.Test.json")', "config-precedence"],
-  ])("finds %s as %s", (path, line, kind) => {
-    expect(signalsIn(path, line).map((s) => s.kind)).toContain(kind);
+  // Injection is not misconfiguration; a missing authentication is not a
+  // function-level authorization failure. Every rule of a kind cites the same
+  // pair, and the pair is the one in the table.
+  it("cites the standard in the table, on every rule of the kind", () => {
+    for (const rule of SWEEP_RULES) {
+      const expected = STANDARDS[rule.kind];
+      expect({ kind: rule.kind, cwe: rule.cwe, owasp: rule.owasp }).toEqual({ kind: rule.kind, ...expected });
+    }
+  });
+
+  it("covers every kind in the standards table with a rule", () => {
+    const ruled = new Set(SWEEP_RULES.map((r) => r.kind));
+    for (const kind of Object.keys(STANDARDS) as SignalKind[]) expect(ruled.has(kind), kind).toBe(true);
   });
 
   // Every signal cites a standard, so a finding rests on something published
@@ -124,33 +261,223 @@ describe("what the sweep can establish without a model", () => {
     expect(found.every((s) => /^CWE-\d+$/.test(s.cwe))).toBe(true);
   });
 
+  it("emits one signal per kind per line, however many rules of that kind match", () => {
+    const found = signalsIn("Program.cs", 'config.AddJsonFile("appsettings.Test.json")');
+    expect(found.filter((s) => s.kind === "config-precedence")).toHaveLength(1);
+  });
+
+  it("puts the raw line in the excerpt, not the stripped one", () => {
+    const [found] = signalsIn("Auth.cs", 'var t = handler.ReadJwtToken(raw); // "temporary"');
+    expect(found?.excerpt).toBe('var t = handler.ReadJwtToken(raw); // "temporary"');
+  });
+});
+
+describe("what a rule is allowed to read", () => {
   // A comment describing code is not code. A rule that fires on prose produces
   // a finding nobody can act on.
-  it("does not fire on a comment", () => {
+  it("does not fire on a line comment", () => {
     expect(signalsIn("C.cs", "// [AllowAnonymous] was removed last year")).toEqual([]);
   });
 
+  it("does not fire on a trailing comment", () => {
+    expect(kinds("Program.cs", 'app.UseHsts(); // was app.UseDeveloperExceptionPage()')).not.toContain("debug-enabled");
+  });
+
+  it("does not fire inside a block comment that opened on an earlier line", () => {
+    const source = ["/*", "  var t = handler.ReadJwtToken(raw);", "  builder.AllowAnyOrigin();", "*/", "var ok = 1;"].join("\n");
+    expect(signalsIn("C.cs", source)).toEqual([]);
+  });
+
+  it("resumes matching after the block comment closes", () => {
+    const source = ["/* legacy */ var t = handler.ReadJwtToken(raw);"].join("\n");
+    expect(kinds("C.cs", source)).toContain("unvalidated-token");
+  });
+
+  it("does not fire on an XML comment in a config file", () => {
+    expect(signalsIn("Web.config", '<!-- <compilation debug="true" /> -->')).toEqual([]);
+  });
+
+  // A SQL keyword in a log message is a message, not a query. The first cut
+  // raised raw-sql on `LogInformation("Update user " + id)`.
+  it.each([
+    '_logger.LogInformation("Update user " + userId);',
+    'logger.info("select * from orders where id = " + orderId);',
+    'throw new InvalidOperationException("Update failed for " + orderId);',
+    'throw new ArgumentException("Select an order from the list: " + name);',
+    'var label = "SELECT * FROM Orders" + " WHERE Id = @id";',
+  ])("does not raise raw-sql on prose or on two literals joined: %s", (line) => {
+    expect(kinds("OrderService.cs", line)).not.toContain("raw-sql");
+  });
+
+  it("does not raise weak-crypto on a string that names the algorithm", () => {
+    expect(kinds("Digest.cs", '_logger.LogWarning("MD5 checksum mismatch for {File}", name);')).not.toContain("weak-crypto");
+  });
+
+  // A README that says "we still hash with MD5" is prose about the code, and a
+  // candidate raised on it cannot be fixed at the cited line.
+  it("reads no rule against markdown", () => {
+    expect(signalsIn("README.md", "We hash with MD5 and read the SSN off the request header.")).toEqual([]);
+  });
+
+  // `$"Patient {patient.Ssn}"` passes the field even though it sits between
+  // quotes; a template's `{Ssn}` is a name and passes nothing.
+  it("keeps interpolation holes as code and template holes as text", () => {
+    expect(kinds("Patient.cs", 'Console.WriteLine($"Patient {patient.Ssn}");')).toContain("phi-in-log");
+    expect(kinds("Patient.cs", 'Console.WriteLine("Patient {Ssn}");')).not.toContain("phi-in-log");
+    expect(kinds("patient.ts", "console.log(`Patient ${patient.ssn}`);")).toContain("phi-in-log");
+  });
+
+  // The header name is the evidence, and it is a literal, so the rule that
+  // needs it reads the line with literals intact.
+  it("still reads a literal when the evidence lives inside one", () => {
+    expect(kinds("Tenant.cs", 'var t = Request.Headers["X-Tenant-Id"];')).toContain("identity-from-request");
+  });
+
+  it("treats # as a comment in languages where it is one, and not in C#", () => {
+    expect(signalsIn("deploy.sh", "# COPY appsettings.Test.json to the image")).toEqual([]);
+    expect(kinds("Program.cs", "#if DEBUG\napp.UseDeveloperExceptionPage();")).toContain("debug-enabled");
+  });
+});
+
+describe("guards the rule must respect", () => {
+  // The template every new project ships with.
+  it("ignores a developer exception page guarded by IsDevelopment on the lines above", () => {
+    const source = ["if (app.Environment.IsDevelopment())", "{", "    app.UseDeveloperExceptionPage();", "}"].join("\n");
+    expect(kinds("Program.cs", source)).not.toContain("debug-enabled");
+  });
+
+  it("still raises the developer exception page when the guard is out of reach", () => {
+    const source = ["if (app.Environment.IsDevelopment())", "{", "    app.UseSwagger();", "    app.UseSwaggerUI();", "}", "app.UseDeveloperExceptionPage();"].join("\n");
+    expect(kinds("Program.cs", source)).toContain("debug-enabled");
+  });
+
+  it("ignores a .csproj item that only copies the test settings file", () => {
+    expect(signalsIn("Orders.csproj", '<Content Include="appsettings.Test.json" CopyToOutputDirectory="Always" />')).toEqual([]);
+  });
+
+  it("counts a credential route only when no throttle sits beside it", () => {
+    const throttled = ['[EnableRateLimiting("auth")]', "[HttpPost(\"login\")]"].join("\n");
+    const bare = ["[HttpPost(\"login\")]"].join("\n");
+    expect(kinds("AuthController.cs", throttled)).not.toContain("rate-limit-absent");
+    expect(kinds("AuthController.cs", bare)).toContain("rate-limit-absent");
+  });
+
+  it("sees a throttle on the minimal-API line after the route", () => {
+    const source = ['app.MapPost("/login", Login)', '    .RequireRateLimiting("auth");'].join("\n");
+    expect(kinds("Program.cs", source)).not.toContain("rate-limit-absent");
+  });
+});
+
+describe("the idioms the first cut missed", () => {
+  it.each([
+    ["dateOfBirth", true],
+    ["date_of_birth", true],
+    ["DOB", true],
+    ["mrn", true],
+    ["Npi", true],
+    ["PatientId", false],
+    ["dobbin", false],
+  ])("recognises %s as a sensitive field: %s", (name, sensitive) => {
+    expect(kinds("patient.ts", `const value = record.${name};`).includes("sensitive-field")).toBe(sensitive);
+  });
+
+  it("raises phi-in-log on the value, not on a message that names the field", () => {
+    expect(kinds("Patient.cs", '_logger.LogDebug("dob {Dob}", patient.DateOfBirth);')).toContain("phi-in-log");
+    expect(kinds("Patient.cs", '_logger.LogDebug("date of birth missing for {Id}", id);')).not.toContain("phi-in-log");
+  });
+
+  it.each([
+    'localStorage.setItem("jwt", rawToken);',
+    "localStorage.setItem(AUTH_TOKEN_KEY, rawToken);",
+    "localStorage.authToken = rawToken;",
+    'window.sessionStorage.setItem("token", rawToken);',
+  ])("raises token-in-web-storage on %s", (line) => {
+    expect(kinds("session.ts", line)).toContain("token-in-web-storage");
+  });
+
+  it("ignores a placeholder or a reference where a secret would be", () => {
+    for (const line of [
+      '"ClientSecret": "<set in key vault>"',
+      '"ClientSecret": "@Microsoft.KeyVault(SecretUri=https://kv.example.com/secrets/client)"',
+      '"ApiKey": ""',
+      '"PasswordResetUrl": "https://app.example.com/reset"',
+    ]) {
+      expect(kinds("appsettings.json", line), line).not.toContain("hardcoded-secret");
+    }
+    expect(kinds(".env", "DB_PASSWORD=Tr0ub4dor&3")).toContain("hardcoded-secret");
+    expect(kinds(".env.example", "DB_PASSWORD=Tr0ub4dor&3")).not.toContain("hardcoded-secret");
+  });
+
+  it("raises hardcoded-secret only in configuration, not in a source file naming the same key", () => {
+    expect(kinds("Db.cs", 'var cs = "Server=db;Password=Tr0ub4dor&3;";')).not.toContain("hardcoded-secret");
+  });
+
+  it("raises ssrf on a caller-supplied host, whichever way the URL is built", () => {
+    expect(kinds("Hooks.cs", 'await client.PostAsync(callbackUrl + "/notify", content);')).toContain("ssrf");
+    expect(kinds("Hooks.cs", "await client.GetAsync(new Uri(request.CallbackUrl));")).toContain("ssrf");
+    expect(kinds("hooks.ts", "const r = await fetch(`${target}/health`);")).toContain("ssrf");
+    expect(kinds("hooks.ts", "const r = await fetch(`${process.env.API_BASE}/health`);")).not.toContain("ssrf");
+    expect(kinds("hooks.ts", 'const r = await fetch("/api/orders/" + orderId);')).not.toContain("ssrf");
+  });
+
+  it("raises path-traversal on a request-bound value and not on a fixed path", () => {
+    expect(kinds("files.ts", "const data = fs.readFileSync(path.join(root, req.params.name));")).toContain("path-traversal");
+    expect(kinds("Files.cs", 'var html = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "templates", "order.html"));')).not.toContain("path-traversal");
+  });
+
+  it("raises insecure-deserialization on TypeNameHandling that trusts the payload", () => {
+    expect(kinds("Json.cs", "settings.TypeNameHandling = TypeNameHandling.All;")).toContain("insecure-deserialization");
+    expect(kinds("Json.cs", "settings.TypeNameHandling = TypeNameHandling.None;")).not.toContain("insecure-deserialization");
+  });
+
+  it("raises xss-sink on a value reaching innerHTML, and not on clearing it", () => {
+    expect(kinds("order.ts", "el.innerHTML = note;")).toContain("xss-sink");
+    expect(kinds("order.ts", 'el.innerHTML = "";')).not.toContain("xss-sink");
+  });
+
+  it("raises xxe on a resolver that will fetch what the DTD names", () => {
+    expect(kinds("Import.cs", "doc.XmlResolver = new XmlUrlResolver();")).toContain("xxe");
+    expect(kinds("Import.cs", "doc.XmlResolver = null;")).not.toContain("xxe");
+  });
+});
+
+describe("what counts as test code", () => {
   // A fixture is not production risk surface. These files are still visited and
   // still counted as covered; what they do not do is generate findings.
-  it.each(["tests/Foo.cs", "src/FooTests.cs", "src/__tests__/a.ts", "src/a.test.ts"])(
+  it.each(["tests/Foo.cs", "src/FooTests.cs", "src/__tests__/a.ts", "src/a.test.ts", "Orders.Tests/OrderServiceTests.cs", "spec/orders_spec.rb", "e2e/x.ts"])(
     "produces no signals from test code: %s",
     (path) => {
       expect(signalsIn(path, "[AllowAnonymous]\nvar t = handler.ReadJwtToken(x);")).toEqual([]);
+      expect(isTestPath(path)).toBe(true);
     },
   );
 
-  it("still counts test files as visited", () => {
-    write("tests/FooTests.cs", "[AllowAnonymous]");
-    const result = sweepTree(scratch, new FileAccessLog());
-    expect(result.read).toBe(1);
-    expect(result.signals).toEqual([]);
+  // The first cut muted these. `Contest.cs` matched `/Tests?\.cs$/i`, and a
+  // production `Mocks/` directory of API doubles matched a segment list.
+  it.each([
+    "src/Services/ContestService.cs",
+    "src/Models/Contest.cs",
+    "src/Models/Contests.cs",
+    "src/Models/LabTest.cs",
+    "src/Mocks/PaymentGatewayMock.cs",
+    "src/Fixtures/FixtureLoader.cs",
+    "src/Testing/TestHarness.cs",
+    "src/latest.ts",
+  ])("does not mistake production code for test code: %s", (path) => {
+    expect(isTestPath(path)).toBe(false);
+    const defect = path.endsWith(".ts") ? "const claims = jwt.decode(rawToken);" : "var t = handler.ReadJwtToken(rawToken);";
+    expect(kinds(path, defect)).toContain("unvalidated-token");
   });
 
-  it.each(["tests/a.cs", "src/FooTests.cs", "e2e/x.ts"])("recognises %s as test code", (p) => {
-    expect(isTestPath(p)).toBe(true);
-  });
-  it("does not mistake production code for test code", () => {
-    expect(isTestPath("src/Services/ContestService.cs")).toBe(false);
+  it("still counts test files as visited, and says why they produced nothing", () => {
+    write("tests/FooTests.cs", "[AllowAnonymous]");
+    write("src/Foo.cs", "class Foo {}");
+    const result = sweepTree(scratch, new FileAccessLog());
+    expect(result.read).toBe(2);
+    expect(result.signals).toEqual([]);
+    const byPath = new Map(result.dispositions.map((d) => [d.path, d]));
+    expect(byPath.get("tests/FooTests.cs")).toMatchObject({ outcome: "read", signals: 0, suppressed: "test-path" });
+    expect(byPath.get("src/Foo.cs")?.suppressed).toBeUndefined();
   });
 });
 
@@ -163,6 +490,18 @@ describe("separating surface from defects", () => {
     const defect = signalsIn("C.cs", "var t = handler.ReadJwtToken(x);");
     expect(surface[0]?.signalClass).toBe("surface");
     expect(defect[0]?.signalClass).toBe("defect");
+  });
+
+  // The kind is named for what the line shows. A count of anti-forgery
+  // attributes under a heading that says "missing" reads as its opposite.
+  it("names the anti-forgery count for what it observes", () => {
+    const [found] = signalsIn("C.cs", "[ValidateAntiForgeryToken]");
+    expect(found?.kind).toBe("csrf-token-validated");
+    expect(found?.signalClass).toBe("surface");
+  });
+
+  it("keeps the credential-route count as surface, because the throttle may live in middleware", () => {
+    expect(signalsIn("AuthController.cs", '[HttpPost("login")]').find((s) => s.kind === "rate-limit-absent")?.signalClass).toBe("surface");
   });
 
   it("puts defects before surface in the summary, however common the surface", () => {

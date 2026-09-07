@@ -48,12 +48,40 @@ describe("the toolset", () => {
 });
 
 describe("what a search records", () => {
-  it("records each file it returned a line from as read, and only those", async () => {
+  // A search shows one line of each file it hits. Counting those as read let a
+  // single broad search move coverage from a few per cent to nearly the whole
+  // tree without the model opening anything, which is the overstatement the
+  // ledger exists to prevent. They are kept as `matched`, because the model did
+  // see those lines and may cite them.
+  it("records each file it returned a line from as matched, never as read", async () => {
     const result = await byName["search_repo"]!.execute({ pattern: "GetOrderById" });
 
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain("src/orders/OrderService.cs:2");
-    expect([...log.opened()]).toEqual(["src/orders/OrderService.cs"]);
+    expect([...log.matched()]).toEqual(["src/orders/OrderService.cs"]);
+    expect([...log.opened()]).toEqual([]);
+  });
+
+  // The property that keeps coverage honest as the search tool gets used: a
+  // search over a whole tree must not move the read count at all.
+  it("leaves the read count untouched however many files it hits", async () => {
+    const before = log.opened().size;
+    await byName["search_repo"]!.execute({ pattern: "Order" });
+
+    expect(log.matched().size).toBeGreaterThan(0);
+    expect(log.opened().size).toBe(before);
+  });
+
+  // Once the model actually opens a matched file it is a read, and it stops
+  // being counted twice.
+  it("moves a file from matched to read when the model opens it", async () => {
+    await byName["search_repo"]!.execute({ pattern: "GetOrderById" });
+    expect(log.matched().has("src/orders/OrderService.cs")).toBe(true);
+
+    await byName["read_file"]!.execute({ path: "src/orders/OrderService.cs" });
+
+    expect(log.opened().has("src/orders/OrderService.cs")).toBe(true);
+    expect(log.matched().has("src/orders/OrderService.cs")).toBe(false);
   });
 
   it("records a file once however many of its lines matched", async () => {
@@ -61,7 +89,7 @@ describe("what a search records", () => {
 
     const records = log.all().filter((r) => r.path === "src/orders/OrderService.cs");
     expect(records).toHaveLength(1);
-    expect(records[0]?.outcome).toBe("read");
+    expect(records[0]?.outcome).toBe("matched");
   });
 
   it("records nothing when nothing matched", async () => {
@@ -101,7 +129,9 @@ describe("one ledger for all three", () => {
     await byName["list_files"]!.execute({});
 
     expect([...log.opened()]).toEqual(["src/orders/OrderService.cs"]);
-    // Two records, both reads, one path: the search and the read each logged.
-    expect(log.all().map((r) => r.outcome)).toEqual(["read", "read"]);
+    // Two records for one path, and they are not the same claim: the search
+    // showed a line, the read opened the file. Coverage counts the read.
+    expect(log.all().map((r) => r.outcome)).toEqual(["matched", "read"]);
+    expect([...log.matched()]).toEqual([]);
   });
 });

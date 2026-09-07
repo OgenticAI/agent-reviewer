@@ -194,7 +194,7 @@ function err(content: string): ToolResult {
  * the numerator counts what was actually read rather than what was asked for.
  */
 export interface RepoAccessRecorder {
-  record(path: string, outcome: "read" | "denied" | "missing" | "too-large" | "escaped"): void;
+  record(path: string, outcome: "read" | "matched" | "denied" | "missing" | "too-large" | "escaped"): void;
 }
 
 export function makeRepoTools(root: string, recorder?: RepoAccessRecorder): ReviewTool[] {
@@ -413,7 +413,9 @@ function searchRepoTool(root: string, recorder?: RepoAccessRecorder): ReviewTool
       }
       // The model is about to see a line from each of these files, so each
       // is a read for coverage purposes; see `makeRepoSearchTools`.
-      for (const rel of hitFiles) recorder?.record(rel, "read");
+      // "matched", not "read": the model has been shown one line of each of
+      // these, not the file. See AccessOutcome in inventory.ts.
+      for (const rel of hitFiles) recorder?.record(rel, "matched");
       return ok(matches.join("\n"));
     },
   };

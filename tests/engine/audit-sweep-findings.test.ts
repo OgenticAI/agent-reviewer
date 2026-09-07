@@ -8,7 +8,7 @@ import {
   sweepSeverity,
   SWEEP_SOURCE,
 } from "../../src/engine/audit/sweep-findings.js";
-import { signalsIn, sweepTree, type Signal, type SignalKind } from "../../src/engine/audit/sweep.js";
+import { SWEEP_RULES, sweepTree, type Signal, type SignalKind } from "../../src/engine/audit/sweep.js";
 import { validateFindings, type AuditFinding } from "../../src/engine/audit/finding.js";
 import { FileAccessLog } from "../../src/engine/audit/inventory.js";
 import { SEVERITY_ORDER } from "../../src/engine/audit/render.js";
@@ -36,26 +36,13 @@ function surface(over: Partial<Signal> = {}): Signal {
   return defect({ kind: "http-endpoint", signalClass: "surface", excerpt: "[HttpGet]", cwe: "CWE-1059", ...over });
 }
 
-/** Every defect-class kind the sweep can emit, taken from the sweep's own rules. */
+/**
+ * Every defect-class kind the sweep can emit, taken from the sweep's own rule
+ * table rather than from a list of fixtures kept here: a kind added to the
+ * sweep is covered by these invariants the moment it ships.
+ */
 const DEFECT_KINDS: SignalKind[] = [
-  ...new Set(
-    [
-      signalsIn("A.cs", "var t = handler.ReadJwtToken(x);"),
-      signalsIn("A.cs", "[AllowAnonymous]"),
-      signalsIn("A.cs", 'var org = Request.Headers["X-Tenant-Id"];'),
-      signalsIn("A.cs", 'var q = "SELECT * FROM t WHERE id = " + id;'),
-      signalsIn("A.cs", "var h = MD5.Create();"),
-      signalsIn("A.cs", "ServerCertificateValidationCallback += (a, b, c, d) => true;"),
-      signalsIn("A.cs", "builder.AllowAnyOrigin()"),
-      signalsIn("A.cs", 'config.AddJsonFile("appsettings.Test.json")'),
-      signalsIn("web.config", '<compilation debug="true" />'),
-      signalsIn("A.cs", "options.Cookie.HttpOnly = false;"),
-      signalsIn("A.cs", "var hash = SHA256.Create().ComputeHash(passwordBytes);"),
-    ]
-      .flat()
-      .filter((s) => s.signalClass === "defect")
-      .map((s) => s.kind),
-  ),
+  ...new Set(SWEEP_RULES.filter((r) => r.signalClass === "defect").map((r) => r.kind)),
 ];
 
 describe("what a sweep finding may claim", () => {
@@ -173,8 +160,37 @@ describe("how severe a sweep finding is", () => {
     }
   });
 
+  // A committed credential and a type-reconstructing deserializer are
+  // exploitable from the cited line alone, which is what puts the token there.
+  it("puts a committed secret and an arbitrary-type deserializer beside the token", () => {
+    expect(rank("hardcoded-secret")).toBe(rank("unvalidated-token"));
+    expect(rank("insecure-deserialization")).toBe(rank("unvalidated-token"));
+  });
+
+  // Each of these is real when true, and the line alone does not say where
+  // the value came from; that is the anonymous-endpoint rung, not the token's.
+  it("puts the source-dependent sinks beside the anonymous endpoint", () => {
+    for (const kind of ["xxe", "path-traversal", "phi-in-log", "ssrf", "xss-sink"] as const) {
+      expect(rank(kind), kind).toBe(rank("anonymous-endpoint"));
+      expect(rank(kind), kind).toBeGreaterThan(rank("unvalidated-token"));
+    }
+  });
+
+  // A token in web storage needs an injected script before it is a loss, so it
+  // sits with the weak digest reference, below the sinks that need nothing.
+  it("puts a token in web storage with the weak digest, below the sinks", () => {
+    expect(rank("token-in-web-storage")).toBe(rank("weak-crypto"));
+    expect(rank("token-in-web-storage")).toBeGreaterThan(rank("xss-sink"));
+  });
+
   it("never lands on unknown, which is reserved for a tool that withheld a rank", () => {
     for (const kind of DEFECT_KINDS) expect(sweepSeverity(kind)).not.toBe("unknown");
+  });
+
+  it("covers the new defect kinds, so none of them fell to a default rank", () => {
+    for (const kind of ["hardcoded-secret", "insecure-deserialization", "xxe", "path-traversal", "phi-in-log", "ssrf", "xss-sink", "token-in-web-storage"] as const) {
+      expect(DEFECT_KINDS, kind).toContain(kind);
+    }
   });
 
   // Confidence and severity are orthogonal; the rank must not leak into the label.

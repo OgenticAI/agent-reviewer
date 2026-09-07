@@ -94,6 +94,18 @@ const SWEEP_RULES: Record<SignalKind, { severity: FindingSeverity; meaning: stri
       "A SQL statement is assembled by concatenation or interpolation rather than " +
       "parameterised, so input can change the structure of the query.",
   },
+  "hardcoded-secret": {
+    severity: "error",
+    meaning:
+      "A credential is written into a settings file that is checked in, so anyone " +
+      "with the repository has it and rotating it means a code change.",
+  },
+  "insecure-deserialization": {
+    severity: "error",
+    meaning:
+      "A deserializer that reconstructs arbitrary types from the payload is used, so " +
+      "a crafted input can instantiate what it names and run code on the server.",
+  },
 
   // Consequence depends on what sits behind the line, which a pattern cannot read.
   "anonymous-endpoint": {
@@ -130,6 +142,36 @@ const SWEEP_RULES: Record<SignalKind, { severity: FindingSeverity; meaning: stri
       "An identity or tenant value is taken from a request header the caller controls, " +
       "ahead of the token's own claim.",
   },
+  "xxe": {
+    severity: "warning",
+    meaning:
+      "An XML reader is configured to process DTDs or to resolve external entities, so " +
+      "a document can read local files or reach internal hosts through the parser.",
+  },
+  "path-traversal": {
+    severity: "warning",
+    meaning:
+      "A file path is built from a request-bound value with nothing on the line pinning it " +
+      "under the intended root, so a dotted segment can reach outside it.",
+  },
+  "phi-in-log": {
+    severity: "warning",
+    meaning:
+      "A log call is passed a field that names a person, so the value lands in log storage " +
+      "that is retained, shipped and searched under weaker controls than the database.",
+  },
+  "ssrf": {
+    severity: "warning",
+    meaning:
+      "An outbound request is sent to a URL whose host comes from the caller, so the " +
+      "server can be pointed at internal addresses it can reach and the caller cannot.",
+  },
+  "xss-sink": {
+    severity: "warning",
+    meaning:
+      "Markup is written to the page through an API that bypasses the framework's escaping, " +
+      "so whatever reaches it is rendered as HTML rather than shown as text.",
+  },
 
   // Real when true, but the cited line rarely settles it on its own.
   "weak-crypto": {
@@ -144,6 +186,12 @@ const SWEEP_RULES: Record<SignalKind, { severity: FindingSeverity; meaning: stri
       "A cookie is configured without HttpOnly or Secure, or with an expiry mode that " +
       "extends a session indefinitely.",
   },
+  "token-in-web-storage": {
+    severity: "info",
+    meaning:
+      "A token is written to web storage, which any script on the origin can read, so " +
+      "a single injected script can take the session that an HttpOnly cookie would keep.",
+  },
 
   // Surface. Never findings; ranked only so the table stays exhaustive.
   "http-endpoint": { severity: "info", meaning: "An HTTP route." },
@@ -152,8 +200,9 @@ const SWEEP_RULES: Record<SignalKind, { severity: FindingSeverity; meaning: stri
     severity: "info",
     meaning: "A by-id fetch through a data accessor.",
   },
-  "missing-csrf-token": { severity: "info", meaning: "An anti-forgery attribute." },
+  "csrf-token-validated": { severity: "info", meaning: "An anti-forgery attribute." },
   "sensitive-field": { severity: "info", meaning: "A field that names sensitive data." },
+  "rate-limit-absent": { severity: "info", meaning: "A credential route with no throttle beside it." },
 };
 
 /** The rank a defect-class kind lands at. Exported for the report and for tests. */

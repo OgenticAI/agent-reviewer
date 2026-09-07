@@ -222,6 +222,36 @@ describe("redaction happens before anything is stored", () => {
     expect(JSON.stringify(t.events()[0])).not.toContain(SECRET);
   });
 
+  /**
+   * The message was masked and the citation beside it was not (OGE-2754).
+   *
+   * `finding()` spread the finding and replaced one field, so every other
+   * text-bearing field went to the collector as written. A citation's quote is
+   * a line copied out of the subject, which for a secret finding is the
+   * credential itself, and the field's own contract says it is masked before it
+   * reaches a rendered report. The report was the only consumer honouring that.
+   */
+  it("masks a citation's quote, not only the message", () => {
+    const t = telemetry();
+    t.finding(
+      finding({
+        message: "A credential is committed.",
+        evidence: [{ path: "api/appsettings.json", rev: REV, line: 8, quote: `"ClientSecret": "${SECRET}"` }],
+      }),
+    );
+    expect(JSON.stringify(t.events()[0])).not.toContain(SECRET);
+  });
+
+  // The quote is what a reader opens the file to check, so masking the value
+  // must not cost them the key name that says which line to look at.
+  it("leaves the rest of the quote readable", () => {
+    const t = telemetry();
+    t.finding(
+      finding({ evidence: [{ path: "api/appsettings.json", rev: REV, line: 8, quote: `"ClientSecret": "${SECRET}"` }] }),
+    );
+    expect(JSON.stringify(t.events()[0])).toContain("ClientSecret");
+  });
+
   // Truncating first could cut a secret in half and leave the tail readable.
   it("masks before truncating, so a long line cannot leak a split secret", () => {
     const line = "x".repeat(MAX_LOG_CHARS - 10) + SECRET + "y".repeat(200);

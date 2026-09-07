@@ -9,6 +9,7 @@ import {
   summariseSignals,
   MAX_SWEEP_BYTES,
   SWEEP_RULES,
+  redactSecretValues,
   type SignalKind,
 } from "../../src/engine/audit/sweep.js";
 import { FileAccessLog } from "../../src/engine/audit/inventory.js";
@@ -510,5 +511,100 @@ describe("separating surface from defects", () => {
       ...signalsIn("C.cs", "var t = handler.ReadJwtToken(x);"),
     ];
     expect(summariseSignals(signals)[0]?.signalClass).toBe("defect");
+  });
+});
+
+/* ── Secret values never reach an artifact (OGE-2754) ───────────────────────── */
+
+/**
+ * A signal's excerpt is the matched line, and for a secret rule the matched
+ * line IS the secret. `sweep.json` defaults into the acquired tree, so an audit
+ * reporting an exposed credential took a second copy of it.
+ *
+ * These assert on the ABSENCE of the value in the serialised result, not on the
+ * presence of the mask. A mask-present test passes while the secret is still in
+ * the file beside it, which is exactly the failure being fixed.
+ */
+describe("secret values in artifacts", () => {
+  // High entropy, no shape any pattern in sanitize.ts recognises. If this
+  // survives, it survives because the rule's own capture group hid it, which is
+  // the layer that has to work for keys we cannot pattern-match.
+  const VALUE = "Zq7NfE2kR9tXwB4mHs6Lp1Yc3Vd8Ja5G";
+
+  it("keeps the value out of every part of the serialised sweep", () => {
+    write("api/appsettings.json", `{\n  "ClientSecret": "${VALUE}"\n}\n`);
+    const result = sweepTree(scratch, new FileAccessLog());
+    expect(result.signals.some((s) => s.kind === "hardcoded-secret")).toBe(true);
+    // The whole artifact, not the excerpt field: a value copied into some other
+    // field later is the same leak and this has to fail then too.
+    expect(JSON.stringify(result)).not.toContain(VALUE);
+  });
+
+  it("keeps a connection-string key out too, where the value has no delimiter of its own", () => {
+    write("api/appsettings.json", `{\n  "Storage": "AccountEndpoint=https://x.example/;AccountKey=${VALUE};"\n}\n`);
+    const result = sweepTree(scratch, new FileAccessLog());
+    expect(JSON.stringify(result)).not.toContain(VALUE);
+  });
+
+  // Hiding the value is only useful if the reader can still act on the signal.
+  it("leaves the key name, path and line readable", () => {
+    write("api/appsettings.json", `{\n  "ClientSecret": "${VALUE}"\n}\n`);
+    const signal = sweepTree(scratch, new FileAccessLog()).signals.find(
+      (s) => s.kind === "hardcoded-secret",
+    );
+    expect(signal?.path).toBe("api/appsettings.json");
+    expect(signal?.line).toBe(2);
+    expect(signal?.excerpt).toContain("ClientSecret");
+  });
+
+  // The documented way of NOT committing a secret. Masking it would teach the
+  // reader to skip the line that is real.
+  it("leaves a placeholder readable", () => {
+    write("api/appsettings.json", '{\n  "ClientSecret": "${CLIENT_SECRET}"\n}\n');
+    const result = sweepTree(scratch, new FileAccessLog());
+    const excerpts = result.signals.map((s) => s.excerpt).join("\n");
+    if (excerpts !== "") expect(excerpts).toContain("CLIENT_SECRET");
+    expect(excerpts).not.toContain("<secret-hidden>");
+  });
+
+  /**
+   * The second layer, tested where it can fail.
+   *
+   * The capture groups only look at an assignment whose key names a secret. A
+   * credential can also sit on a line that some other rule matched, in a shape
+   * no capture group is pointed at, and `maskSecrets` is what covers that. A
+   * sweep-level test of it would be vacuous, because these shapes fire no rule
+   * of their own and an empty signal list trivially contains no secret.
+   */
+  it("masks credential shapes the capture groups are not pointed at", () => {
+    const shaped = [
+      `https://svc:${VALUE}@nuget.example/v3/index.json`,
+      `sk-ant-api03-${VALUE}`,
+      `ghp_${VALUE}`,
+    ];
+    for (const line of shaped) expect(redactSecretValues(line)).not.toContain(VALUE);
+  });
+
+  // The layers overlap on purpose, and the overlap has to actually hold: a
+  // connection string reached by either route must come out hidden.
+  it("hides a credential on a line another rule also matched", () => {
+    const line = `{ "PatientName": "x", "Storage": "Server=db;Password=${VALUE};" }`;
+    const signals = signalsIn("api/appsettings.json", line);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(JSON.stringify(signals)).not.toContain(VALUE);
+  });
+
+  /**
+   * The redactor needs its own global regexes. Sharing the detector's objects
+   * and adding `/g` makes `lastIndex` persist across `.exec` calls, so the
+   * detector skips every other line it is asked about. That reads as flaky rule
+   * coverage and points nowhere near the redactor.
+   */
+  it("detects a secret on every call, not every other one", () => {
+    const line = `{ "ClientSecret": "${VALUE}" }`;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const kinds = signalsIn("api/appsettings.json", line).map((s) => s.kind);
+      expect(kinds).toContain("hardcoded-secret");
+    }
   });
 });

@@ -48,6 +48,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { FileAccessLog } from "./inventory.js";
 import { languageOf, walkTree, type TreeFile, type WalkOptions } from "./tree.js";
+import { maskSecrets, SECRET_MASK } from "../tools/sanitize.js";
 
 /** Files above this are recorded as seen and not parsed: minified bundles, vendored blobs. */
 export const MAX_SWEEP_BYTES = 1_500_000;
@@ -823,8 +824,60 @@ function looksBinary(buffer: Buffer): boolean {
   return window.includes(0);
 }
 
+/**
+ * The value-capturing patterns again, global (OGE-2754).
+ *
+ * Separate objects on purpose. A global regex carries `lastIndex` across
+ * `.exec` calls, so adding the flag to the two constants the detector uses
+ * would make `hardcodedSecret` skip every other line it was asked about. The
+ * detector would then miss secrets intermittently, which reads as flaky rule
+ * coverage and points nowhere near here.
+ */
+const CONNECTION_STRING_SECRET_ALL = new RegExp(CONNECTION_STRING_SECRET.source, "gi");
+const KEYED_SECRET_ALL = new RegExp(KEYED_SECRET.source, "gi");
+
+/**
+ * Hide the value, keep everything that makes the signal actionable.
+ *
+ * A signal's excerpt is the matched line verbatim, and for a secret rule the
+ * matched line IS the secret. Written to `sweep.json`, which by default lands
+ * inside the acquired tree, that made an audit reporting an exposed credential
+ * take a second copy of it to somewhere the operator did not choose.
+ *
+ * Redaction happens where the excerpt is built rather than at render, so every
+ * consumer inherits it: the artifact on disk, findings, telemetry, the report,
+ * and any stage added later. A gate at the end only protects the outputs it
+ * knows about.
+ *
+ * The key name, the path and the line all survive, which is what a reader needs
+ * to open the file and confirm. Two layers, because each covers the other's
+ * blind spot: the rule's own capture groups know where the value is whatever
+ * shape it has, and `maskSecrets` catches credential shapes on lines that some
+ * OTHER rule matched, where no capture group is looking.
+ *
+ * A placeholder is left readable, on the same reasoning that keeps the detector
+ * from firing on one: `"ClientSecret": "${CLIENT_SECRET}"` is the documented way
+ * of not committing a secret, and masking it would teach the reader to skip the
+ * line that is real.
+ */
+export function redactSecretValues(line: string): string {
+  let out = line;
+  for (const pattern of [CONNECTION_STRING_SECRET_ALL, KEYED_SECRET_ALL]) {
+    out = out.replace(pattern, (whole: string, value: string | undefined) => {
+      if (value === undefined) return whole;
+      const trimmed = value.trim();
+      if (trimmed.length < 4 || PLACEHOLDER_VALUE.test(trimmed)) return whole;
+      return whole.slice(0, whole.length - value.length) + SECRET_MASK;
+    });
+  }
+  return maskSecrets(out);
+}
+
 function excerptOf(line: string): string {
-  const flat = line.trim().replace(/\s+/g, " ");
+  // Redact before truncating. Truncating first can cut a long connection
+  // string mid-value and leave a readable prefix of the key sitting in the
+  // artifact, which is a leak that looks handled.
+  const flat = redactSecretValues(line).trim().replace(/\s+/g, " ");
   return flat.length <= 200 ? flat : `${flat.slice(0, 199)}…`;
 }
 

@@ -3,9 +3,9 @@
  *
  * Coverage used to be a by-product of agent discretion. The investigation is an
  * agent answering a question set with Read and Grep under a turn cap, so it
- * opens what it judges relevant and stops: two runs over comparable trees
- * opened 5.5% and 2.2% of their files, the second AFTER the iteration cap was
- * raised. Raising a budget does not fix a stage that decides for itself when it
+ * opens what it judges relevant and stops: two runs over comparable trees each
+ * opened a small fraction of their files, and the second read less than the
+ * first AFTER the iteration cap was raised. Raising a budget does not fix a stage that decides for itself when it
  * has read enough.
  *
  * So this stage does not decide. It visits every file in the tree, records the

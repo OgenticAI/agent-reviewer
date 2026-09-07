@@ -8,7 +8,7 @@ import type { Question } from "../../src/engine/audit/questions.js";
 
 /**
  * The investigator had `read_file` and nothing else, and the last run over a
- * large subject opened 2.2% of its files: a model that cannot search or list
+ * large subject opened a small fraction of its files: a model that cannot search or list
  * guesses paths and answers from memory when the cap arrives. These pin the
  * registry each stage is actually sent, from the request body, because the
  * option being present on the factory proves nothing about what reaches the

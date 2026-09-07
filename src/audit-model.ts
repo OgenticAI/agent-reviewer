@@ -15,8 +15,8 @@
  * a verifier that could see the investigator's reasoning would be checking the
  * argument rather than the evidence, and would agree with it far too often.
  *
- * The investigator had `read_file` alone until the run that opened 2.2% of a
- * large tree. A model that cannot search or list guesses paths, spends its
+ * The investigator had `read_file` alone until the run that opened a small
+ * fraction of a large tree. A model that cannot search or list guesses paths, spends its
  * turns on misses, and answers from memory when the cap arrives; the search
  * and listing tools already existed for the PR reviewer and were simply never
  * bound here. The verifier keeps the single tool on purpose: it is handed a

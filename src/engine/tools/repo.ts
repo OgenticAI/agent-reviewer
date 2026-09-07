@@ -209,7 +209,7 @@ export function makeRepoTools(root: string, recorder?: RepoAccessRecorder): Revi
  * numbering that tool produces. It had NO search and NO listing: the
  * investigator's registry was `read_file` alone, so the model guessed paths,
  * spent its turns on misses, and answered from memory when the cap arrived.
- * The last run over a large subject opened 2.2% of the tree. These two tools
+ * The last run over a large subject opened a small fraction of the tree. These two tools
  * are the half of the PR toolset the audit was missing, split out so it can
  * bind them beside its own reader instead of shadowing it.
  *

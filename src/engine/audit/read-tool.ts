@@ -170,7 +170,7 @@ export function makeReadTool(options: ReadToolOptions): ReviewTool {
  * repo map names the top-ranked files and the model has to guess the rest,
  * and a guessed path that misses costs a turn and teaches nothing. Under a
  * turn cap that is how a question ends up answered from memory: the last run
- * over a large subject opened 2.2% of its files. The PR reviewer has had
+ * over a large subject opened a small fraction of its files. The PR reviewer has had
  * search and listing since OGE-1555; the audit simply never bound them.
  *
  * The reader stays the audit's own. The PR `read_file` returns a 100-line

@@ -429,6 +429,17 @@ export class AuditTelemetry {
       finding: {
         ...finding,
         message: redactLine(finding.message, this.knownSecrets),
+        // A citation's quote is a line copied out of the subject, so it can be
+        // the credential the finding is about (OGE-2754). Spreading the finding
+        // and redacting only `message` sent that line to the collector intact.
+        // The field's own contract says it is masked before it reaches a
+        // rendered report; the report was the only consumer honouring it.
+        evidence: finding.evidence.map((ref) => ({
+          ...ref,
+          ...(ref.quote !== undefined
+            ? { quote: redactLine(ref.quote, this.knownSecrets) }
+            : {}),
+        })),
       },
     });
   }

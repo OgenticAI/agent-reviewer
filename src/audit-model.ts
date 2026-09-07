@@ -9,11 +9,19 @@
  *
  * ── Why the two stages get different tools ──────────────────────────────────
  *
- * The investigator gets `read_file` and a repo map, and is asked for claims.
- * The verifier gets `read_file` and one claim, and is asked to destroy it.
- * Neither is given the other's output beyond that: a verifier that could see
- * the investigator's reasoning would be checking the argument rather than the
- * evidence, and would agree with it far too often.
+ * The investigator gets `read_file`, `search_repo`, `list_files` and a repo
+ * map, and is asked for claims. The verifier gets `read_file` and one claim,
+ * and is asked to destroy it. Neither is given the other's output beyond that:
+ * a verifier that could see the investigator's reasoning would be checking the
+ * argument rather than the evidence, and would agree with it far too often.
+ *
+ * The investigator had `read_file` alone until the run that opened a small
+ * fraction of a large tree. A model that cannot search or list guesses paths, spends its
+ * turns on misses, and answers from memory when the cap arrives; the search
+ * and listing tools already existed for the PR reviewer and were simply never
+ * bound here. The verifier keeps the single tool on purpose: it is handed a
+ * cited location to test, and a verifier that can search goes looking for a
+ * better argument instead of testing the one it was given.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -103,7 +111,16 @@ function extractText(content: unknown[]): string {
     .join("\n");
 }
 
-/** Paths the loop actually opened, in order, deduplicated. */
+/**
+ * Paths the loop opened WHOLE, in order, deduplicated.
+ *
+ * `read_file` calls only. A `search_repo` hit shows the model one line from
+ * each matching file and those files are recorded as read in the access log
+ * by the tool itself (see `makeRepoSearchTools`), which is where coverage is
+ * computed from. They are not listed here because the transcript keeps a
+ * truncated copy of each result and the paths would have to be parsed back
+ * out of it; this list is the files the model could cite by line number.
+ */
 function openedFrom(transcript: ReadonlyArray<{ name: string; input: unknown }>): string[] {
   const paths = transcript
     .filter((call) => call.name === "read_file")
@@ -139,6 +156,16 @@ export interface AuditModelOptions {
   anthropic: Anthropic;
   /** The `read_file` tool, already bound to the tree and the access log. */
   readTool: ReviewTool;
+  /**
+   * Tools offered to the INVESTIGATOR beside `read_file`: `search_repo` and
+   * `list_files`, bound to the same access log so a search hit is a read in
+   * the ledger and a listing is not. The verifier never sees these; see the
+   * module comment for why.
+   *
+   * Optional so a caller that wants the old single-tool investigator can have
+   * it, but the CLI always supplies them.
+   */
+  searchTools?: ReviewTool[];
   model?: string;
   log?: (message: string) => void;
 }
@@ -203,8 +230,13 @@ export function withCachedPrefix(messages: LoopMessage[]): Anthropic.MessagePara
   ] as Anthropic.MessageParam[];
 }
 
-async function runOnce(options: AuditModelOptions, systemPrompt: string, userPrompt: string) {
-  const registry = makeRegistry([options.readTool]);
+async function runOnce(
+  options: AuditModelOptions,
+  bound: ReviewTool[],
+  systemPrompt: string,
+  userPrompt: string,
+) {
+  const registry = makeRegistry(bound);
   const tools = toolDefinitions(registry);
 
   const turn: TurnFn = async (messages, turnOptions) => {
@@ -248,7 +280,12 @@ export function makeInvestigateModel(options: AuditModelOptions): InvestigateMod
 
   return {
     async investigate(request: InvestigateRequest): Promise<InvestigateResponse> {
-      const loop = await runOnce(options, request.systemPrompt, request.userPrompt);
+      const loop = await runOnce(
+        options,
+        [options.readTool, ...(options.searchTools ?? [])],
+        request.systemPrompt,
+        request.userPrompt,
+      );
 
       // A capped loop is reported, never silently accepted. A question the
       // model ran out of turns on has thinner evidence behind it than one it
@@ -314,7 +351,9 @@ export function makeVerifierModel(options: AuditModelOptions): VerifierModel {
   return {
     async refute(request: VerifyRequest): Promise<VerifierVerdict> {
       try {
-        const loop = await runOnce(options, request.systemPrompt, request.userPrompt);
+        // `read_file` only, whatever `searchTools` the caller bound: the
+        // verifier tests the cited location it was given.
+        const loop = await runOnce(options, [options.readTool], request.systemPrompt, request.userPrompt);
         return parseVerdict(extractText(loop.finalContent as unknown[]), request.verifier);
       } catch (error) {
         // A verifier that crashed did not clear the claim. Same reasoning as

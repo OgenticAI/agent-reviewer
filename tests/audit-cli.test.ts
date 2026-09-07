@@ -488,3 +488,25 @@ describe("the investigate row", () => {
     expect(warnings()).toHaveLength(0);
   });
 });
+
+/* ── Asking the sweep about a kind it may not know ──────────────────────── */
+
+import { knownSweepSeverity } from "../src/audit-cli.js";
+
+/**
+ * The seeding treats taxonomy kind names as data because the sweep's kinds
+ * are being renamed in another build. The severity table throws on a name it
+ * does not know; this is the probe that turns that into "unknown", so a run
+ * warns and continues rather than failing on a taxonomy ahead of its sweep.
+ */
+describe("knownSweepSeverity", () => {
+  it("returns the sweep's own rank for a kind it knows", () => {
+    expect(knownSweepSeverity("unvalidated-token")).toBe("error");
+    expect(knownSweepSeverity("anonymous-endpoint")).toBe("warning");
+  });
+
+  it("returns undefined for a name the sweep does not know, without throwing", () => {
+    expect(knownSweepSeverity("kind-from-a-future-sweep")).toBeUndefined();
+    expect(knownSweepSeverity("")).toBeUndefined();
+  });
+});

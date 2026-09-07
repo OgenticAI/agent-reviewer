@@ -21,6 +21,45 @@ import type { Tag } from "./tags.js";
 
 export const DEFAULT_MAP_TOKENS = 1024;
 
+/**
+ * Ceiling for a map sized by tree, in estimated tokens.
+ *
+ * 16384 tokens is roughly 64KB of signature lines, which at 8 tokens per
+ * file names every file in a tree of about two thousand before the cap
+ * bites. It is also the largest prefix this engine wants to pay to cache: the
+ * audit marks the first user message as a cache breakpoint, so the map is
+ * written once per question and read back at a tenth of the rate on each
+ * later turn. Past this size the map starts crowding out the files the model
+ * opens, which is the thing it exists to guide.
+ */
+export const MAX_AUDIT_MAP_TOKENS = 16_384;
+
+/** Tokens the budget grows by for each file in the tree. */
+const MAP_TOKENS_PER_FILE = 8;
+
+/**
+ * A map budget that grows with the tree (audit path).
+ *
+ * `DEFAULT_MAP_TOKENS` is the PR reviewer's floor, sized for a run that also
+ * carries a diff. The audit has no diff: the map is the only overview the
+ * model gets, and `investigateRun` passed no budget at all, so a tree of
+ * several hundred files was outlined in 1024 tokens, which is a dozen files.
+ * The model then guessed at the rest, and a guessed path that misses is a
+ * turn spent on nothing.
+ *
+ *   budget = 1024 + 8 * files, capped at 16384
+ *
+ * Eight tokens is about one `path:` header line plus a short signature, so
+ * the linear term buys the map roughly one line per file: enough to NAME most
+ * of a mid-sized tree, which is what turns a guess into a read. The floor
+ * keeps a tiny tree at the PR default rather than below it; the cap is
+ * explained on `MAX_AUDIT_MAP_TOKENS`.
+ */
+export function mapBudgetForTree(fileCount: number): number {
+  const files = Number.isFinite(fileCount) && fileCount > 0 ? Math.floor(fileCount) : 0;
+  return Math.min(DEFAULT_MAP_TOKENS + MAP_TOKENS_PER_FILE * files, MAX_AUDIT_MAP_TOKENS);
+}
+
 /** Diff size (in estimated tokens) at/below which the map gets its full budget. */
 const SMALL_DIFF_TOKENS = 1000;
 /** Diff size at/above which the map shrinks to its floor. */
@@ -69,6 +108,11 @@ export interface RenderedMap {
   text: string;
   /** How many files made it into the budget. */
   fileCount: number;
+  /**
+   * The files the text names, in rank order. Carried so a prompt can say what
+   * the map covers per language without parsing its own output back.
+   */
+  files: string[];
   /** The effective token budget used (after inverse scaling). */
   budget: number;
 }
@@ -89,7 +133,7 @@ export function renderRepoMap(args: {
   const budget = scaledMapTokens(args.baseTokens ?? DEFAULT_MAP_TOKENS, args.diffTokens);
   const byFile = defsByFile(args.tags);
   const rankedWithDefs = args.ranked.filter((r) => (byFile.get(r.path)?.length ?? 0) > 0);
-  if (rankedWithDefs.length === 0) return { text: "", fileCount: 0, budget };
+  if (rankedWithDefs.length === 0) return { text: "", fileCount: 0, files: [], budget };
 
   let lo = 0;
   let hi = rankedWithDefs.length;
@@ -112,5 +156,5 @@ export function renderRepoMap(args: {
     best = renderFor(rankedWithDefs, byFile, 1);
     bestN = 1;
   }
-  return { text: best, fileCount: bestN, budget };
+  return { text: best, fileCount: bestN, files: rankedWithDefs.slice(0, bestN).map((r) => r.path), budget };
 }

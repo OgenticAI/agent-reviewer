@@ -194,11 +194,39 @@ function err(content: string): ToolResult {
  * the numerator counts what was actually read rather than what was asked for.
  */
 export interface RepoAccessRecorder {
-  record(path: string, outcome: "read" | "denied" | "missing" | "too-large" | "escaped"): void;
+  record(path: string, outcome: "read" | "matched" | "denied" | "missing" | "too-large" | "escaped"): void;
 }
 
 export function makeRepoTools(root: string, recorder?: RepoAccessRecorder): ReviewTool[] {
-  return [readFileTool(root, recorder), searchRepoTool(root), listFilesTool(root)];
+  return [readFileTool(root, recorder), ...makeRepoSearchTools(root, recorder)];
+}
+
+/**
+ * `search_repo` and `list_files` on their own, without `read_file`.
+ *
+ * The audit path has its own `read_file` (whole numbered files, a bigger size
+ * cap, no window) because its verifier re-reads cited lines and needs the
+ * numbering that tool produces. It had NO search and NO listing: the
+ * investigator's registry was `read_file` alone, so the model guessed paths,
+ * spent its turns on misses, and answered from memory when the cap arrived.
+ * The last run over a large subject opened a small fraction of the tree. These two tools
+ * are the half of the PR toolset the audit was missing, split out so it can
+ * bind them beside its own reader instead of shadowing it.
+ *
+ * ── Ledger semantics ────────────────────────────────────────────────────────
+ *
+ * `list_files` records nothing: a listing shows paths, not contents, and a
+ * path the model has seen the name of is not a file it has read. Counting a
+ * listing would put every file under the prefix into coverage for one call.
+ *
+ * `search_repo` records each distinct file that had a matching line RETURNED
+ * to the model as `read`. The model saw those lines and may cite them, so
+ * they belong in the numerator. A search that matched nothing, or that was
+ * refused for matching too much, showed the model no line from any file and
+ * records nothing.
+ */
+export function makeRepoSearchTools(root: string, recorder?: RepoAccessRecorder): ReviewTool[] {
+  return [searchRepoTool(root, recorder), listFilesTool(root)];
 }
 
 function readFileTool(root: string, recorder?: RepoAccessRecorder): ReviewTool {
@@ -296,7 +324,7 @@ function readFileTool(root: string, recorder?: RepoAccessRecorder): ReviewTool {
   };
 }
 
-function searchRepoTool(root: string): ReviewTool {
+function searchRepoTool(root: string, recorder?: RepoAccessRecorder): ReviewTool {
   return {
     definition: {
       name: "search_repo",
@@ -340,6 +368,10 @@ function searchRepoTool(root: string): ReviewTool {
       }
 
       const matches: string[] = [];
+      // Files with at least one returned line, in walk order. Recorded only
+      // once the call is known to succeed: a refused search returns none of
+      // these lines, so none of these files was read.
+      const hitFiles: string[] = [];
       let truncated = false;
       walk(base, (abs) => {
         if (matches.length >= MAX_SEARCH_MATCHES) {
@@ -354,13 +386,18 @@ function searchRepoTool(root: string): ReviewTool {
           return; // binary or unreadable — not an error, just not searchable
         }
         const rel = relative(realpathSync(root), abs).split(sep).join("/");
+        let hit = false;
         content.split(/\r?\n/).forEach((line, i) => {
           if (matches.length >= MAX_SEARCH_MATCHES) {
             truncated = true;
             return;
           }
-          if (re.test(line)) matches.push(`${rel}:${i + 1}: ${line.trim().slice(0, 200)}`);
+          if (re.test(line)) {
+            matches.push(`${rel}:${i + 1}: ${line.trim().slice(0, 200)}`);
+            hit = true;
+          }
         });
+        if (hit) hitFiles.push(rel);
       }, realpathSync(root));
 
       if (matches.length === 0) return ok(`No matches for /${pattern}/.`);
@@ -374,6 +411,11 @@ function searchRepoTool(root: string): ReviewTool {
             `Narrow it: add surrounding syntax, anchor it, or pass path_prefix to scope the search.`,
         );
       }
+      // The model is about to see a line from each of these files, so each
+      // is a read for coverage purposes; see `makeRepoSearchTools`.
+      // "matched", not "read": the model has been shown one line of each of
+      // these, not the file. See AccessOutcome in inventory.ts.
+      for (const rel of hitFiles) recorder?.record(rel, "matched");
       return ok(matches.join("\n"));
     },
   };

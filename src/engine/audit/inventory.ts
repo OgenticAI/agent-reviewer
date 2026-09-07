@@ -147,7 +147,18 @@ export function computeCoverage(inventory: Inventory, log: FileAccessLog): Cover
 
 /* ── The access log ───────────────────────────────────────────────────────── */
 
-export type AccessOutcome = "read" | "denied" | "missing" | "too-large" | "escaped";
+/**
+ * What happened to a file the run touched.
+ *
+ * `matched` is deliberately not `read`. A search returns the matching lines
+ * from many files at once, and the model has seen one line of each, not the
+ * file. Recording those as read let a single broad search move coverage from a
+ * few per cent to nearly the whole tree without the model opening anything,
+ * which is precisely the overclaim the ledger exists to prevent. It is kept
+ * because it is real: the model saw those lines and may cite them, so a
+ * citation into a matched file is anchored rather than invented.
+ */
+export type AccessOutcome = "read" | "matched" | "denied" | "missing" | "too-large" | "escaped";
 
 export interface AccessRecord {
   path: string;
@@ -173,6 +184,14 @@ export class FileAccessLog {
   /** Distinct paths successfully read. */
   opened(): Set<string> {
     return new Set(this.records.filter((r) => r.outcome === "read").map((r) => r.path));
+  }
+
+  /** Distinct paths a search showed the model a line of, without opening. */
+  matched(): Set<string> {
+    const read = this.opened();
+    return new Set(
+      this.records.filter((r) => r.outcome === "matched" && !read.has(r.path)).map((r) => r.path),
+    );
   }
 
   /** Distinct paths an attempt was made on but which could not be read. */

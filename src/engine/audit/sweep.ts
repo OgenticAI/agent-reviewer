@@ -202,9 +202,11 @@ export interface SignalRule {
  * them and the defect rule that catches them in a log call, so the two cannot
  * drift apart.
  *
- * Case-insensitive, and tolerant of camel, Pascal and snake case, because the
- * first cut was `\bDateOfBirth\b` and the subject spelled it `dateOfBirth` on
- * every model, so the count was zero and read as an absence.
+ * Case-insensitive, and tolerant of camel, Pascal and snake case. A rule
+ * anchored on one spelling (`\bDateOfBirth\b`) returns nothing on a codebase
+ * that uses another (`dateOfBirth`, `date_of_birth`), and a zero from a rule
+ * that could not match reads exactly like a zero from a codebase that has no
+ * such field.
  */
 const SENSITIVE_FIELD_SOURCE =
   "\\b(?:birth[-_]?date|date[-_]?of[-_]?birth|dob|ssn|social[-_]?security(?:[-_]?(?:number|no))?|national[-_]?id" +
@@ -306,7 +308,15 @@ function enclosingCallee(before: string): string {
  * parameterise every hole, so a `$` literal inside them is the safe idiom, not
  * the defect. `FromSqlRaw` with the same literal is the defect, and the
  * dedicated rule below catches its non-statement forms too.
+ *
+ * The exclusion has to name the Async spellings and the EF7+ short names.
+ * Anchoring on `Interpolated$` missed `ExecuteSqlInterpolatedAsync`, which is
+ * the same method: the safest idiom in the framework was reported as the
+ * defect, which is worse than missing one, because it teaches a reader that the
+ * rule does not know the stack. `Raw` is deliberately absent from the list, so
+ * `FromSqlRaw` and `ExecuteSqlRawAsync` still fire.
  */
+const EF_PARAMETERISED = /(?:^|\.)(?:FromSql|ExecuteSql|SqlQuery)(?:Interpolated)?(?:Async)?$/;
 function sqlFromInput(view: LineView): boolean {
   const { literals, masked } = literalsOf(view.text);
   for (const literal of literals) {
@@ -330,7 +340,7 @@ function sqlFromInput(view: LineView): boolean {
 
     const callee = enclosingCallee(beforePrefix);
     if (LOG_CALLEE.test(callee)) continue;
-    if (/Interpolated$/.test(callee)) continue;
+    if (EF_PARAMETERISED.test(callee)) continue;
     return true;
   }
   return false;
@@ -348,8 +358,20 @@ function sqlFromInput(view: LineView): boolean {
  * and `changeme` are the documented way NOT to commit a secret, and a rule that
  * flags them teaches the reader to skip the one that is real.
  */
-const PLACEHOLDER_VALUE =
-  /^(?:<[^>]*>|\$\{[^}]*\}|\$\([^)]*\)|\{\{[^}]*\}\}|#\{[^}]*\}|%[^%]*%|\*+|x+|-+|\.+|change[-_]?me|your[-_][\w-]*|placeholder|redacted|secret|password|example|sample|todo|tbd|null|none|true|false|\d{1,3}|https?:\/\/.*|[/~@].*)$/i;
+const PLACEHOLDER_VALUE = new RegExp(
+  // Substitution syntax, matched on the OPENER alone. The value capture stops
+  // at `}` so that a JSON object end does not run away with the rest of the
+  // line, which means `${JWT_SECRET}` arrives here as `${JWT_SECRET` and a
+  // closed-form pattern never matched it. Every documented way of NOT
+  // committing a secret was therefore reported as one, and a rule that flags
+  // the placeholder teaches the reader to skip the line that is real.
+  "^(?:<|\\$\\{|\\$\\(|\\{\\{|#\\{|%\\w|\\$[A-Za-z_][\\w]*$)" +
+    "|" +
+    // Whole-value stand-ins, still anchored at both ends: `secret` is a
+    // placeholder, `secretsauce` is a password.
+    "^(?:\\*+|x+|-+|\\.+|change[-_]?me|your[-_][\\w-]*|placeholder|redacted|secret|password|example|sample|todo|tbd|null|none|true|false|\\d{1,3}|https?://.*|[/~@].*)$",
+  "i",
+);
 
 const SECRET_KEY_SOURCE =
   "(?:password|passwd|pwd|account[-_]?key|shared[-_]?access[-_]?key|secret[-_]?key|client[-_]?secret|api[-_]?key|private[-_]?key|access[-_]?key|auth[-_]?token|secret)";
@@ -396,6 +418,21 @@ function requestToCallerHost(view: LineView): boolean {
 const CREDENTIAL_ROUTE =
   /(?:\[\s*Http(?:Post|Put)\s*\(\s*"|\[\s*Route\s*\(\s*"|\.Map(?:Post|Put)\s*\(\s*"|\b(?:app|router)\.(?:post|put)\s*\(\s*['"`])[^"'`]*\b(?:login|signin|sign-in|logon|authenticate|password|reset|forgot|signup|sign-up|register|otp|mfa|2fa)\b/i;
 const THROTTLE = /RateLimit|Throttl|limiter|slowDown|BruteForce|brute-force|RequireRateLimiting|EnableRateLimiting|Lockout/i;
+
+/**
+ * A header that names WHO the caller is, rather than one describing the request.
+ *
+ * The identity word has to be a whole segment of the header name. A substring
+ * test reads `User-Agent` as a user header and `Origin` as an org header, both
+ * of which nearly every request carries, so the rule fired across whole
+ * middleware files and buried the header that actually decides the tenant.
+ *
+ * `user` alone is not enough for the same reason: only `user-id`, `userid` or
+ * `user-name` name a subject. `org` as a full segment does, and stops short of
+ * `origin` because a trailing segment boundary is required.
+ */
+const IDENTITY_HEADER =
+  /(?:^|[-_])(?:tenant|organi[sz]ation|org|account|customer|role|admin|impersonat\w*|act[-_]?as|on[-_]?behalf(?:[-_]of)?)(?:[-_]|$)|user[-_]?(?:id|name)\b/i;
 
 const RULES: readonly SignalRule[] = [
   // ── Broken authentication (API2) ────────────────────────────────────────
@@ -459,7 +496,10 @@ const RULES: readonly SignalRule[] = [
     signalClass: "defect",
     languages: ["csharp"],
     scope: "text",
-    pattern: /(?:Request\.Headers|HttpContext\.Request\.Headers)\s*\[\s*"[^"]*(?:tenant|org|account|customer|user|role|admin)[^"]*"/i,
+    pattern: (view) => {
+      const header = /(?:Request\.Headers|HttpContext\.Request\.Headers)\s*\[\s*"([^"]+)"/i.exec(view.text);
+      return header?.[1] !== undefined && IDENTITY_HEADER.test(header[1]);
+    },
     cwe: "CWE-639",
     owasp: OWASP.bola,
   },
@@ -468,7 +508,11 @@ const RULES: readonly SignalRule[] = [
     signalClass: "defect",
     languages: ["typescript", "javascript"],
     scope: "text",
-    pattern: /(?:req|request)\.headers\s*(?:\[\s*['"`]|\.)\s*[^'"`\]]*(?:tenant|org|account|user-id|role|admin)/i,
+    pattern: (view) => {
+      const header = /(?:req|request)\.headers\s*(?:\[\s*['"`]([^'"`\]]+)|\.\s*([\w$]+))/i.exec(view.text);
+      const name = header?.[1] ?? header?.[2];
+      return name !== undefined && IDENTITY_HEADER.test(name);
+    },
     cwe: "CWE-639",
     owasp: OWASP.bola,
   },
@@ -544,8 +588,9 @@ const RULES: readonly SignalRule[] = [
   },
   // A test settings file loaded after the environment file is how a test value
   // reaches production without anyone choosing it. The file name is the
-  // evidence and it is a literal. A `.csproj` item that copies the file to the
-  // output directory is not a load, and fired on every project that had one.
+  // evidence and it is a literal. A `.csproj` item that copies that file to the
+  // output directory names it too and is not a load, so the rule reads the
+  // loading call rather than every mention of the name.
   {
     kind: "config-precedence",
     signalClass: "defect",
@@ -792,9 +837,10 @@ function excerptOf(line: string): string {
  * fixture, and reporting it as a risk buries the ones in the service layer.
  *
  * Anchored on directory segments and on suffixes with a case-sensitive
- * PascalCase boundary. The first cut used `/Tests?\.cs$/i`, which muted
- * `Contest.cs`, and listed `fixtures` and `mocks` as directories, which muted
- * a production `Mocks/` folder of API doubles that shipped. A muted file is
+ * PascalCase boundary. A case-insensitive `/Tests?\.cs$/` mutes any file whose
+ * name merely ends in those letters, such as `Contest.cs`, and treating
+ * `fixtures` or `mocks` as test directories mutes shipped code that happens to
+ * live under one, since API doubles are often production types. A muted file is
  * the one class of miss the ledger cannot show, so the rule errs towards
  * reading: plural `FooTests.cs` is a test class, but singular `LabTest.cs`
  * is as likely a domain model, so the singular needs a separator before it

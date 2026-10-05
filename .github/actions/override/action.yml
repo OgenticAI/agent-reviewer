@@ -34,6 +34,9 @@ runs:
       uses: actions/setup-node@v5
       with:
         node-version: "20"
+        # Same fix as the review action: without this, setup-node@v5 detects a consumer's
+        # pnpm-lock.yaml / yarn.lock and fails with "Unable to locate executable file: pnpm".
+        package-manager-cache: false
 
     - name: Install reviewer
       shell: bash
